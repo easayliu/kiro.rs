@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::http_client::ProxyConfig;
-use crate::model::config::Config;
+use crate::model::config::{ClientMode, Config};
 
 /// Kiro OAuth 凭证
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -92,6 +92,11 @@ pub struct KiroCredentials {
     /// 凭据级代理认证密码（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
+
+    /// 凭据级客户端模拟模式（可选）
+    /// 未配置时回退到 config.json 的 clientMode
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_mode: Option<ClientMode>,
 
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
@@ -206,6 +211,12 @@ impl KiroCredentials {
         self.api_region
             .as_deref()
             .unwrap_or(config.effective_api_region())
+    }
+
+    /// 获取有效的客户端模拟模式
+    /// 优先级：凭据.client_mode > config.client_mode
+    pub fn effective_client_mode(&self, config: &Config) -> ClientMode {
+        self.client_mode.unwrap_or(config.client_mode)
     }
 
     /// 获取有效的代理配置
@@ -333,6 +344,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            client_mode: None,
             disabled: false,
             kiro_api_key: None,
         };
@@ -450,6 +462,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            client_mode: None,
             disabled: false,
             kiro_api_key: None,
         };
@@ -480,6 +493,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            client_mode: None,
             disabled: false,
             kiro_api_key: None,
         };
@@ -593,6 +607,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            client_mode: None,
             disabled: false,
             kiro_api_key: None,
         };
