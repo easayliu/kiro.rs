@@ -5,7 +5,7 @@
 //! 支持多凭据故障转移和重试
 
 use reqwest::Client;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -206,6 +206,7 @@ impl KiroProvider {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
+        let mut force_refreshed: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
             // 获取调用上下文
@@ -301,6 +302,17 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
+                // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
+                if Self::is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
+                    force_refreshed.insert(ctx.id);
+                    tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
+                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                        continue;
+                    }
+                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+                }
+
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
@@ -356,6 +368,7 @@ impl KiroProvider {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
+        let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -481,6 +494,17 @@ impl KiroProvider {
                     body
                 );
 
+                // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
+                if Self::is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
+                    force_refreshed.insert(ctx.id);
+                    tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
+                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
+                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
+                        continue;
+                    }
+                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+                }
+
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
                     anyhow::bail!(
@@ -588,6 +612,14 @@ impl KiroProvider {
             .pointer("/error/reason")
             .and_then(|v| v.as_str())
             .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
+    }
+
+    /// 检查响应体是否包含 bearer token 失效的特征消息
+    ///
+    /// 当上游已使 accessToken 失效但本地 expiresAt 未到期时，
+    /// API 会返回 401/403 并携带此特征消息。
+    fn is_bearer_token_invalid(body: &str) -> bool {
+        body.contains("The bearer token included in the request is invalid")
     }
 }
 
