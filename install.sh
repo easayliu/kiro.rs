@@ -9,7 +9,7 @@
 # 环境变量：
 #   INSTALL_DIR   安装目录，默认 ./kiro-rs
 #   IMAGE_OWNER   镜像 owner，默认 easayliu
-#   IMAGE_TAG     镜像 tag，默认 beta（CI 产出的开发版；稳定 tag 用 latest）
+#   IMAGE_TAG     镜像 tag，默认 latest（由 tag 触发的 CI 构建产出）
 #   IMAGE_REG     镜像 registry，默认 ghcr.io；国内可用 ghcr.nju.edu.cn
 #   PORT          宿主机监听端口，默认 8990
 #   API_KEY       客户端 API Key，默认自动生成
@@ -22,7 +22,7 @@ set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-$(pwd)/kiro-rs}"
 IMAGE_OWNER="${IMAGE_OWNER:-easayliu}"
-IMAGE_TAG="${IMAGE_TAG:-beta}"
+IMAGE_TAG="${IMAGE_TAG:-latest}"
 IMAGE_REG="${IMAGE_REG:-ghcr.io}"
 PORT="${PORT:-8990}"
 REGION="${REGION:-us-east-1}"
