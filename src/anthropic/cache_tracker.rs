@@ -238,6 +238,8 @@ impl CacheTracker {
         let (cache_5m, cache_1h) = compute_ttl_breakdown(profile, matched_tokens);
 
         // Anthropic 公式：input_tokens = total - cache_read - cache_creation
+        // total_input_tokens 包含消息结构 overhead，而 cache tokens 只计内容，
+        // 差值自然反映未缓存的部分。
         let uncached = profile
             .total_input_tokens
             .saturating_sub(cache_read)

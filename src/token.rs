@@ -183,9 +183,13 @@ async fn call_remote_count_tokens(
     Ok(result.input_tokens as u64)
 }
 
+/// 每条 message 的结构开销（role token、分隔符等），模拟 Anthropic 内部 overhead
+const TOKENS_PER_MESSAGE_OVERHEAD: u64 = 4;
+
 /// 本地计算请求的输入 tokens
 ///
-/// 使用与 cache_tracker 相同的 block 级函数，确保 total 和 block 累加口径一致。
+/// 使用与 cache_tracker 相同的 block 级函数计算内容 tokens，
+/// 再加上消息结构 overhead 来模拟 Anthropic 的总量计算。
 fn count_all_tokens_local(
     system: Option<Vec<SystemMessage>>,
     messages: Vec<Message>,
@@ -193,23 +197,21 @@ fn count_all_tokens_local(
 ) -> u64 {
     let mut total = 0;
 
-    // 工具定义（与 cache_tracker 使用相同的 count_tool_definition_tokens）
     if let Some(ref tools) = tools {
         for tool in tools {
             total += count_tool_definition_tokens(tool);
         }
     }
 
-    // 系统消息（与 cache_tracker 使用相同的 count_system_message_tokens）
     if let Some(ref system) = system {
         for msg in system {
             total += count_system_message_tokens(msg);
         }
     }
 
-    // 用户/助手消息（与 cache_tracker 使用相同的 count_message_content_tokens）
     for msg in &messages {
         total += count_message_content_tokens(&msg.content);
+        total += TOKENS_PER_MESSAGE_OVERHEAD;
     }
 
     total.max(1)
