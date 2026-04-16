@@ -13,7 +13,11 @@ use axum::{
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 
+use super::cache_tracker::CacheTracker;
 use super::types::ErrorResponse;
+
+/// Prompt cache 默认最大 TTL（1 小时）
+const DEFAULT_PROMPT_CACHE_TTL_SECS: u64 = 3600;
 
 /// 应用共享状态
 #[derive(Clone)]
@@ -25,6 +29,8 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// Prompt caching 本地追踪器（按 credential_id 维度分片）
+    pub cache_tracker: Arc<CacheTracker>,
 }
 
 impl AppState {
@@ -34,6 +40,9 @@ impl AppState {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            cache_tracker: Arc::new(CacheTracker::new(std::time::Duration::from_secs(
+                DEFAULT_PROMPT_CACHE_TTL_SECS,
+            ))),
         }
     }
 

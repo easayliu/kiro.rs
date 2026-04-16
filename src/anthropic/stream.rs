@@ -268,6 +268,15 @@ impl BlockState {
     }
 }
 
+/// message_delta/final_usage 中的缓存 token 细分
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CacheUsage {
+    pub cache_creation_input_tokens: i32,
+    pub cache_read_input_tokens: i32,
+    pub cache_creation_5m_input_tokens: i32,
+    pub cache_creation_1h_input_tokens: i32,
+}
+
 /// SSE 状态管理器
 ///
 /// 确保 SSE 事件序列符合 Claude API 规范：
@@ -291,6 +300,8 @@ pub struct SseStateManager {
     stop_reason: Option<String>,
     /// 是否有工具调用
     has_tool_use: bool,
+    /// message_delta/final 阶段透传的缓存使用细分
+    final_usage: Option<CacheUsage>,
 }
 
 impl Default for SseStateManager {
@@ -309,7 +320,13 @@ impl SseStateManager {
             next_block_index: 0,
             stop_reason: None,
             has_tool_use: false,
+            final_usage: None,
         }
+    }
+
+    /// 设置最终 usage（含 prompt caching 细分）
+    pub fn set_final_usage(&mut self, usage: CacheUsage) {
+        self.final_usage = Some(usage);
     }
 
     /// 判断指定块是否处于可接收 delta 的打开状态
@@ -486,10 +503,22 @@ impl SseStateManager {
                         "stop_reason": self.get_stop_reason(),
                         "stop_sequence": null
                     },
-                    "usage": {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens
-                    }
+                    "usage": self.final_usage.map_or_else(
+                        || json!({
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                        }),
+                        |usage| json!({
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                            "cache_read_input_tokens": usage.cache_read_input_tokens,
+                            "cache_creation": {
+                                "ephemeral_5m_input_tokens": usage.cache_creation_5m_input_tokens,
+                                "ephemeral_1h_input_tokens": usage.cache_creation_1h_input_tokens
+                            }
+                        })
+                    )
                 }),
             ));
         }
@@ -508,6 +537,7 @@ impl SseStateManager {
 }
 
 use super::converter::get_context_window_size;
+use super::handlers::CacheUsageContext;
 
 /// 流处理上下文
 pub struct StreamContext {
@@ -523,6 +553,8 @@ pub struct StreamContext {
     pub context_input_tokens: Option<i32>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    /// Prompt caching 使用细分（由 handler 在 API 调用返回后注入）
+    pub cache_usage: CacheUsage,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -559,6 +591,7 @@ impl StreamContext {
             input_tokens,
             context_input_tokens: None,
             output_tokens: 0,
+            cache_usage: CacheUsage::default(),
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -571,8 +604,27 @@ impl StreamContext {
         }
     }
 
+    /// 注入 prompt caching 结果
+    pub fn set_cache_usage(&mut self, ctx: CacheUsageContext) {
+        self.cache_usage = CacheUsage {
+            cache_creation_input_tokens: ctx.cache_creation_input_tokens,
+            cache_read_input_tokens: ctx.cache_read_input_tokens,
+            cache_creation_5m_input_tokens: ctx.cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens: ctx.cache_creation_1h_input_tokens,
+        };
+    }
+
+    /// 计算剔除 cache 读写后的 billed input tokens
+    fn billed_input_tokens(&self, input_tokens: i32) -> i32 {
+        input_tokens
+            .saturating_sub(self.cache_usage.cache_creation_input_tokens)
+            .saturating_sub(self.cache_usage.cache_read_input_tokens)
+            .max(0)
+    }
+
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let billed = self.billed_input_tokens(self.input_tokens);
         json!({
             "type": "message_start",
             "message": {
@@ -584,8 +636,14 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
-                    "output_tokens": 1
+                    "input_tokens": billed,
+                    "output_tokens": 1,
+                    "cache_creation_input_tokens": self.cache_usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": self.cache_usage.cache_read_input_tokens,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": self.cache_usage.cache_creation_5m_input_tokens,
+                        "ephemeral_1h_input_tokens": self.cache_usage.cache_creation_1h_input_tokens,
+                    }
                 }
             }
         })
@@ -1119,11 +1177,15 @@ impl StreamContext {
 
         // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        let billed = self.billed_input_tokens(final_input_tokens);
+
+        // 把 cache usage 透传给 state_manager，让 message_delta 输出 cache_* 字段
+        self.state_manager.set_final_usage(self.cache_usage);
 
         // 生成最终事件
         events.extend(
             self.state_manager
-                .generate_final_events(final_input_tokens, self.output_tokens),
+                .generate_final_events(billed, self.output_tokens),
         );
         events
     }
@@ -1168,6 +1230,11 @@ impl BufferedStreamContext {
         }
     }
 
+    /// 注入 prompt caching 结果（透传到内部 StreamContext）
+    pub fn set_cache_usage(&mut self, ctx: CacheUsageContext) {
+        self.inner.set_cache_usage(ctx);
+    }
+
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
@@ -1207,13 +1274,14 @@ impl BufferedStreamContext {
             .inner
             .context_input_tokens
             .unwrap_or(self.estimated_input_tokens);
+        let billed = self.inner.billed_input_tokens(final_input_tokens);
 
-        // 更正 message_start 事件中的 input_tokens
+        // 更正 message_start 事件中的 input_tokens（同时保持 cache_* 字段与最终 usage 一致）
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        usage["input_tokens"] = serde_json::json!(billed);
                     }
                 }
             }

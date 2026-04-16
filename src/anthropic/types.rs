@@ -3,6 +3,17 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// === 缓存控制 ===
+
+/// 缓存控制配置（Anthropic prompt caching）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CacheControl {
+    #[serde(rename = "type")]
+    pub cache_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+}
+
 // === 错误响应 ===
 
 /// API 错误响应
@@ -112,7 +123,7 @@ pub struct Metadata {
 }
 
 /// Messages 请求体
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct MessagesRequest {
     pub model: String,
@@ -151,6 +162,8 @@ where
         {
             Ok(Some(vec![SystemMessage {
                 text: value.to_string(),
+                block_type: None,
+                cache_control: None,
             }]))
         }
 
@@ -199,6 +212,10 @@ pub struct Message {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMessage {
     pub text: String,
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub block_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// 工具定义
@@ -223,6 +240,9 @@ pub struct Tool {
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,
+    /// 缓存控制
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// 内容块

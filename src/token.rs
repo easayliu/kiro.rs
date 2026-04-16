@@ -243,3 +243,42 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
 
     total.max(1)
 }
+
+/// 计算系统消息的 tokens
+pub(crate) fn count_system_message_tokens(message: &SystemMessage) -> u64 {
+    count_tokens(&message.text)
+}
+
+/// 工具定义估算单位（基线工具开销，避免每个 schema 都重复计算）
+const TOKENS_PER_TOOL: u64 = 150;
+
+/// 计算工具定义的 tokens
+pub(crate) fn count_tool_definition_tokens(_tool: &Tool) -> u64 {
+    TOKENS_PER_TOOL
+}
+
+/// 计算消息内容块的 tokens（用于 cache_tracker 计算每个 block 的 token 数）
+pub(crate) fn count_message_content_tokens(value: &serde_json::Value) -> u64 {
+    match value {
+        serde_json::Value::Null => 0,
+        serde_json::Value::String(s) => count_tokens(s),
+        serde_json::Value::Array(arr) => arr.iter().map(count_message_content_tokens).sum(),
+        serde_json::Value::Object(obj) => {
+            if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                return count_tokens(text);
+            }
+            if let Some(thinking) = obj.get("thinking").and_then(|v| v.as_str()) {
+                return count_tokens(thinking);
+            }
+            if let Some(input) = obj.get("input") {
+                let json = serde_json::to_string(input).unwrap_or_default();
+                return count_tokens(&json);
+            }
+            if let Some(content) = obj.get("content") {
+                return count_message_content_tokens(content);
+            }
+            0
+        }
+        _ => 0,
+    }
+}
