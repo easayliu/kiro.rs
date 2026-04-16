@@ -93,15 +93,19 @@ EOF
   fi
 
   # ---------- credentials.json ----------
+  # 使用多凭据数组格式，确保 Admin API 新增/修改凭据可被回写到文件，
+  # 避免容器重启后新增凭据丢失（单凭据对象格式不会被 persist_credentials 回写）。
   local CREDS_PATH="$INSTALL_DIR/config/credentials.json"
   if [[ -f "$CREDS_PATH" ]]; then
     warn "已存在 $CREDS_PATH，跳过覆盖"
   else
     cat > "$CREDS_PATH" <<'EOF'
-{
-  "kiroApiKey": "ksk_请填入你的_kiro_api_key",
-  "authMethod": "api_key"
-}
+[
+  {
+    "kiroApiKey": "ksk_请填入你的_kiro_api_key",
+    "authMethod": "api_key"
+  }
+]
 EOF
     warn "已写入 $CREDS_PATH 占位文件，请编辑并填入真实凭据（支持 api_key / social / idc）"
   fi
