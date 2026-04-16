@@ -156,10 +156,6 @@ impl CacheTracker {
         let last_breakpoint_tokens = last_breakpoint
             .cumulative_tokens
             .min(profile.total_input_tokens);
-        let uncached = profile
-            .total_input_tokens
-            .saturating_sub(last_breakpoint_tokens)
-            .max(0);
 
         let now = Instant::now();
         let mut entries = self.entries.lock();
@@ -237,13 +233,21 @@ impl CacheTracker {
             }
         }
 
-        let new_tokens = last_breakpoint_tokens.saturating_sub(matched_tokens).max(0);
+        let cache_read = matched_tokens.max(0);
+        let cache_creation = last_breakpoint_tokens.saturating_sub(matched_tokens).max(0);
         let (cache_5m, cache_1h) = compute_ttl_breakdown(profile, matched_tokens);
+
+        // Anthropic 公式：input_tokens = total - cache_read - cache_creation
+        let uncached = profile
+            .total_input_tokens
+            .saturating_sub(cache_read)
+            .saturating_sub(cache_creation)
+            .max(0);
 
         tracing::debug!(
             credential_id,
-            matched_tokens,
-            new_tokens,
+            cache_read,
+            cache_creation,
             uncached,
             cache_5m,
             cache_1h,
@@ -251,8 +255,8 @@ impl CacheTracker {
         );
 
         CacheResult {
-            cache_read_input_tokens: matched_tokens.max(0),
-            cache_creation_input_tokens: new_tokens,
+            cache_read_input_tokens: cache_read,
+            cache_creation_input_tokens: cache_creation,
             cache_creation_5m_input_tokens: cache_5m,
             cache_creation_1h_input_tokens: cache_1h,
             uncached_input_tokens: uncached,
