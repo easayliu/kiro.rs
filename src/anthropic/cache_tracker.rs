@@ -152,7 +152,20 @@ impl CacheTracker {
     /// 之前建立的缓存位置命中 —— 对应到本实现里即从本次请求的所有
     /// block 前缀指纹（倒序扫描，取最长匹配）中找命中。
     pub fn compute_and_update(&self, credential_id: u64, profile: &CacheProfile) -> CacheResult {
+        let breakpoints_info: Vec<(usize, i32)> = profile
+            .cacheable_breakpoints()
+            .iter()
+            .map(|bp| (bp.block_index, bp.cumulative_tokens))
+            .collect();
+
         let Some(last_breakpoint) = profile.last_cacheable_breakpoint() else {
+            tracing::info!(
+                credential_id,
+                block_count = profile.blocks.len(),
+                breakpoints = ?breakpoints_info,
+                total_input_tokens = profile.total_input_tokens,
+                "缓存分析：无可缓存 breakpoint，整段未缓存"
+            );
             return CacheResult {
                 uncached_input_tokens: profile.total_input_tokens,
                 ..Default::default()
@@ -169,6 +182,7 @@ impl CacheTracker {
         let credential_entries_opt = entries.by_credential.get_mut(&credential_id);
 
         let mut matched_tokens = 0;
+        let mut matched_block_index: Option<usize> = None;
 
         if let Some(credential_entries) = credential_entries_opt {
             tracing::debug!(
@@ -195,6 +209,7 @@ impl CacheTracker {
                     entry.expires_at = now + entry.ttl;
                     matched_tokens =
                         block.cumulative_tokens.min(profile.total_input_tokens);
+                    matched_block_index = Some(idx);
                     break;
                 }
             }
@@ -253,8 +268,15 @@ impl CacheTracker {
             .saturating_sub(cache_creation)
             .max(0);
 
-        tracing::debug!(
+        tracing::info!(
             credential_id,
+            block_count = profile.blocks.len(),
+            breakpoints = ?breakpoints_info,
+            matched_block_index = ?matched_block_index,
+            matched_cumulative = matched_tokens,
+            last_breakpoint_block_index = last_breakpoint.block_index,
+            last_breakpoint_cumulative = last_breakpoint.cumulative_tokens,
+            total_input_tokens = profile.total_input_tokens,
             cache_read,
             cache_creation,
             uncached,
