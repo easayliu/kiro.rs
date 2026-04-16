@@ -146,6 +146,11 @@ impl CacheTracker {
     }
 
     /// 原子地计算缓存命中并更新 checkpoint 表
+    ///
+    /// 命中查询模拟 Anthropic 原生行为：缓存点只在显式 `cache_control`
+    /// 位置建立（写入），但下次请求无论 breakpoint 打在哪，都能从
+    /// 之前建立的缓存位置命中 —— 对应到本实现里即从本次请求的所有
+    /// block 前缀指纹（倒序扫描，取最长匹配）中找命中。
     pub fn compute_and_update(&self, credential_id: u64, profile: &CacheProfile) -> CacheResult {
         let Some(last_breakpoint) = profile.last_cacheable_breakpoint() else {
             return CacheResult {
@@ -172,22 +177,24 @@ impl CacheTracker {
                 "查找缓存匹配"
             );
 
-            let cacheable_breakpoints = profile.cacheable_breakpoints();
-            let candidate_breakpoints: Vec<_> = cacheable_breakpoints
-                .iter()
-                .rev()
-                .take(PREFIX_LOOKBACK_LIMIT)
-                .copied()
-                .collect();
+            // 命中范围只能在最后 breakpoint 之前（含 last_breakpoint 位置）。
+            // 逆序扫描每个 block 的 prefix_fingerprint：一旦命中，即为最长命中。
+            let last_index = last_breakpoint.block_index;
+            let mut scanned = 0usize;
+            for idx in (0..=last_index).rev() {
+                if scanned >= PREFIX_LOOKBACK_LIMIT {
+                    break;
+                }
+                scanned += 1;
 
-            for breakpoint in candidate_breakpoints {
-                let candidate = &profile.blocks[breakpoint.block_index];
-                if let Some(entry) = credential_entries.get_mut(&candidate.prefix_fingerprint) {
+                let block = &profile.blocks[idx];
+                if let Some(entry) = credential_entries.get_mut(&block.prefix_fingerprint) {
                     if entry.expires_at <= now {
                         continue;
                     }
                     entry.expires_at = now + entry.ttl;
-                    matched_tokens = breakpoint.cumulative_tokens.min(profile.total_input_tokens);
+                    matched_tokens =
+                        block.cumulative_tokens.min(profile.total_input_tokens);
                     break;
                 }
             }
@@ -542,5 +549,199 @@ fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
             serde_json::Value::Object(out)
         }
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::types::{CacheControl, Message, MessagesRequest, SystemMessage};
+    use serde_json::json;
+
+    const LARGE_SYSTEM_CHARS: usize = 20_000; // 约 5k tokens（按 ~4 字符/token 估算，超过 sonnet-4.6 的 2048 门槛）
+
+    fn tracker() -> CacheTracker {
+        CacheTracker::new(DEFAULT_CACHE_TTL)
+    }
+
+    fn large_text(prefix: &str, size: usize) -> String {
+        let mut s = String::with_capacity(size + prefix.len());
+        s.push_str(prefix);
+        while s.len() < size {
+            s.push_str(" lorem ipsum dolor sit amet");
+        }
+        s
+    }
+
+    fn ephemeral_5m() -> CacheControl {
+        CacheControl {
+            cache_type: "ephemeral".to_string(),
+            ttl: None,
+        }
+    }
+
+    fn user_message(blocks: Vec<serde_json::Value>) -> Message {
+        Message {
+            role: "user".to_string(),
+            content: serde_json::Value::Array(blocks),
+        }
+    }
+
+    fn assistant_text(text: &str) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: json!([{ "type": "text", "text": text }]),
+        }
+    }
+
+    fn build_request(
+        system_text: &str,
+        messages: Vec<Message>,
+    ) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            messages,
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: system_text.to_string(),
+                block_type: Some("text".to_string()),
+                cache_control: None,
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        }
+    }
+
+    /// 第二轮请求的用户 breakpoint 指纹 ≠ 第一轮，但前缀（tools+system+第一轮 user+assistant）
+    /// 在第二轮的 blocks 中同样存在，应命中 cache_read。
+    #[test]
+    fn multi_turn_conversation_hits_cache_read() {
+        let tracker = tracker();
+        let credential_id = 42;
+
+        let system = large_text("SYSTEM ", LARGE_SYSTEM_CHARS);
+        let turn1_user = user_message(vec![
+            json!({
+                "type": "text",
+                "text": "first user message",
+                "cache_control": ephemeral_5m(),
+            }),
+        ]);
+        let req1 = build_request(&system, vec![turn1_user.clone()]);
+        // 第一轮：token 数随便给个覆盖 min_cacheable（由内部重新估算）
+        let profile1 = tracker.build_profile(&req1, 10_000);
+        let r1 = tracker.compute_and_update(credential_id, &profile1);
+        assert_eq!(r1.cache_read_input_tokens, 0, "第一轮应全部 creation");
+        assert!(
+            r1.cache_creation_input_tokens > 0,
+            "第一轮应建立缓存，got={:?}",
+            r1
+        );
+
+        // 第二轮：前缀保留第一轮的 user + assistant，再追加新 user（打新 breakpoint）
+        let assistant = assistant_text("assistant reply");
+        let turn2_user = user_message(vec![
+            json!({
+                "type": "text",
+                "text": "second user message",
+                "cache_control": ephemeral_5m(),
+            }),
+        ]);
+        let req2 = build_request(
+            &system,
+            vec![turn1_user, assistant, turn2_user],
+        );
+        let profile2 = tracker.build_profile(&req2, 12_000);
+        let r2 = tracker.compute_and_update(credential_id, &profile2);
+
+        assert!(
+            r2.cache_read_input_tokens > 0,
+            "第二轮应命中第一轮的前缀缓存，cache_read={}, full={:?}",
+            r2.cache_read_input_tokens,
+            r2
+        );
+        // 命中 token 应等于第一轮最后 breakpoint 的累计
+        assert_eq!(
+            r2.cache_read_input_tokens, r1.cache_creation_input_tokens,
+            "cache_read 应等于第一轮 creation（=第一轮 breakpoint 累计）"
+        );
+        assert!(
+            r2.cache_creation_input_tokens > 0,
+            "第二轮仍会给新 breakpoint 建缓存"
+        );
+    }
+
+    /// 第一轮无任何 breakpoint：不写表，也不报 creation。
+    #[test]
+    fn no_breakpoint_no_cache_activity() {
+        let tracker = tracker();
+        let req = build_request(
+            "small system",
+            vec![user_message(vec![json!({
+                "type": "text",
+                "text": "no cache markers",
+            })])],
+        );
+        let profile = tracker.build_profile(&req, 5_000);
+        let r = tracker.compute_and_update(7, &profile);
+        assert_eq!(r.cache_read_input_tokens, 0);
+        assert_eq!(r.cache_creation_input_tokens, 0);
+        assert_eq!(r.uncached_input_tokens, 5_000);
+    }
+
+    /// 两次请求完全相同：第二次应 cache_read 全量。
+    #[test]
+    fn identical_requests_fully_cached_on_second() {
+        let tracker = tracker();
+        let cred = 1;
+        let system = large_text("S ", LARGE_SYSTEM_CHARS);
+        let user = user_message(vec![json!({
+            "type": "text",
+            "text": "same text",
+            "cache_control": ephemeral_5m(),
+        })]);
+        let req = build_request(&system, vec![user]);
+
+        let p1 = tracker.build_profile(&req, 10_000);
+        let r1 = tracker.compute_and_update(cred, &p1);
+        assert_eq!(r1.cache_read_input_tokens, 0);
+        let creation = r1.cache_creation_input_tokens;
+        assert!(creation > 0);
+
+        let p2 = tracker.build_profile(&req, 10_000);
+        let r2 = tracker.compute_and_update(cred, &p2);
+        assert_eq!(
+            r2.cache_read_input_tokens, creation,
+            "完全相同的请求第二次应命中全部前缀"
+        );
+        assert_eq!(r2.cache_creation_input_tokens, 0);
+    }
+
+    /// 不同 credential 互不影响。
+    #[test]
+    fn cache_isolated_between_credentials() {
+        let tracker = tracker();
+        let system = large_text("S ", LARGE_SYSTEM_CHARS);
+        let req = build_request(
+            &system,
+            vec![user_message(vec![json!({
+                "type": "text",
+                "text": "hello",
+                "cache_control": ephemeral_5m(),
+            })])],
+        );
+        let p = tracker.build_profile(&req, 10_000);
+        tracker.compute_and_update(1, &p);
+
+        let p2 = tracker.build_profile(&req, 10_000);
+        let r = tracker.compute_and_update(2, &p2);
+        assert_eq!(
+            r.cache_read_input_tokens, 0,
+            "credential 2 应看不到 credential 1 的缓存"
+        );
     }
 }
