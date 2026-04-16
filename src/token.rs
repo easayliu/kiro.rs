@@ -249,12 +249,10 @@ pub(crate) fn count_system_message_tokens(message: &SystemMessage) -> u64 {
     count_tokens(&message.text)
 }
 
-/// 工具定义估算单位（基线工具开销，避免每个 schema 都重复计算）
-const TOKENS_PER_TOOL: u64 = 150;
-
 /// 计算工具定义的 tokens
-pub(crate) fn count_tool_definition_tokens(_tool: &Tool) -> u64 {
-    TOKENS_PER_TOOL
+pub(crate) fn count_tool_definition_tokens(tool: &Tool) -> u64 {
+    let json = serde_json::to_string(tool).unwrap_or_default();
+    count_tokens(&json)
 }
 
 /// 计算消息内容块的 tokens（用于 cache_tracker 计算每个 block 的 token 数）

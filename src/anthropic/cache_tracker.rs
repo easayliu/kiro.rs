@@ -3,8 +3,14 @@
 //! 通过在代理内部按 credential + prefix fingerprint 记录缓存 checkpoint，
 //! 在 Anthropic API 响应的 usage 字段中补上 `cache_creation_input_tokens` /
 //! `cache_read_input_tokens`（及 5m / 1h 细分），使客户端能感知命中情况。
+//!
+//! 对齐 Anthropic 官方 prompt caching 行为：
+//! - 仅在显式 `cache_control` 标记处建立 breakpoint（不自动在 message 边界插入）
+//! - 最多保留 4 个 breakpoint（超出取最后 4 个）
+//! - `input_tokens` = 最后 breakpoint 之后的未缓存 tokens
+//! - `total_processed = cache_read + cache_creation + input_tokens`
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -19,6 +25,8 @@ use super::types::{CacheControl, Message, MessagesRequest};
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
 const ONE_HOUR_CACHE_TTL: Duration = Duration::from_secs(3600);
 const PREFIX_LOOKBACK_LIMIT: usize = 10;
+const MAX_BREAKPOINTS: usize = 4;
+const MAX_ENTRIES_PER_CREDENTIAL: usize = 1000;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CacheResult {
@@ -26,6 +34,8 @@ pub struct CacheResult {
     pub cache_creation_input_tokens: i32,
     pub cache_creation_5m_input_tokens: i32,
     pub cache_creation_1h_input_tokens: i32,
+    /// 最后 breakpoint 之后的未缓存 tokens，对应 Anthropic 返回的 input_tokens
+    pub uncached_input_tokens: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -82,7 +92,6 @@ impl CacheTracker {
     ) -> CacheProfile {
         let flattened = flatten_cacheable_blocks(payload);
 
-        // 与 prompt 内容无关但会影响官方缓存可复用性的固定配置。
         let request_prelude = canonicalize_json(serde_json::json!({
             "model": payload.model,
             "tool_choice": payload.tool_choice,
@@ -95,9 +104,6 @@ impl CacheTracker {
         let mut blocks = Vec::with_capacity(flattened.len());
         let mut breakpoints = Vec::new();
         let mut cumulative_tokens = 0i32;
-
-        let mut active_ttl: Option<Duration> = None;
-        let mut seen_breakpoints: BTreeSet<usize> = BTreeSet::new();
 
         for (index, block) in flattened.into_iter().enumerate() {
             cumulative_tokens = cumulative_tokens.saturating_add(block.tokens);
@@ -118,25 +124,17 @@ impl CacheTracker {
 
             if let Some(ttl) = block.breakpoint_ttl {
                 let ttl = ttl.min(self.max_supported_ttl);
-                active_ttl = Some(ttl);
-                if seen_breakpoints.insert(index) {
-                    breakpoints.push(CacheBreakpoint {
-                        block_index: index,
-                        ttl,
-                    });
-                }
-            }
-
-            if block.is_message_end
-                && block.message_index.is_some()
-                && let Some(ttl) = active_ttl
-                && seen_breakpoints.insert(index)
-            {
                 breakpoints.push(CacheBreakpoint {
                     block_index: index,
                     ttl,
                 });
             }
+        }
+
+        // Anthropic 限制最多 4 个 breakpoint，超出时只保留最后 4 个
+        if breakpoints.len() > MAX_BREAKPOINTS {
+            let start = breakpoints.len() - MAX_BREAKPOINTS;
+            breakpoints = breakpoints.split_off(start);
         }
 
         CacheProfile {
@@ -147,85 +145,62 @@ impl CacheTracker {
         }
     }
 
-    pub fn compute(&self, credential_id: u64, profile: &CacheProfile) -> CacheResult {
+    /// 原子地计算缓存命中并更新 checkpoint 表
+    pub fn compute_and_update(&self, credential_id: u64, profile: &CacheProfile) -> CacheResult {
         let Some(last_breakpoint) = profile.last_cacheable_breakpoint() else {
-            return CacheResult::default();
+            return CacheResult {
+                uncached_input_tokens: profile.total_input_tokens,
+                ..Default::default()
+            };
         };
         let last_breakpoint_tokens = last_breakpoint
             .cumulative_tokens
             .min(profile.total_input_tokens);
+        let uncached = profile
+            .total_input_tokens
+            .saturating_sub(last_breakpoint_tokens)
+            .max(0);
 
         let now = Instant::now();
         let mut entries = self.entries.lock();
         prune_expired(&mut entries.by_credential, now);
 
-        let Some(credential_entries) = entries.by_credential.get_mut(&credential_id) else {
-            // 首次请求，需要创建缓存
-            tracing::debug!(credential_id, "首次请求，无缓存条目");
-            let (cache_5m, cache_1h) = compute_ttl_breakdown(profile, 0);
-            return CacheResult {
-                cache_read_input_tokens: 0,
-                cache_creation_input_tokens: last_breakpoint_tokens,
-                cache_creation_5m_input_tokens: cache_5m,
-                cache_creation_1h_input_tokens: cache_1h,
-            };
-        };
-
-        tracing::debug!(
-            credential_id,
-            entry_count = credential_entries.len(),
-            "查找缓存匹配"
-        );
+        let credential_entries_opt = entries.by_credential.get_mut(&credential_id);
 
         let mut matched_tokens = 0;
 
-        let cacheable_breakpoints = profile.cacheable_breakpoints();
-        let candidate_breakpoints: Vec<_> = cacheable_breakpoints
-            .iter()
-            .rev()
-            .take(PREFIX_LOOKBACK_LIMIT)
-            .copied()
-            .collect();
+        if let Some(credential_entries) = credential_entries_opt {
+            tracing::debug!(
+                credential_id,
+                entry_count = credential_entries.len(),
+                "查找缓存匹配"
+            );
 
-        'outer: for breakpoint in candidate_breakpoints {
-            let candidate = &profile.blocks[breakpoint.block_index];
-            if let Some(entry) = credential_entries.get_mut(&candidate.prefix_fingerprint) {
-                if entry.expires_at <= now {
-                    continue;
+            let cacheable_breakpoints = profile.cacheable_breakpoints();
+            let candidate_breakpoints: Vec<_> = cacheable_breakpoints
+                .iter()
+                .rev()
+                .take(PREFIX_LOOKBACK_LIMIT)
+                .copied()
+                .collect();
+
+            for breakpoint in candidate_breakpoints {
+                let candidate = &profile.blocks[breakpoint.block_index];
+                if let Some(entry) = credential_entries.get_mut(&candidate.prefix_fingerprint) {
+                    if entry.expires_at <= now {
+                        continue;
+                    }
+                    entry.expires_at = now + entry.ttl;
+                    matched_tokens = breakpoint.cumulative_tokens.min(profile.total_input_tokens);
+                    break;
                 }
-                entry.expires_at = now + entry.ttl;
-                matched_tokens = breakpoint.cumulative_tokens.min(profile.total_input_tokens);
-                break 'outer;
             }
+        } else {
+            tracing::debug!(credential_id, "首次请求，无缓存条目");
         }
 
-        let new_tokens = last_breakpoint_tokens.saturating_sub(matched_tokens).max(0);
-        let (cache_5m, cache_1h) = compute_ttl_breakdown(profile, matched_tokens);
-
-        tracing::debug!(
-            credential_id,
-            matched_tokens,
-            new_tokens,
-            cache_5m,
-            cache_1h,
-            "缓存计算结果"
-        );
-
-        CacheResult {
-            cache_read_input_tokens: matched_tokens.max(0),
-            cache_creation_input_tokens: new_tokens,
-            cache_creation_5m_input_tokens: cache_5m,
-            cache_creation_1h_input_tokens: cache_1h,
-        }
-    }
-
-    pub fn update(&self, credential_id: u64, profile: &CacheProfile) {
-        let now = Instant::now();
-        let mut entries = self.entries.lock();
-        prune_expired(&mut entries.by_credential, now);
-
+        // 更新 checkpoint 表（在同一个锁范围内）
         let credential_entries = entries.by_credential.entry(credential_id).or_default();
-
         for breakpoint in profile.cacheable_breakpoints() {
             let block = &profile.blocks[breakpoint.block_index];
             let next_expiry = now + breakpoint.ttl;
@@ -247,6 +222,40 @@ impl CacheTracker {
                     );
                 }
             }
+        }
+
+        // 容量淘汰：按过期时间删除最旧的条目
+        if credential_entries.len() > MAX_ENTRIES_PER_CREDENTIAL {
+            let mut sorted: Vec<_> = credential_entries
+                .iter()
+                .map(|(k, v)| (*k, v.expires_at))
+                .collect();
+            sorted.sort_by_key(|(_, expires)| *expires);
+            let to_remove = credential_entries.len() - MAX_ENTRIES_PER_CREDENTIAL;
+            for (key, _) in sorted.into_iter().take(to_remove) {
+                credential_entries.remove(&key);
+            }
+        }
+
+        let new_tokens = last_breakpoint_tokens.saturating_sub(matched_tokens).max(0);
+        let (cache_5m, cache_1h) = compute_ttl_breakdown(profile, matched_tokens);
+
+        tracing::debug!(
+            credential_id,
+            matched_tokens,
+            new_tokens,
+            uncached,
+            cache_5m,
+            cache_1h,
+            "缓存计算结果"
+        );
+
+        CacheResult {
+            cache_read_input_tokens: matched_tokens.max(0),
+            cache_creation_input_tokens: new_tokens,
+            cache_creation_5m_input_tokens: cache_5m,
+            cache_creation_1h_input_tokens: cache_1h,
+            uncached_input_tokens: uncached,
         }
     }
 }
@@ -309,8 +318,6 @@ struct PendingBlock {
     value: serde_json::Value,
     tokens: i32,
     breakpoint_ttl: Option<Duration>,
-    message_index: Option<usize>,
-    is_message_end: bool,
 }
 
 fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
@@ -330,8 +337,6 @@ fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
                 })),
                 tokens: count_tool_definition_tokens(tool) as i32,
                 breakpoint_ttl,
-                message_index: None,
-                is_message_end: false,
             });
         }
     }
@@ -351,8 +356,6 @@ fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
                 })),
                 tokens: count_system_message_tokens(block) as i32,
                 breakpoint_ttl,
-                message_index: None,
-                is_message_end: false,
             });
         }
     }
@@ -404,35 +407,29 @@ fn flatten_message_blocks(message_index: usize, message: &Message) -> Vec<Pendin
                 "text": text,
             }),
             None,
-            true,
         )],
-        serde_json::Value::Array(blocks) => {
-            let last_block_index = blocks.len().saturating_sub(1);
-            blocks
-                .iter()
-                .enumerate()
-                .map(|(block_index, block)| {
-                    let breakpoint_ttl = extract_cache_ttl(block);
-                    let mut normalized = block.clone();
-                    strip_cache_control(&mut normalized);
-                    build_message_block(
-                        message_index,
-                        &message.role,
-                        block_index,
-                        normalized,
-                        breakpoint_ttl,
-                        block_index == last_block_index,
-                    )
-                })
-                .collect()
-        }
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .enumerate()
+            .map(|(block_index, block)| {
+                let breakpoint_ttl = extract_cache_ttl(block);
+                let mut normalized = block.clone();
+                strip_cache_control(&mut normalized);
+                build_message_block(
+                    message_index,
+                    &message.role,
+                    block_index,
+                    normalized,
+                    breakpoint_ttl,
+                )
+            })
+            .collect(),
         other => vec![build_message_block(
             message_index,
             &message.role,
             0,
             other.clone(),
             None,
-            true,
         )],
     }
 }
@@ -443,7 +440,6 @@ fn build_message_block(
     block_index: usize,
     block: serde_json::Value,
     breakpoint_ttl: Option<Duration>,
-    is_message_end: bool,
 ) -> PendingBlock {
     PendingBlock {
         tokens: count_message_content_tokens(&block) as i32,
@@ -455,8 +451,6 @@ fn build_message_block(
             "block": block,
         })),
         breakpoint_ttl,
-        message_index: Some(message_index),
-        is_message_end,
     }
 }
 
@@ -491,11 +485,26 @@ fn strip_cache_control(value: &mut serde_json::Value) {
 }
 
 fn minimum_cacheable_tokens_for_model(model: &str) -> i32 {
-    let model_lower = model.to_lowercase();
-
-    if model_lower.contains("opus") {
+    let m = model.to_lowercase();
+    if m.contains("opus-4-6")
+        || m.contains("opus-4-5")
+        || m.contains("opus-4.6")
+        || m.contains("opus-4.5")
+    {
         4096
-    } else if model_lower.contains("haiku-3") || model_lower.contains("haiku_3") {
+    } else if m.contains("opus") {
+        1024
+    } else if m.contains("sonnet-4-6") || m.contains("sonnet-4.6") || m.contains("sonnet_4_6") {
+        2048
+    } else if m.contains("sonnet") {
+        1024
+    } else if m.contains("haiku-4-5")
+        || m.contains("haiku-4.5")
+        || m.contains("haiku_4_5")
+        || m.contains("haiku_4.5")
+    {
+        4096
+    } else if m.contains("haiku") {
         2048
     } else {
         1024

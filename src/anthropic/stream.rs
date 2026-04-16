@@ -275,6 +275,8 @@ pub struct CacheUsage {
     pub cache_read_input_tokens: i32,
     pub cache_creation_5m_input_tokens: i32,
     pub cache_creation_1h_input_tokens: i32,
+    /// 最后 breakpoint 之后的未缓存 tokens，对应 Anthropic 返回的 input_tokens
+    pub uncached_input_tokens: i32,
 }
 
 /// SSE 状态管理器
@@ -547,9 +549,11 @@ pub struct StreamContext {
     pub model: String,
     /// 消息 ID
     pub message_id: String,
-    /// 输入 tokens（估算值）
+    /// 输入 tokens（估算值，用于 contextUsageEvent 的上下文窗口判断）
+    #[allow(dead_code)]
     pub input_tokens: i32,
     /// 从 contextUsageEvent 计算的实际输入 tokens
+    #[allow(dead_code)]
     pub context_input_tokens: Option<i32>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
@@ -611,20 +615,12 @@ impl StreamContext {
             cache_read_input_tokens: ctx.cache_read_input_tokens,
             cache_creation_5m_input_tokens: ctx.cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens: ctx.cache_creation_1h_input_tokens,
+            uncached_input_tokens: ctx.uncached_input_tokens,
         };
-    }
-
-    /// 计算剔除 cache 读写后的 billed input tokens
-    fn billed_input_tokens(&self, input_tokens: i32) -> i32 {
-        input_tokens
-            .saturating_sub(self.cache_usage.cache_creation_input_tokens)
-            .saturating_sub(self.cache_usage.cache_read_input_tokens)
-            .max(0)
     }
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
-        let billed = self.billed_input_tokens(self.input_tokens);
         json!({
             "type": "message_start",
             "message": {
@@ -636,7 +632,7 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": billed,
+                    "input_tokens": self.cache_usage.uncached_input_tokens,
                     "output_tokens": 1,
                     "cache_creation_input_tokens": self.cache_usage.cache_creation_input_tokens,
                     "cache_read_input_tokens": self.cache_usage.cache_read_input_tokens,
@@ -1175,17 +1171,13 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
-        // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
-        let billed = self.billed_input_tokens(final_input_tokens);
-
         // 把 cache usage 透传给 state_manager，让 message_delta 输出 cache_* 字段
         self.state_manager.set_final_usage(self.cache_usage);
 
-        // 生成最终事件
+        // 生成最终事件（input_tokens 使用 uncached_input_tokens）
         events.extend(
             self.state_manager
-                .generate_final_events(billed, self.output_tokens),
+                .generate_final_events(self.cache_usage.uncached_input_tokens, self.output_tokens),
         );
         events
     }
@@ -1206,8 +1198,6 @@ pub struct BufferedStreamContext {
     inner: StreamContext,
     /// 缓冲的所有事件（包括 message_start、content_block_start 等）
     event_buffer: Vec<SseEvent>,
-    /// 估算的 input_tokens（用于回退）
-    estimated_input_tokens: i32,
     /// 是否已经生成了初始事件
     initial_events_generated: bool,
 }
@@ -1225,7 +1215,6 @@ impl BufferedStreamContext {
         Self {
             inner,
             event_buffer: Vec::new(),
-            estimated_input_tokens,
             initial_events_generated: false,
         }
     }
@@ -1269,23 +1258,8 @@ impl BufferedStreamContext {
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        // 获取正确的 input_tokens
-        let final_input_tokens = self
-            .inner
-            .context_input_tokens
-            .unwrap_or(self.estimated_input_tokens);
-        let billed = self.inner.billed_input_tokens(final_input_tokens);
-
-        // 更正 message_start 事件中的 input_tokens（同时保持 cache_* 字段与最终 usage 一致）
-        for event in &mut self.event_buffer {
-            if event.event == "message_start" {
-                if let Some(message) = event.data.get_mut("message") {
-                    if let Some(usage) = message.get_mut("usage") {
-                        usage["input_tokens"] = serde_json::json!(billed);
-                    }
-                }
-            }
-        }
+        // uncached_input_tokens 已由 cache_tracker 在 build_profile 阶段计算好，
+        // message_start 中的 input_tokens 已经是正确的 uncached 值，无需更正。
 
         std::mem::take(&mut self.event_buffer)
     }

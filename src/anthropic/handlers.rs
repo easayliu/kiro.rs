@@ -37,31 +37,8 @@ pub(crate) struct CacheUsageContext {
     pub cache_read_input_tokens: i32,
     pub cache_creation_5m_input_tokens: i32,
     pub cache_creation_1h_input_tokens: i32,
-}
-
-pub(crate) fn resolved_cache_usage(
-    cache_tracker: &CacheTracker,
-    credential_id: u64,
-    profile: &CacheProfile,
-) -> CacheUsageContext {
-    let result = cache_tracker.compute(credential_id, profile);
-    CacheUsageContext {
-        cache_creation_input_tokens: result.cache_creation_input_tokens,
-        cache_read_input_tokens: result.cache_read_input_tokens,
-        cache_creation_5m_input_tokens: result.cache_creation_5m_input_tokens,
-        cache_creation_1h_input_tokens: result.cache_creation_1h_input_tokens,
-    }
-}
-
-pub(crate) fn billed_input_tokens(
-    input_tokens: i32,
-    cache_creation_input_tokens: i32,
-    cache_read_input_tokens: i32,
-) -> i32 {
-    input_tokens
-        .saturating_sub(cache_creation_input_tokens)
-        .saturating_sub(cache_read_input_tokens)
-        .max(0)
+    /// 最后 breakpoint 之后的未缓存 tokens，对应 Anthropic 返回的 input_tokens
+    pub uncached_input_tokens: i32,
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -369,9 +346,15 @@ async fn handle_stream_request(
         Err(e) => return map_provider_error(e),
     };
 
-    // 按 credential 维度计算缓存命中，并更新 checkpoint 表
-    let cache_context = resolved_cache_usage(&cache_tracker, api_result.credential_id, &cache_profile);
-    cache_tracker.update(api_result.credential_id, &cache_profile);
+    // 原子地计算缓存命中并更新 checkpoint 表
+    let cache_result = cache_tracker.compute_and_update(api_result.credential_id, &cache_profile);
+    let cache_context = CacheUsageContext {
+        cache_creation_input_tokens: cache_result.cache_creation_input_tokens,
+        cache_read_input_tokens: cache_result.cache_read_input_tokens,
+        cache_creation_5m_input_tokens: cache_result.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: cache_result.cache_creation_1h_input_tokens,
+        uncached_input_tokens: cache_result.uncached_input_tokens,
+    };
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
@@ -500,7 +483,7 @@ async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
-    input_tokens: i32,
+    _input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     cache_tracker: Arc<CacheTracker>,
@@ -512,9 +495,15 @@ async fn handle_non_stream_request(
         Err(e) => return map_provider_error(e),
     };
 
-    // 按 credential 维度计算缓存命中，并更新 checkpoint 表
-    let cache_context = resolved_cache_usage(&cache_tracker, api_result.credential_id, &cache_profile);
-    cache_tracker.update(api_result.credential_id, &cache_profile);
+    // 原子地计算缓存命中并更新 checkpoint 表
+    let cache_result = cache_tracker.compute_and_update(api_result.credential_id, &cache_profile);
+    let cache_context = CacheUsageContext {
+        cache_creation_input_tokens: cache_result.cache_creation_input_tokens,
+        cache_read_input_tokens: cache_result.cache_read_input_tokens,
+        cache_creation_5m_input_tokens: cache_result.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: cache_result.cache_creation_1h_input_tokens,
+        uncached_input_tokens: cache_result.uncached_input_tokens,
+    };
 
     let response = api_result.response;
 
@@ -544,8 +533,6 @@ async fn handle_non_stream_request(
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
-    // 从 contextUsageEvent 计算的实际输入 tokens
-    let mut context_input_tokens: Option<i32> = None;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -603,7 +590,6 @@ async fn handle_non_stream_request(
                                 * (window_size as f64)
                                 / 100.0)
                                 as i32;
-                            context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
@@ -667,14 +653,6 @@ async fn handle_non_stream_request(
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
-    let billed = billed_input_tokens(
-        final_input_tokens,
-        cache_context.cache_creation_input_tokens,
-        cache_context.cache_read_input_tokens,
-    );
-
     // 构建 Anthropic 响应
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
@@ -685,7 +663,7 @@ async fn handle_non_stream_request(
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
-            "input_tokens": billed,
+            "input_tokens": cache_context.uncached_input_tokens,
             "output_tokens": output_tokens,
             "cache_creation_input_tokens": cache_context.cache_creation_input_tokens,
             "cache_read_input_tokens": cache_context.cache_read_input_tokens,
@@ -927,9 +905,15 @@ async fn handle_stream_request_buffered(
         Err(e) => return map_provider_error(e),
     };
 
-    // 按 credential 维度计算缓存命中，并更新 checkpoint 表
-    let cache_context = resolved_cache_usage(&cache_tracker, api_result.credential_id, &cache_profile);
-    cache_tracker.update(api_result.credential_id, &cache_profile);
+    // 原子地计算缓存命中并更新 checkpoint 表
+    let cache_result = cache_tracker.compute_and_update(api_result.credential_id, &cache_profile);
+    let cache_context = CacheUsageContext {
+        cache_creation_input_tokens: cache_result.cache_creation_input_tokens,
+        cache_read_input_tokens: cache_result.cache_read_input_tokens,
+        cache_creation_5m_input_tokens: cache_result.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: cache_result.cache_creation_1h_input_tokens,
+        uncached_input_tokens: cache_result.uncached_input_tokens,
+    };
 
     // 创建缓冲流处理上下文
     let mut ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
