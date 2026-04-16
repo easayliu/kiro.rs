@@ -184,6 +184,8 @@ async fn call_remote_count_tokens(
 }
 
 /// 本地计算请求的输入 tokens
+///
+/// 使用与 cache_tracker 相同的 block 级函数，确保 total 和 block 累加口径一致。
 fn count_all_tokens_local(
     system: Option<Vec<SystemMessage>>,
     messages: Vec<Message>,
@@ -191,34 +193,23 @@ fn count_all_tokens_local(
 ) -> u64 {
     let mut total = 0;
 
-    // 系统消息
-    if let Some(ref system) = system {
-        for msg in system {
-            total += count_tokens(&msg.text);
-        }
-    }
-
-    // 用户消息
-    for msg in &messages {
-        if let serde_json::Value::String(s) = &msg.content {
-            total += count_tokens(s);
-        } else if let serde_json::Value::Array(arr) = &msg.content {
-            for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    total += count_tokens(text);
-                }
-            }
-        }
-    }
-
-    // 工具定义
+    // 工具定义（与 cache_tracker 使用相同的 count_tool_definition_tokens）
     if let Some(ref tools) = tools {
         for tool in tools {
-            total += count_tokens(&tool.name);
-            total += count_tokens(&tool.description);
-            let input_schema_json = serde_json::to_string(&tool.input_schema).unwrap_or_default();
-            total += count_tokens(&input_schema_json);
+            total += count_tool_definition_tokens(tool);
         }
+    }
+
+    // 系统消息（与 cache_tracker 使用相同的 count_system_message_tokens）
+    if let Some(ref system) = system {
+        for msg in system {
+            total += count_system_message_tokens(msg);
+        }
+    }
+
+    // 用户/助手消息（与 cache_tracker 使用相同的 count_message_content_tokens）
+    for msg in &messages {
+        total += count_message_content_tokens(&msg.content);
     }
 
     total.max(1)
