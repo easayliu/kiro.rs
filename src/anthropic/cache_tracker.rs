@@ -1,8 +1,11 @@
 //! Prompt Caching 本地追踪器
 //!
-//! 通过在代理内部按 credential + prefix fingerprint 记录缓存 checkpoint，
+//! 通过在代理内部按 prefix fingerprint 记录缓存 checkpoint，
 //! 在 Anthropic API 响应的 usage 字段中补上 `cache_creation_input_tokens` /
 //! `cache_read_input_tokens`（及 5m / 1h 细分），使客户端能感知命中情况。
+//!
+//! 上游 Kiro API 不支持 prompt caching，本追踪器纯本地模拟，
+//! 所有凭据共享同一份 checkpoint 表。
 //!
 //! 对齐 Anthropic 官方 prompt caching 行为：
 //! - 仅在显式 `cache_control` 标记处建立 breakpoint（不自动在 message 边界插入）
@@ -26,7 +29,7 @@ const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
 const ONE_HOUR_CACHE_TTL: Duration = Duration::from_secs(3600);
 const PREFIX_LOOKBACK_LIMIT: usize = 10;
 const MAX_BREAKPOINTS: usize = 4;
-const MAX_ENTRIES_PER_CREDENTIAL: usize = 1000;
+const MAX_ENTRIES: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CacheResult {
@@ -66,21 +69,15 @@ struct CacheEntry {
     expires_at: Instant,
 }
 
-struct CachedCheckpointStore {
-    by_credential: HashMap<u64, HashMap<[u8; 32], CacheEntry>>,
-}
-
 pub struct CacheTracker {
-    entries: Mutex<CachedCheckpointStore>,
+    entries: Mutex<HashMap<[u8; 32], CacheEntry>>,
     max_supported_ttl: Duration,
 }
 
 impl CacheTracker {
     pub fn new(max_supported_ttl: Duration) -> Self {
         Self {
-            entries: Mutex::new(CachedCheckpointStore {
-                by_credential: HashMap::new(),
-            }),
+            entries: Mutex::new(HashMap::new()),
             max_supported_ttl,
         }
     }
@@ -151,6 +148,8 @@ impl CacheTracker {
     /// 位置建立（写入），但下次请求无论 breakpoint 打在哪，都能从
     /// 之前建立的缓存位置命中 —— 对应到本实现里即从本次请求的所有
     /// block 前缀指纹（倒序扫描，取最长匹配）中找命中。
+    ///
+    /// `credential_id` 仅用于诊断日志，不影响缓存查找/存储。
     pub fn compute_and_update(&self, credential_id: u64, profile: &CacheProfile) -> CacheResult {
         let breakpoints_info: Vec<(usize, i32)> = profile
             .cacheable_breakpoints()
@@ -177,60 +176,51 @@ impl CacheTracker {
 
         let now = Instant::now();
         let mut entries = self.entries.lock();
-        prune_expired(&mut entries.by_credential, now);
-
-        let credential_entries_opt = entries.by_credential.get_mut(&credential_id);
+        entries.retain(|_, entry| entry.expires_at > now);
 
         let mut matched_tokens = 0;
         let mut matched_block_index: Option<usize> = None;
 
-        if let Some(credential_entries) = credential_entries_opt {
-            tracing::debug!(
-                credential_id,
-                entry_count = credential_entries.len(),
-                "查找缓存匹配"
-            );
+        tracing::debug!(
+            credential_id,
+            entry_count = entries.len(),
+            "查找缓存匹配"
+        );
 
-            // 命中范围只能在最后 breakpoint 之前（含 last_breakpoint 位置）。
-            // 逆序扫描每个 block 的 prefix_fingerprint：一旦命中，即为最长命中。
-            let last_index = last_breakpoint.block_index;
-            let mut scanned = 0usize;
-            for idx in (0..=last_index).rev() {
-                if scanned >= PREFIX_LOOKBACK_LIMIT {
-                    break;
-                }
-                scanned += 1;
-
-                let block = &profile.blocks[idx];
-                if let Some(entry) = credential_entries.get_mut(&block.prefix_fingerprint) {
-                    if entry.expires_at <= now {
-                        continue;
-                    }
-                    entry.expires_at = now + entry.ttl;
-                    matched_tokens =
-                        block.cumulative_tokens.min(profile.total_input_tokens);
-                    matched_block_index = Some(idx);
-                    break;
-                }
+        let last_index = last_breakpoint.block_index;
+        let mut scanned = 0usize;
+        for idx in (0..=last_index).rev() {
+            if scanned >= PREFIX_LOOKBACK_LIMIT {
+                break;
             }
-        } else {
-            tracing::debug!(credential_id, "首次请求，无缓存条目");
+            scanned += 1;
+
+            let block = &profile.blocks[idx];
+            if let Some(entry) = entries.get_mut(&block.prefix_fingerprint) {
+                if entry.expires_at <= now {
+                    continue;
+                }
+                entry.expires_at = now + entry.ttl;
+                matched_tokens =
+                    block.cumulative_tokens.min(profile.total_input_tokens);
+                matched_block_index = Some(idx);
+                break;
+            }
         }
 
         // 更新 checkpoint 表（在同一个锁范围内）
-        let credential_entries = entries.by_credential.entry(credential_id).or_default();
         for breakpoint in profile.cacheable_breakpoints() {
             let block = &profile.blocks[breakpoint.block_index];
             let next_expiry = now + breakpoint.ttl;
 
-            match credential_entries.get_mut(&block.prefix_fingerprint) {
+            match entries.get_mut(&block.prefix_fingerprint) {
                 Some(existing) => {
                     existing.token_count = existing.token_count.max(block.cumulative_tokens);
                     existing.ttl = existing.ttl.max(breakpoint.ttl);
                     existing.expires_at = existing.expires_at.max(next_expiry);
                 }
                 None => {
-                    credential_entries.insert(
+                    entries.insert(
                         block.prefix_fingerprint,
                         CacheEntry {
                             token_count: block.cumulative_tokens,
@@ -243,15 +233,15 @@ impl CacheTracker {
         }
 
         // 容量淘汰：按过期时间删除最旧的条目
-        if credential_entries.len() > MAX_ENTRIES_PER_CREDENTIAL {
-            let mut sorted: Vec<_> = credential_entries
+        if entries.len() > MAX_ENTRIES {
+            let mut sorted: Vec<_> = entries
                 .iter()
                 .map(|(k, v)| (*k, v.expires_at))
                 .collect();
             sorted.sort_by_key(|(_, expires)| *expires);
-            let to_remove = credential_entries.len() - MAX_ENTRIES_PER_CREDENTIAL;
+            let to_remove = entries.len() - MAX_ENTRIES;
             for (key, _) in sorted.into_iter().take(to_remove) {
-                credential_entries.remove(&key);
+                entries.remove(&key);
             }
         }
 
@@ -259,9 +249,6 @@ impl CacheTracker {
         let cache_creation = last_breakpoint_tokens.saturating_sub(matched_tokens).max(0);
         let (cache_5m, cache_1h) = compute_ttl_breakdown(profile, matched_tokens);
 
-        // Anthropic 公式：input_tokens = total - cache_read - cache_creation
-        // total_input_tokens 包含消息结构 overhead，而 cache tokens 只计内容，
-        // 差值自然反映未缓存的部分。
         let uncached = profile
             .total_input_tokens
             .saturating_sub(cache_read)
@@ -546,13 +533,6 @@ fn minimum_cacheable_tokens_for_model(model: &str) -> i32 {
     }
 }
 
-fn prune_expired(entries: &mut HashMap<u64, HashMap<[u8; 32], CacheEntry>>, now: Instant) {
-    entries.retain(|_, credential_entries| {
-        credential_entries.retain(|_, entry| entry.expires_at > now);
-        !credential_entries.is_empty()
-    });
-}
-
 fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Array(arr) => {
@@ -743,9 +723,9 @@ mod tests {
         assert_eq!(r2.cache_creation_input_tokens, 0);
     }
 
-    /// 不同 credential 互不影响。
+    /// 不同 credential 共享缓存（上游无 prompt cache，本地纯模拟）。
     #[test]
-    fn cache_isolated_between_credentials() {
+    fn cache_shared_across_credentials() {
         let tracker = tracker();
         let system = large_text("S ", LARGE_SYSTEM_CHARS);
         let req = build_request(
@@ -757,13 +737,15 @@ mod tests {
             })])],
         );
         let p = tracker.build_profile(&req, 10_000);
-        tracker.compute_and_update(1, &p);
+        let r1 = tracker.compute_and_update(1, &p);
+        assert!(r1.cache_creation_input_tokens > 0);
 
         let p2 = tracker.build_profile(&req, 10_000);
-        let r = tracker.compute_and_update(2, &p2);
+        let r2 = tracker.compute_and_update(2, &p2);
         assert_eq!(
-            r.cache_read_input_tokens, 0,
-            "credential 2 应看不到 credential 1 的缓存"
+            r2.cache_read_input_tokens, r1.cache_creation_input_tokens,
+            "credential 2 应能命中 credential 1 建立的缓存"
         );
+        assert_eq!(r2.cache_creation_input_tokens, 0);
     }
 }
