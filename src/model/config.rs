@@ -97,6 +97,13 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
+    /// 全局缓存模式（默认 true）
+    ///
+    /// 启用后，所有凭据共享同一份 prompt cache checkpoint 表；
+    /// 关闭后，每个凭据独立维护 checkpoint，互不影响。
+    #[serde(default = "default_global_cache")]
+    pub global_cache: bool,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -143,6 +150,10 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_global_cache() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -166,6 +177,7 @@ impl Default for Config {
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
+            global_cache: default_global_cache(),
             config_path: None,
         }
     }

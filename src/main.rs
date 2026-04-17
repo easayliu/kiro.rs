@@ -117,10 +117,11 @@ async fn main() {
     });
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
-    let anthropic_app = anthropic::create_router_with_provider(
+    let (anthropic_app, app_state) = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
+        config.global_cache,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -136,7 +137,10 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
-            let admin_service = admin::AdminService::new(token_manager.clone());
+            let admin_service = admin::AdminService::new(
+                token_manager.clone(),
+                app_state.cache_tracker.clone(),
+            );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

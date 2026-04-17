@@ -10,6 +10,8 @@ import {
   deleteCredential,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getGlobalCache,
+  setGlobalCache,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -115,6 +117,25 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+// 获取全局缓存模式
+export function useGlobalCache() {
+  return useQuery({
+    queryKey: ['globalCache'],
+    queryFn: getGlobalCache,
+  })
+}
+
+// 设置全局缓存模式
+export function useSetGlobalCache() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setGlobalCache,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['globalCache'] })
     },
   })
 }

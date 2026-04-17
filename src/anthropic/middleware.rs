@@ -35,14 +35,15 @@ pub struct AppState {
 
 impl AppState {
     /// 创建新的应用状态
-    pub fn new(api_key: impl Into<String>, extract_thinking: bool) -> Self {
+    pub fn new(api_key: impl Into<String>, extract_thinking: bool, global_cache: bool) -> Self {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
-            cache_tracker: Arc::new(CacheTracker::new(std::time::Duration::from_secs(
-                DEFAULT_PROMPT_CACHE_TTL_SECS,
-            ))),
+            cache_tracker: Arc::new(CacheTracker::new(
+                std::time::Duration::from_secs(DEFAULT_PROMPT_CACHE_TTL_SECS),
+                global_cache,
+            )),
         }
     }
 

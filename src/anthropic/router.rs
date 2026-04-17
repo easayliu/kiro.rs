@@ -38,8 +38,9 @@ pub fn create_router_with_provider(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
-) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking);
+    global_cache: bool,
+) -> (Router, AppState) {
+    let mut state = AppState::new(api_key, extract_thinking, global_cache);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
@@ -64,10 +65,12 @@ pub fn create_router_with_provider(
             auth_middleware,
         ));
 
-    Router::new()
+    let router = Router::new()
         .nest("/v1", v1_routes)
         .nest("/cc/v1", cc_v1_routes)
         .layer(cors_layer())
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
-        .with_state(state)
+        .with_state(state.clone());
+
+    (router, state)
 }

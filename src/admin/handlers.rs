@@ -9,8 +9,8 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, SetDisabledRequest, SetGlobalCacheRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
     },
 };
 
@@ -136,6 +136,25 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/global-cache
+/// 获取全局缓存模式
+pub async fn get_global_cache(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_global_cache();
+    Json(response)
+}
+
+/// PUT /api/admin/config/global-cache
+/// 设置全局缓存模式
+pub async fn set_global_cache(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetGlobalCacheRequest>,
+) -> impl IntoResponse {
+    match state.service.set_global_cache(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

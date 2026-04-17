@@ -12,7 +12,7 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useGlobalCache, useSetGlobalCache } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
@@ -54,6 +54,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
+  const { data: globalCacheData, isLoading: isLoadingGlobalCache } = useGlobalCache()
+  const { mutate: setGlobalCacheMutation, isPending: isSettingGlobalCache } = useSetGlobalCache()
 
   // 计算分页
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
@@ -491,6 +493,20 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setVerifying(false)
   }
 
+  // 切换全局缓存模式
+  const handleToggleGlobalCache = () => {
+    const current = globalCacheData?.enabled ?? true
+    setGlobalCacheMutation(!current, {
+      onSuccess: () => {
+        const modeName = !current ? '全局共享' : '按凭据隔离'
+        toast.success(`缓存模式已切换到${modeName}`)
+      },
+      onError: (error) => {
+        toast.error(`切换失败: ${extractErrorMessage(error)}`)
+      }
+    })
+  }
+
   // 切换负载均衡模式
   const handleToggleLoadBalancing = () => {
     const currentMode = loadBalancingData?.mode || 'priority'
@@ -545,6 +561,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <span className="font-semibold">Kiro Admin</span>
           </div>
           <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleToggleGlobalCache}
+              disabled={isLoadingGlobalCache || isSettingGlobalCache}
+              title={
+                globalCacheData?.enabled
+                  ? '当前：全局共享缓存（所有凭据共享 checkpoint）· 点击切换到按凭据隔离'
+                  : '当前：按凭据隔离缓存（每个凭据独立 checkpoint）· 点击切换到全局共享'
+              }
+            >
+              {isLoadingGlobalCache ? '加载中...' : (globalCacheData?.enabled ? '全局缓存' : '隔离缓存')}
+            </Button>
             <Button
               variant="outline"
               size="sm"

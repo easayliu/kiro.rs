@@ -186,6 +186,24 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+// ============ 全局缓存配置 ============
+
+/// 全局缓存模式响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalCacheResponse {
+    /// 是否启用全局缓存
+    pub enabled: bool,
+}
+
+/// 设置全局缓存模式请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetGlobalCacheRequest {
+    /// 是否启用全局缓存
+    pub enabled: bool,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应
