@@ -683,53 +683,64 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
-        let entries = self.entries.lock();
+        let mut entries = self.entries.lock();
 
         // 检查是否是 opus 模型
         let is_opus = model
             .map(|m| m.to_lowercase().contains("opus"))
             .unwrap_or(false);
 
-        // 过滤可用凭据
-        let available: Vec<_> = entries
+        // 过滤可用凭据的索引
+        let available_indices: Vec<usize> = entries
             .iter()
-            .filter(|e| {
+            .enumerate()
+            .filter(|(_, e)| {
                 if e.disabled {
                     return false;
                 }
-                // 如果是 opus 模型，需要检查订阅等级
                 if is_opus && !e.credentials.supports_opus() {
                     return false;
                 }
                 true
             })
+            .map(|(i, _)| i)
             .collect();
 
-        if available.is_empty() {
+        if available_indices.is_empty() {
             return None;
         }
 
         let mode = self.load_balancing_mode.lock().clone();
         let mode = mode.as_str();
 
-        match mode {
+        let selected_index = match mode {
             "balanced" => {
                 // LRU 策略：选择最久未使用的凭据（last_used_at 最早者）
                 // None（从未使用）排在最前，优先分配给新加入的凭据。
                 // RFC3339 时间字符串的字典序与时间序一致，可直接比较。
                 // 平局时按优先级排序（数字越小优先级越高）。
-                let entry = available
-                    .iter()
-                    .min_by_key(|e| (e.last_used_at.clone(), e.credentials.priority))?;
-
-                Some((entry.id, entry.credentials.clone()))
+                *available_indices.iter().min_by_key(|&&i| {
+                    (entries[i].last_used_at.clone(), entries[i].credentials.priority)
+                })?
             }
             _ => {
                 // priority 模式（默认）：选择优先级最高的
-                let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
-                Some((entry.id, entry.credentials.clone()))
+                *available_indices
+                    .iter()
+                    .min_by_key(|&&i| entries[i].credentials.priority)?
             }
+        };
+
+        let entry = &mut entries[selected_index];
+        let result = (entry.id, entry.credentials.clone());
+
+        // balanced 模式下立即标记 last_used_at，在同一把锁内完成，
+        // 确保并发请求不会选中同一个凭据
+        if mode == "balanced" {
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
         }
+
+        Some(result)
     }
 
     /// 获取 API 调用上下文
