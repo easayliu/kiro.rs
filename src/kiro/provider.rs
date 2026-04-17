@@ -312,6 +312,10 @@ impl KiroProvider {
                     status,
                     body
                 );
+                // 429 被限流时刷新 last_used_at，让 balanced (LRU) 立即轮转到其他凭据
+                if status.as_u16() == 429 {
+                    self.token_manager.mark_accessed(ctx.id);
+                }
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
@@ -525,6 +529,10 @@ impl KiroProvider {
                     status,
                     body
                 );
+                // 429 被限流时刷新 last_used_at，让 balanced (LRU) 立即轮转到其他凭据
+                if status.as_u16() == 429 {
+                    self.token_manager.mark_accessed(ctx.id);
+                }
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
                     api_type,

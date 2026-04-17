@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-INSTALL_DIR="${INSTALL_DIR:-$(pwd)/kiro-rs}"
+INSTALL_DIR="${INSTALL_DIR:-$HOME/kiro-rs}"
 IMAGE_OWNER="${IMAGE_OWNER:-easayliu}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 IMAGE_REG="${IMAGE_REG:-ghcr.io}"
@@ -62,23 +62,47 @@ gen_key() {
   fi
 }
 
+# 从 JSON 文件中按字符串键提取顶层字符串值（不依赖 jq，仅适用于简单 JSON）。
+extract_json_string() {
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || return 1
+  awk -v k="\"$key\"" '
+    {
+      i = index($0, k)
+      if (i == 0) next
+      rest = substr($0, i + length(k))
+      sub(/^[[:space:]]*:[[:space:]]*"/, "", rest)
+      end = index(rest, "\"")
+      if (end == 0) next
+      print substr(rest, 1, end - 1)
+      exit
+    }
+  ' "$file"
+}
+
 main() {
   require_cmd docker
   local COMPOSE
   COMPOSE="$(detect_compose)"
   ok "docker 就绪；compose 命令：$COMPOSE"
 
-  local API_KEY_VAL="${API_KEY:-$(gen_key sk-kiro)}"
-  local ADMIN_API_KEY_VAL="${ADMIN_API_KEY:-$(gen_key sk-admin)}"
-
   mkdir -p "$INSTALL_DIR/config"
   info "安装目录：$INSTALL_DIR"
 
   # ---------- config.json ----------
+  # 复用策略：若 config.json 已存在，则从中读取既有 apiKey / adminApiKey，
+  # 避免重装时显示「新生成」的 key 与文件内容不一致，导致用户以为凭据被改写。
   local CONFIG_PATH="$INSTALL_DIR/config/config.json"
+  local API_KEY_VAL ADMIN_API_KEY_VAL
   if [[ -f "$CONFIG_PATH" ]]; then
-    warn "已存在 $CONFIG_PATH，跳过覆盖"
+    API_KEY_VAL="${API_KEY:-$(extract_json_string "$CONFIG_PATH" apiKey)}"
+    ADMIN_API_KEY_VAL="${ADMIN_API_KEY:-$(extract_json_string "$CONFIG_PATH" adminApiKey)}"
+    [[ -n "$API_KEY_VAL" ]]       || API_KEY_VAL="$(gen_key sk-kiro)"
+    [[ -n "$ADMIN_API_KEY_VAL" ]] || ADMIN_API_KEY_VAL="$(gen_key sk-admin)"
+    warn "已存在 ${CONFIG_PATH}，跳过覆盖（沿用既有 apiKey / adminApiKey）"
   else
+    API_KEY_VAL="${API_KEY:-$(gen_key sk-kiro)}"
+    ADMIN_API_KEY_VAL="${ADMIN_API_KEY:-$(gen_key sk-admin)}"
     cat > "$CONFIG_PATH" <<EOF
 {
   "host": "0.0.0.0",

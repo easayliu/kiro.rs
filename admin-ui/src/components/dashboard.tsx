@@ -550,7 +550,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
               size="sm"
               onClick={handleToggleLoadBalancing}
               disabled={isLoadingMode || isSettingMode}
-              title="切换负载均衡模式"
+              title={
+                loadBalancingData?.mode === 'balanced'
+                  ? '当前：均衡负载（LRU，选择最久未使用的凭据）· 点击切换到优先级模式'
+                  : '当前：优先级模式（固定使用优先级最高的凭据）· 点击切换到均衡负载'
+              }
             >
               {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
             </Button>

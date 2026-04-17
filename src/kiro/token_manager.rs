@@ -677,7 +677,7 @@ impl MultiTokenManager {
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：均衡选择可用凭据
+    /// - balanced 模式：LRU 均衡（选择最久未使用的凭据）
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
@@ -713,11 +713,13 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
+                // LRU 策略：选择最久未使用的凭据（last_used_at 最早者）
+                // None（从未使用）排在最前，优先分配给新加入的凭据。
+                // RFC3339 时间字符串的字典序与时间序一致，可直接比较。
+                // 平局时按优先级排序（数字越小优先级越高）。
                 let entry = available
                     .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+                    .min_by_key(|e| (e.last_used_at.clone(), e.credentials.priority))?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -1127,6 +1129,19 @@ impl MultiTokenManager {
             }
         }
         self.save_stats_debounced();
+    }
+
+    /// 标记凭据最近被访问过（用于 LRU 轮转，但不视为成功）
+    ///
+    /// 场景：上游返回 429 / 408 等瞬态限流错误时调用。
+    /// 不增加 success_count、不重置 failure_count，仅刷新 last_used_at，
+    /// 让 balanced (LRU) 模式把该凭据排到队尾，下一次轮转到其他凭据。
+    pub fn mark_accessed(&self, id: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            tracing::debug!("凭据 #{} 标记为最近访问（瞬态错误，用于 LRU 轮转）", id);
+        }
     }
 
     /// 报告指定凭据 API 调用失败
@@ -2220,6 +2235,32 @@ mod tests {
         manager.report_failure(1);
         manager.report_failure(1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    #[test]
+    fn test_mark_accessed_updates_last_used_at_without_success_count() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        // 先失败一次，记一个基线 failure_count
+        manager.report_failure(1);
+
+        // mark_accessed：只动 last_used_at，不重置 failure_count 也不增 success_count
+        manager.mark_accessed(1);
+
+        let snap = manager.snapshot();
+        let e1 = snap.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(e1.last_used_at.is_some(), "last_used_at 应被刷新");
+        assert_eq!(e1.success_count, 0, "mark_accessed 不应增加 success_count");
+        assert_eq!(e1.failure_count, 1, "mark_accessed 不应重置 failure_count");
+
+        // 未被标记的凭据 2 仍然是 None，balanced (LRU) 应优先选它
+        let e2 = snap.entries.iter().find(|e| e.id == 2).unwrap();
+        assert!(e2.last_used_at.is_none());
     }
 
     #[test]
