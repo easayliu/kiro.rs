@@ -539,7 +539,8 @@ impl MultiTokenManager {
     /// * `credentials` - 凭据列表
     /// * `proxy` - 可选的代理配置
     /// * `credentials_path` - 凭据文件路径（用于回写）
-    /// * `is_multiple_format` - 是否为多凭据格式（数组格式才回写）
+    /// * `is_multiple_format` - 原始文件是否为数组格式；仅用于日志/兼容，
+    ///   回写时一律使用数组格式（单对象格式会在首次持久化时自动升级）
     pub fn new(
         config: Config,
         credentials: Vec<KiroCredentials>,
@@ -957,24 +958,22 @@ impl MultiTokenManager {
         })
     }
 
-    /// 将凭据列表回写到源文件
+    /// 将凭据列表回写到源文件（统一输出为数组格式）
     ///
-    /// 仅在以下条件满足时回写：
-    /// - 源文件是多凭据格式（数组）
-    /// - credentials_path 已设置
+    /// 历史上仅多凭据格式回写，导致单对象格式在 Admin API 添加/修改凭据、
+    /// 或 token 轮换后新 refresh_token 无法持久化，重启即丢失。
+    /// 现改为无条件以数组格式回写，单对象格式会在首次回写时自动升级。
     ///
     /// # Returns
     /// - `Ok(true)` - 成功写入文件
-    /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
+    /// - `Ok(false)` - 跳过写入（未配置 credentials_path）
     /// - `Err(_)` - 写入失败
     fn persist_credentials(&self) -> anyhow::Result<bool> {
         use anyhow::Context;
 
-        // 仅多凭据格式才回写
-        if !self.is_multiple_format {
-            return Ok(false);
-        }
-
+        // 无论原始文件是单对象还是数组格式，都以数组格式回写；
+        // 单对象格式首次回写后即自动升级为数组格式，便于 Admin API
+        // 新增/更新/刷新后的凭据持久化，避免容器重启后丢失。
         let path = match &self.credentials_path {
             Some(p) => p,
             None => return Ok(false),
@@ -2034,6 +2033,55 @@ mod tests {
         assert!(id > 0);
         assert_eq!(manager.total_count(), 1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    /// 回归测试：即使 is_multiple_format=false（原文件是单对象格式），
+    /// add_credential 也应回写为数组格式（自动升级），防止「重启后 Admin
+    /// 新增凭据丢失 + 单对象格式停留在占位符」的历史 bug 回潮。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_single_format_upgrades_to_array_on_persist() {
+        let tmp_dir = std::env::temp_dir().join(format!("kiro_test_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let creds_path = tmp_dir.join("credentials.json");
+
+        // 模拟旧版 install.sh 生成的单对象占位文件
+        std::fs::write(
+            &creds_path,
+            r#"{"kiroApiKey":"ksk_placeholder","authMethod":"api_key"}"#,
+        )
+        .unwrap();
+
+        let mut placeholder = KiroCredentials::default();
+        placeholder.kiro_api_key = Some("ksk_placeholder".to_string());
+        placeholder.auth_method = Some("api_key".to_string());
+
+        // is_multiple_format=false 模拟原文件是单对象格式
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![placeholder],
+            None,
+            Some(creds_path.clone()),
+            false,
+        )
+        .unwrap();
+
+        let mut new_cred = KiroCredentials::default();
+        new_cred.kiro_api_key = Some("ksk_real_new".to_string());
+        new_cred.auth_method = Some("api_key".to_string());
+        manager.add_credential(new_cred).await.unwrap();
+
+        let content = std::fs::read_to_string(&creds_path).unwrap();
+        assert!(
+            content.trim_start().starts_with('['),
+            "回写后应为数组格式（自动升级），实际首字符: {:?}",
+            content.chars().next()
+        );
+        assert!(
+            content.contains("ksk_real_new"),
+            "Admin 新增的凭据应被持久化到文件"
+        );
+
+        std::fs::remove_dir_all(&tmp_dir).ok();
     }
 
     #[tokio::test]
