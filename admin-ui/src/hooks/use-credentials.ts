@@ -12,6 +12,8 @@ import {
   setLoadBalancingMode,
   getGlobalCache,
   setGlobalCache,
+  getCacheHitRate,
+  setCacheHitRate,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -136,6 +138,25 @@ export function useSetGlobalCache() {
     mutationFn: setGlobalCache,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['globalCache'] })
+    },
+  })
+}
+
+// 获取手动缓存率 override
+export function useCacheHitRate() {
+  return useQuery({
+    queryKey: ['cacheHitRate'],
+    queryFn: getCacheHitRate,
+  })
+}
+
+// 设置手动缓存率 override
+export function useSetCacheHitRate() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setCacheHitRate,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['cacheHitRate'] })
     },
   })
 }

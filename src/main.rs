@@ -122,6 +122,7 @@ async fn main() {
         Some(kiro_provider),
         config.extract_thinking,
         config.global_cache,
+        config.cache_hit_rate_override,
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

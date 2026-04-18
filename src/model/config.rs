@@ -104,6 +104,14 @@ pub struct Config {
     #[serde(default = "default_global_cache")]
     pub global_cache: bool,
 
+    /// 手动缓存命中率 override（0.0-1.0，默认 None 不启用）
+    ///
+    /// 启用后，响应 usage 中的 cache_read_input_tokens 会强制按
+    /// `total_input_tokens * ratio` 呈现，用于 Kiro 不返回真实缓存时
+    /// 向客户端展示稳定可控的命中率。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit_rate_override: Option<f32>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -178,6 +186,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             global_cache: default_global_cache(),
+            cache_hit_rate_override: None,
             config_path: None,
         }
     }

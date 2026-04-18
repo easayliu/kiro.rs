@@ -9,7 +9,7 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetGlobalCacheRequest,
+        AddCredentialRequest, SetCacheHitRateRequest, SetDisabledRequest, SetGlobalCacheRequest,
         SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
     },
 };
@@ -155,6 +155,25 @@ pub async fn set_global_cache(
     Json(payload): Json<SetGlobalCacheRequest>,
 ) -> impl IntoResponse {
     match state.service.set_global_cache(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/cache-hit-rate
+/// 获取手动缓存率 override
+pub async fn get_cache_hit_rate(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_cache_hit_rate();
+    Json(response)
+}
+
+/// PUT /api/admin/config/cache-hit-rate
+/// 设置手动缓存率 override（0.0-1.0，传 null 关闭）
+pub async fn set_cache_hit_rate(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetCacheHitRateRequest>,
+) -> impl IntoResponse {
+    match state.service.set_cache_hit_rate(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

@@ -116,3 +116,15 @@ export async function setGlobalCache(enabled: boolean): Promise<{ enabled: boole
   const { data } = await api.put<{ enabled: boolean }>('/config/global-cache', { enabled })
   return data
 }
+
+// 获取手动缓存率 override
+export async function getCacheHitRate(): Promise<{ ratio: number | null }> {
+  const { data } = await api.get<{ ratio: number | null }>('/config/cache-hit-rate')
+  return data
+}
+
+// 设置手动缓存率 override（0.0-1.0，传 null 关闭）
+export async function setCacheHitRate(ratio: number | null): Promise<{ ratio: number | null }> {
+  const { data } = await api.put<{ ratio: number | null }>('/config/cache-hit-rate', { ratio })
+  return data
+}

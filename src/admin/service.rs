@@ -14,9 +14,10 @@ use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, GlobalCacheResponse, LoadBalancingModeResponse,
-    SetGlobalCacheRequest, SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CacheHitRateResponse,
+    CredentialStatusItem, CredentialsStatusResponse, GlobalCacheResponse,
+    LoadBalancingModeResponse, SetCacheHitRateRequest, SetGlobalCacheRequest,
+    SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -311,6 +312,46 @@ impl AdminService {
         Ok(GlobalCacheResponse {
             enabled: req.enabled,
         })
+    }
+
+    /// 获取手动缓存率 override
+    pub fn get_cache_hit_rate(&self) -> CacheHitRateResponse {
+        CacheHitRateResponse {
+            ratio: self.cache_tracker.hit_rate_override(),
+        }
+    }
+
+    /// 设置手动缓存率 override
+    pub fn set_cache_hit_rate(
+        &self,
+        req: SetCacheHitRateRequest,
+    ) -> Result<CacheHitRateResponse, AdminServiceError> {
+        if let Some(r) = req.ratio {
+            if !r.is_finite() || !(0.0..=1.0).contains(&r) {
+                return Err(AdminServiceError::InvalidParameter(format!(
+                    "cache hit rate 必须在 0.0-1.0 之间，收到: {}",
+                    r
+                )));
+            }
+        }
+
+        self.cache_tracker.set_hit_rate_override(req.ratio);
+
+        if let Some(config_path) = self.token_manager.config().config_path() {
+            match crate::model::config::Config::load(config_path) {
+                Ok(mut config) => {
+                    config.cache_hit_rate_override = req.ratio;
+                    if let Err(e) = config.save() {
+                        tracing::warn!("保存缓存率 override 失败: {}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("加载配置文件失败: {}", e);
+                }
+            }
+        }
+
+        Ok(CacheHitRateResponse { ratio: req.ratio })
     }
 
     /// 强制刷新指定凭据的 Token

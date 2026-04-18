@@ -78,14 +78,23 @@ pub struct CacheTracker {
     entries: Mutex<HashMap<u64, HashMap<[u8; 32], CacheEntry>>>,
     max_supported_ttl: Duration,
     global_cache: AtomicBool,
+    /// 手动缓存率 override（0.0-1.0）。设置后，cache_read 会强制按
+    /// `total_input_tokens * ratio` 计算，其余为 uncached，cache_creation 归零。
+    /// 用于 Kiro 不返回真实缓存时，向客户端呈现一个可控的命中率。
+    hit_rate_override: Mutex<Option<f32>>,
 }
 
 impl CacheTracker {
-    pub fn new(max_supported_ttl: Duration, global_cache: bool) -> Self {
+    pub fn new(
+        max_supported_ttl: Duration,
+        global_cache: bool,
+        hit_rate_override: Option<f32>,
+    ) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
             max_supported_ttl,
             global_cache: AtomicBool::new(global_cache),
+            hit_rate_override: Mutex::new(hit_rate_override.map(clamp_hit_rate)),
         }
     }
 
@@ -95,6 +104,14 @@ impl CacheTracker {
 
     pub fn set_global_cache(&self, enabled: bool) {
         self.global_cache.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn hit_rate_override(&self) -> Option<f32> {
+        *self.hit_rate_override.lock()
+    }
+
+    pub fn set_hit_rate_override(&self, ratio: Option<f32>) {
+        *self.hit_rate_override.lock() = ratio.map(clamp_hit_rate);
     }
 
     fn effective_credential_id(&self, credential_id: u64) -> u64 {
@@ -187,10 +204,11 @@ impl CacheTracker {
                 total_input_tokens = profile.total_input_tokens,
                 "缓存分析：无可缓存 breakpoint，整段未缓存"
             );
-            return CacheResult {
+            let natural = CacheResult {
                 uncached_input_tokens: profile.total_input_tokens,
                 ..Default::default()
             };
+            return self.apply_hit_rate_override(profile.total_input_tokens, natural);
         };
         let last_breakpoint_tokens = last_breakpoint
             .cumulative_tokens
@@ -297,13 +315,53 @@ impl CacheTracker {
             "缓存计算结果"
         );
 
-        CacheResult {
+        let natural = CacheResult {
             cache_read_input_tokens: cache_read,
             cache_creation_input_tokens: cache_creation,
             cache_creation_5m_input_tokens: cache_5m,
             cache_creation_1h_input_tokens: cache_1h,
             uncached_input_tokens: uncached,
+        };
+        self.apply_hit_rate_override(profile.total_input_tokens, natural)
+    }
+
+    /// 应用手动缓存率 override。
+    ///
+    /// 固定比率语义：`cache_read = total * ratio`，`uncached = total - read`，
+    /// `cache_creation*` 清零。Kiro 不返回真实缓存时，由此提供稳定可控的命中率。
+    fn apply_hit_rate_override(&self, total_input_tokens: i32, natural: CacheResult) -> CacheResult {
+        let Some(ratio) = self.hit_rate_override() else {
+            return natural;
+        };
+        if total_input_tokens <= 0 {
+            return natural;
         }
+        let ratio = clamp_hit_rate(ratio);
+        let cache_read = ((total_input_tokens as f32) * ratio).round() as i32;
+        let cache_read = cache_read.clamp(0, total_input_tokens);
+        let uncached = total_input_tokens - cache_read;
+        tracing::info!(
+            ratio,
+            total_input_tokens,
+            overridden_cache_read = cache_read,
+            overridden_uncached = uncached,
+            "应用手动缓存率 override"
+        );
+        CacheResult {
+            cache_read_input_tokens: cache_read,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+            uncached_input_tokens: uncached,
+        }
+    }
+}
+
+fn clamp_hit_rate(ratio: f32) -> f32 {
+    if ratio.is_nan() {
+        0.0
+    } else {
+        ratio.clamp(0.0, 1.0)
     }
 }
 
@@ -584,11 +642,11 @@ mod tests {
     const LARGE_SYSTEM_CHARS: usize = 20_000; // 约 5k tokens（按 ~4 字符/token 估算，超过 sonnet-4.6 的 2048 门槛）
 
     fn tracker() -> CacheTracker {
-        CacheTracker::new(DEFAULT_CACHE_TTL, true)
+        CacheTracker::new(DEFAULT_CACHE_TTL, true, None)
     }
 
     fn tracker_per_credential() -> CacheTracker {
-        CacheTracker::new(DEFAULT_CACHE_TTL, false)
+        CacheTracker::new(DEFAULT_CACHE_TTL, false, None)
     }
 
     fn large_text(prefix: &str, size: usize) -> String {

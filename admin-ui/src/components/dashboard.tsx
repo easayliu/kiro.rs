@@ -12,7 +12,16 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useGlobalCache, useSetGlobalCache } from '@/hooks/use-credentials'
+import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useGlobalCache, useSetGlobalCache, useCacheHitRate, useSetCacheHitRate } from '@/hooks/use-credentials'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
@@ -56,6 +65,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const { data: globalCacheData, isLoading: isLoadingGlobalCache } = useGlobalCache()
   const { mutate: setGlobalCacheMutation, isPending: isSettingGlobalCache } = useSetGlobalCache()
+  const { data: cacheHitRateData, isLoading: isLoadingCacheHitRate } = useCacheHitRate()
+  const { mutate: setCacheHitRateMutation, isPending: isSettingCacheHitRate } = useSetCacheHitRate()
+  const [cacheHitRateDialogOpen, setCacheHitRateDialogOpen] = useState(false)
+  const [cacheHitRateInput, setCacheHitRateInput] = useState('')
 
   // 计算分页
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
@@ -493,6 +506,39 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setVerifying(false)
   }
 
+  // 打开缓存率设置对话框
+  const handleOpenCacheHitRateDialog = () => {
+    const current = cacheHitRateData?.ratio
+    setCacheHitRateInput(current == null ? '' : String(current))
+    setCacheHitRateDialogOpen(true)
+  }
+
+  // 提交缓存率 override
+  const handleSaveCacheHitRate = () => {
+    if (isSettingCacheHitRate) return
+    const trimmed = cacheHitRateInput.trim()
+    let ratio: number | null
+    if (trimmed === '') {
+      ratio = null
+    } else {
+      const parsed = Number(trimmed)
+      if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+        toast.error('请输入 0.0 - 1.0 之间的数字（留空表示关闭）')
+        return
+      }
+      ratio = parsed
+    }
+    setCacheHitRateMutation(ratio, {
+      onSuccess: () => {
+        toast.success(ratio == null ? '已关闭手动缓存率' : `已设置缓存率为 ${(ratio * 100).toFixed(0)}%`)
+        setCacheHitRateDialogOpen(false)
+      },
+      onError: (error) => {
+        toast.error(`设置失败: ${extractErrorMessage(error)}`)
+      }
+    })
+  }
+
   // 切换全局缓存模式
   const handleToggleGlobalCache = () => {
     const current = globalCacheData?.enabled ?? true
@@ -573,6 +619,23 @@ export function Dashboard({ onLogout }: DashboardProps) {
               }
             >
               {isLoadingGlobalCache ? '加载中...' : (globalCacheData?.enabled ? '全局缓存' : '隔离缓存')}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleOpenCacheHitRateDialog}
+              disabled={isLoadingCacheHitRate || isSettingCacheHitRate}
+              title={
+                cacheHitRateData?.ratio == null
+                  ? '未设置手动缓存率 · 点击设置一个固定命中比率（0.0-1.0）'
+                  : `当前手动缓存率：${(cacheHitRateData.ratio * 100).toFixed(0)}% · 点击修改或关闭`
+              }
+            >
+              {isLoadingCacheHitRate
+                ? '加载中...'
+                : cacheHitRateData?.ratio == null
+                  ? '缓存率：自动'
+                  : `缓存率：${(cacheHitRateData.ratio * 100).toFixed(0)}%`}
             </Button>
             <Button
               variant="outline"
@@ -814,6 +877,52 @@ export function Dashboard({ onLogout }: DashboardProps) {
         results={verifyResults}
         onCancel={handleCancelVerify}
       />
+
+      {/* 手动缓存率对话框 */}
+      <Dialog open={cacheHitRateDialogOpen} onOpenChange={setCacheHitRateDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>手动缓存率 override</DialogTitle>
+            <DialogDescription>
+              输入 0.0 – 1.0 之间的比率。设置后，响应 usage 中的 cache_read_input_tokens 会按
+              <code className="mx-1 rounded bg-muted px-1">total × ratio</code>
+              强制呈现；留空则关闭 override，恢复按 breakpoint 真实计算。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 py-2">
+            <Input
+              type="number"
+              min={0}
+              max={1}
+              step={0.05}
+              placeholder="例如 0.8 表示 80% 命中率；留空关闭"
+              value={cacheHitRateInput}
+              onChange={(e) => setCacheHitRateInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleSaveCacheHitRate()
+              }}
+              autoFocus
+            />
+            <p className="text-xs text-muted-foreground">
+              当前：{cacheHitRateData?.ratio == null ? '未启用（按真实 breakpoint 计算）' : `${(cacheHitRateData.ratio * 100).toFixed(0)}%`}
+            </p>
+          </div>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button
+              variant="outline"
+              onClick={() => {
+                setCacheHitRateInput('')
+              }}
+              disabled={isSettingCacheHitRate}
+            >
+              清空（关闭 override）
+            </Button>
+            <Button onClick={handleSaveCacheHitRate} disabled={isSettingCacheHitRate}>
+              {isSettingCacheHitRate ? '保存中...' : '保存'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
