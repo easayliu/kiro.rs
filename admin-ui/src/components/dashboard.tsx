@@ -12,7 +12,7 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useGlobalCache, useSetGlobalCache, useCacheHitRate, useSetCacheHitRate } from '@/hooks/use-credentials'
+import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useGlobalCache, useSetGlobalCache, useCacheSkipRate, useSetCacheSkipRate } from '@/hooks/use-credentials'
 import {
   Dialog,
   DialogContent,
@@ -65,10 +65,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const { data: globalCacheData, isLoading: isLoadingGlobalCache } = useGlobalCache()
   const { mutate: setGlobalCacheMutation, isPending: isSettingGlobalCache } = useSetGlobalCache()
-  const { data: cacheHitRateData, isLoading: isLoadingCacheHitRate } = useCacheHitRate()
-  const { mutate: setCacheHitRateMutation, isPending: isSettingCacheHitRate } = useSetCacheHitRate()
-  const [cacheHitRateDialogOpen, setCacheHitRateDialogOpen] = useState(false)
-  const [cacheHitRateInput, setCacheHitRateInput] = useState('')
+  const { data: cacheSkipRateData, isLoading: isLoadingCacheSkipRate } = useCacheSkipRate()
+  const { mutate: setCacheSkipRateMutation, isPending: isSettingCacheSkipRate } = useSetCacheSkipRate()
+  const [cacheSkipRateDialogOpen, setCacheSkipRateDialogOpen] = useState(false)
+  const [cacheSkipRateInput, setCacheSkipRateInput] = useState('')
 
   // 计算分页
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
@@ -506,32 +506,32 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setVerifying(false)
   }
 
-  // 打开缓存率设置对话框
-  const handleOpenCacheHitRateDialog = () => {
-    const current = cacheHitRateData?.ratio
-    setCacheHitRateInput(current == null ? '' : String(current))
-    setCacheHitRateDialogOpen(true)
+  // 打开跳过率设置对话框
+  const handleOpenCacheSkipRateDialog = () => {
+    const current = cacheSkipRateData?.rate
+    setCacheSkipRateInput(current == null ? '' : String(current))
+    setCacheSkipRateDialogOpen(true)
   }
 
-  // 提交缓存率 override
-  const handleSaveCacheHitRate = () => {
-    if (isSettingCacheHitRate) return
-    const trimmed = cacheHitRateInput.trim()
-    let ratio: number | null
+  // 提交缓存查找跳过率
+  const handleSaveCacheSkipRate = () => {
+    if (isSettingCacheSkipRate) return
+    const trimmed = cacheSkipRateInput.trim()
+    let rate: number | null
     if (trimmed === '') {
-      ratio = null
+      rate = null
     } else {
       const parsed = Number(trimmed)
       if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
         toast.error('请输入 0.0 - 1.0 之间的数字（留空表示关闭）')
         return
       }
-      ratio = parsed
+      rate = parsed
     }
-    setCacheHitRateMutation(ratio, {
+    setCacheSkipRateMutation(rate, {
       onSuccess: () => {
-        toast.success(ratio == null ? '已关闭手动缓存率' : `已设置缓存率为 ${(ratio * 100).toFixed(0)}%`)
-        setCacheHitRateDialogOpen(false)
+        toast.success(rate == null ? '已关闭缓存跳过率' : `已设置跳过率为 ${(rate * 100).toFixed(0)}%`)
+        setCacheSkipRateDialogOpen(false)
       },
       onError: (error) => {
         toast.error(`设置失败: ${extractErrorMessage(error)}`)
@@ -623,19 +623,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <Button
               variant="outline"
               size="sm"
-              onClick={handleOpenCacheHitRateDialog}
-              disabled={isLoadingCacheHitRate || isSettingCacheHitRate}
+              onClick={handleOpenCacheSkipRateDialog}
+              disabled={isLoadingCacheSkipRate || isSettingCacheSkipRate}
               title={
-                cacheHitRateData?.ratio == null
-                  ? '未设置手动缓存率 · 点击设置一个固定命中比率（0.0-1.0）'
-                  : `当前手动缓存率：${(cacheHitRateData.ratio * 100).toFixed(0)}% · 点击修改或关闭`
+                cacheSkipRateData?.rate == null
+                  ? '未启用缓存跳过 · 点击设置跳过概率（0.0-1.0），按概率跳过 cache 查找以降低观察到的命中率'
+                  : `当前跳过率：${(cacheSkipRateData.rate * 100).toFixed(0)}% · 点击修改或关闭`
               }
             >
-              {isLoadingCacheHitRate
+              {isLoadingCacheSkipRate
                 ? '加载中...'
-                : cacheHitRateData?.ratio == null
-                  ? '缓存率：自动'
-                  : `缓存率：${(cacheHitRateData.ratio * 100).toFixed(0)}%`}
+                : cacheSkipRateData?.rate == null
+                  ? '跳过率：关闭'
+                  : `跳过率：${(cacheSkipRateData.rate * 100).toFixed(0)}%`}
             </Button>
             <Button
               variant="outline"
@@ -878,15 +878,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
         onCancel={handleCancelVerify}
       />
 
-      {/* 手动缓存率对话框 */}
-      <Dialog open={cacheHitRateDialogOpen} onOpenChange={setCacheHitRateDialogOpen}>
+      {/* 缓存跳过率对话框 */}
+      <Dialog open={cacheSkipRateDialogOpen} onOpenChange={setCacheSkipRateDialogOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>手动缓存率 override</DialogTitle>
+            <DialogTitle>缓存查找跳过率</DialogTitle>
             <DialogDescription>
-              输入 0.0 – 1.0 之间的比率。设置后，响应 usage 中的 cache_read_input_tokens 会按
-              <code className="mx-1 rounded bg-muted px-1">total × ratio</code>
-              强制呈现；留空则关闭 override，恢复按 breakpoint 真实计算。
+              输入 0.0 – 1.0 之间的跳过概率。每个请求按此概率跳过 cache 查找（当作首次请求，
+              <code className="mx-1 rounded bg-muted px-1">cache_read = 0</code>
+              ），但仍正常写入 checkpoint；用于在自然命中率偏高时整体降低观察到的缓存率。留空则关闭。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2 py-2">
@@ -895,30 +895,30 @@ export function Dashboard({ onLogout }: DashboardProps) {
               min={0}
               max={1}
               step={0.05}
-              placeholder="例如 0.8 表示 80% 命中率；留空关闭"
-              value={cacheHitRateInput}
-              onChange={(e) => setCacheHitRateInput(e.target.value)}
+              placeholder="例如 0.3 表示 30% 请求跳过查找；留空关闭"
+              value={cacheSkipRateInput}
+              onChange={(e) => setCacheSkipRateInput(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') handleSaveCacheHitRate()
+                if (e.key === 'Enter') handleSaveCacheSkipRate()
               }}
               autoFocus
             />
             <p className="text-xs text-muted-foreground">
-              当前：{cacheHitRateData?.ratio == null ? '未启用（按真实 breakpoint 计算）' : `${(cacheHitRateData.ratio * 100).toFixed(0)}%`}
+              当前：{cacheSkipRateData?.rate == null ? '关闭（按自然 breakpoint 计算）' : `${(cacheSkipRateData.rate * 100).toFixed(0)}%`}
             </p>
           </div>
           <DialogFooter className="gap-2 sm:gap-2">
             <Button
               variant="outline"
               onClick={() => {
-                setCacheHitRateInput('')
+                setCacheSkipRateInput('')
               }}
-              disabled={isSettingCacheHitRate}
+              disabled={isSettingCacheSkipRate}
             >
-              清空（关闭 override）
+              清空（关闭）
             </Button>
-            <Button onClick={handleSaveCacheHitRate} disabled={isSettingCacheHitRate}>
-              {isSettingCacheHitRate ? '保存中...' : '保存'}
+            <Button onClick={handleSaveCacheSkipRate} disabled={isSettingCacheSkipRate}>
+              {isSettingCacheSkipRate ? '保存中...' : '保存'}
             </Button>
           </DialogFooter>
         </DialogContent>

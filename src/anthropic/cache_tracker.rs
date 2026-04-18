@@ -78,23 +78,23 @@ pub struct CacheTracker {
     entries: Mutex<HashMap<u64, HashMap<[u8; 32], CacheEntry>>>,
     max_supported_ttl: Duration,
     global_cache: AtomicBool,
-    /// 手动缓存率 override（0.0-1.0）。设置后，cache_read 会强制按
-    /// `total_input_tokens * ratio` 计算，其余为 uncached，cache_creation 归零。
-    /// 用于 Kiro 不返回真实缓存时，向客户端呈现一个可控的命中率。
-    hit_rate_override: Mutex<Option<f32>>,
+    /// 缓存查找跳过率（0.0-1.0）。对每个有 breakpoint 的请求，以此概率
+    /// 跳过 cache 查找（当作首次请求，cache_read = 0），但仍正常写入 checkpoint；
+    /// 用于在自然命中率偏高时整体降低可观察到的缓存命中率。
+    cache_skip_rate: Mutex<Option<f32>>,
 }
 
 impl CacheTracker {
     pub fn new(
         max_supported_ttl: Duration,
         global_cache: bool,
-        hit_rate_override: Option<f32>,
+        cache_skip_rate: Option<f32>,
     ) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
             max_supported_ttl,
             global_cache: AtomicBool::new(global_cache),
-            hit_rate_override: Mutex::new(hit_rate_override.map(clamp_hit_rate)),
+            cache_skip_rate: Mutex::new(cache_skip_rate.map(clamp_skip_rate)),
         }
     }
 
@@ -106,12 +106,26 @@ impl CacheTracker {
         self.global_cache.store(enabled, Ordering::Relaxed);
     }
 
-    pub fn hit_rate_override(&self) -> Option<f32> {
-        *self.hit_rate_override.lock()
+    pub fn cache_skip_rate(&self) -> Option<f32> {
+        *self.cache_skip_rate.lock()
     }
 
-    pub fn set_hit_rate_override(&self, ratio: Option<f32>) {
-        *self.hit_rate_override.lock() = ratio.map(clamp_hit_rate);
+    pub fn set_cache_skip_rate(&self, rate: Option<f32>) {
+        *self.cache_skip_rate.lock() = rate.map(clamp_skip_rate);
+    }
+
+    /// 按配置的跳过率掷骰子，决定本次请求是否跳过 cache 查找
+    fn should_skip_lookup(&self) -> bool {
+        let Some(rate) = self.cache_skip_rate() else {
+            return false;
+        };
+        if rate <= 0.0 {
+            return false;
+        }
+        if rate >= 1.0 {
+            return true;
+        }
+        fastrand::f32() < rate
     }
 
     fn effective_credential_id(&self, credential_id: u64) -> u64 {
@@ -204,11 +218,10 @@ impl CacheTracker {
                 total_input_tokens = profile.total_input_tokens,
                 "缓存分析：无可缓存 breakpoint，整段未缓存"
             );
-            let natural = CacheResult {
+            return CacheResult {
                 uncached_input_tokens: profile.total_input_tokens,
                 ..Default::default()
             };
-            return self.apply_hit_rate_override(profile.total_input_tokens, natural);
         };
         let last_breakpoint_tokens = last_breakpoint
             .cumulative_tokens
@@ -220,8 +233,16 @@ impl CacheTracker {
 
         let mut matched_tokens = 0;
         let mut matched_block_index: Option<usize> = None;
+        let skipped_lookup = self.should_skip_lookup();
 
-        if let Some(bucket) = all_entries.get_mut(&effective_id) {
+        if skipped_lookup {
+            tracing::info!(
+                credential_id,
+                effective_id,
+                skip_rate = ?self.cache_skip_rate(),
+                "按配置概率跳过 cache 查找，本次请求按首次请求处理"
+            );
+        } else if let Some(bucket) = all_entries.get_mut(&effective_id) {
             tracing::debug!(
                 credential_id,
                 effective_id,
@@ -312,56 +333,25 @@ impl CacheTracker {
             uncached,
             cache_5m,
             cache_1h,
+            skipped_lookup,
             "缓存计算结果"
         );
 
-        let natural = CacheResult {
+        CacheResult {
             cache_read_input_tokens: cache_read,
             cache_creation_input_tokens: cache_creation,
             cache_creation_5m_input_tokens: cache_5m,
             cache_creation_1h_input_tokens: cache_1h,
             uncached_input_tokens: uncached,
-        };
-        self.apply_hit_rate_override(profile.total_input_tokens, natural)
-    }
-
-    /// 应用手动缓存率 override。
-    ///
-    /// 固定比率语义：`cache_read = total * ratio`，`uncached = total - read`，
-    /// `cache_creation*` 清零。Kiro 不返回真实缓存时，由此提供稳定可控的命中率。
-    fn apply_hit_rate_override(&self, total_input_tokens: i32, natural: CacheResult) -> CacheResult {
-        let Some(ratio) = self.hit_rate_override() else {
-            return natural;
-        };
-        if total_input_tokens <= 0 {
-            return natural;
-        }
-        let ratio = clamp_hit_rate(ratio);
-        let cache_read = ((total_input_tokens as f32) * ratio).round() as i32;
-        let cache_read = cache_read.clamp(0, total_input_tokens);
-        let uncached = total_input_tokens - cache_read;
-        tracing::info!(
-            ratio,
-            total_input_tokens,
-            overridden_cache_read = cache_read,
-            overridden_uncached = uncached,
-            "应用手动缓存率 override"
-        );
-        CacheResult {
-            cache_read_input_tokens: cache_read,
-            cache_creation_input_tokens: 0,
-            cache_creation_5m_input_tokens: 0,
-            cache_creation_1h_input_tokens: 0,
-            uncached_input_tokens: uncached,
         }
     }
 }
 
-fn clamp_hit_rate(ratio: f32) -> f32 {
-    if ratio.is_nan() {
+fn clamp_skip_rate(rate: f32) -> f32 {
+    if rate.is_nan() {
         0.0
     } else {
-        ratio.clamp(0.0, 1.0)
+        rate.clamp(0.0, 1.0)
     }
 }
 

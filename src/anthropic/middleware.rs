@@ -39,7 +39,7 @@ impl AppState {
         api_key: impl Into<String>,
         extract_thinking: bool,
         global_cache: bool,
-        cache_hit_rate_override: Option<f32>,
+        cache_skip_rate: Option<f32>,
     ) -> Self {
         Self {
             api_key: api_key.into(),
@@ -48,7 +48,7 @@ impl AppState {
             cache_tracker: Arc::new(CacheTracker::new(
                 std::time::Duration::from_secs(DEFAULT_PROMPT_CACHE_TTL_SECS),
                 global_cache,
-                cache_hit_rate_override,
+                cache_skip_rate,
             )),
         }
     }

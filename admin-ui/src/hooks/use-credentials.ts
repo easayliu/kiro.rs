@@ -12,8 +12,8 @@ import {
   setLoadBalancingMode,
   getGlobalCache,
   setGlobalCache,
-  getCacheHitRate,
-  setCacheHitRate,
+  getCacheSkipRate,
+  setCacheSkipRate,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
@@ -142,21 +142,21 @@ export function useSetGlobalCache() {
   })
 }
 
-// 获取手动缓存率 override
-export function useCacheHitRate() {
+// 获取缓存查找跳过率
+export function useCacheSkipRate() {
   return useQuery({
-    queryKey: ['cacheHitRate'],
-    queryFn: getCacheHitRate,
+    queryKey: ['cacheSkipRate'],
+    queryFn: getCacheSkipRate,
   })
 }
 
-// 设置手动缓存率 override
-export function useSetCacheHitRate() {
+// 设置缓存查找跳过率
+export function useSetCacheSkipRate() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: setCacheHitRate,
+    mutationFn: setCacheSkipRate,
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['cacheHitRate'] })
+      queryClient.invalidateQueries({ queryKey: ['cacheSkipRate'] })
     },
   })
 }

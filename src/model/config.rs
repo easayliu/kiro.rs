@@ -104,13 +104,13 @@ pub struct Config {
     #[serde(default = "default_global_cache")]
     pub global_cache: bool,
 
-    /// 手动缓存命中率 override（0.0-1.0，默认 None 不启用）
+    /// 缓存查找跳过率（0.0-1.0，默认 None 不启用）
     ///
-    /// 启用后，响应 usage 中的 cache_read_input_tokens 会强制按
-    /// `total_input_tokens * ratio` 呈现，用于 Kiro 不返回真实缓存时
-    /// 向客户端展示稳定可控的命中率。
+    /// 启用后，每个有 breakpoint 的请求以此概率跳过 cache 查找（当作
+    /// 首次请求，cache_read = 0），但仍正常写入 checkpoint；用于在
+    /// 自然命中率偏高时整体降低可观察到的缓存命中率。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_hit_rate_override: Option<f32>,
+    pub cache_skip_rate: Option<f32>,
 
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
@@ -186,7 +186,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             global_cache: default_global_cache(),
-            cache_hit_rate_override: None,
+            cache_skip_rate: None,
             config_path: None,
         }
     }

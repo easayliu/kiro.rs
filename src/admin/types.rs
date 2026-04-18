@@ -204,20 +204,20 @@ pub struct SetGlobalCacheRequest {
     pub enabled: bool,
 }
 
-/// 手动缓存率 override 响应
+/// 缓存查找跳过率响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CacheHitRateResponse {
-    /// 当前 override 比率（0.0-1.0），未设置时为 null
-    pub ratio: Option<f32>,
+pub struct CacheSkipRateResponse {
+    /// 当前跳过率（0.0-1.0），未设置时为 null
+    pub rate: Option<f32>,
 }
 
-/// 设置手动缓存率 override 请求
+/// 设置缓存查找跳过率请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SetCacheHitRateRequest {
-    /// 目标比率（0.0-1.0）；传 null 表示关闭 override
-    pub ratio: Option<f32>,
+pub struct SetCacheSkipRateRequest {
+    /// 目标跳过率（0.0-1.0）；传 null 表示关闭
+    pub rate: Option<f32>,
 }
 
 // ============ 通用响应 ============

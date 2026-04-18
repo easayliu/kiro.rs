@@ -9,7 +9,7 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetCacheHitRateRequest, SetDisabledRequest, SetGlobalCacheRequest,
+        AddCredentialRequest, SetCacheSkipRateRequest, SetDisabledRequest, SetGlobalCacheRequest,
         SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
     },
 };
@@ -160,20 +160,20 @@ pub async fn set_global_cache(
     }
 }
 
-/// GET /api/admin/config/cache-hit-rate
-/// 获取手动缓存率 override
-pub async fn get_cache_hit_rate(State(state): State<AdminState>) -> impl IntoResponse {
-    let response = state.service.get_cache_hit_rate();
+/// GET /api/admin/config/cache-skip-rate
+/// 获取缓存查找跳过率
+pub async fn get_cache_skip_rate(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_cache_skip_rate();
     Json(response)
 }
 
-/// PUT /api/admin/config/cache-hit-rate
-/// 设置手动缓存率 override（0.0-1.0，传 null 关闭）
-pub async fn set_cache_hit_rate(
+/// PUT /api/admin/config/cache-skip-rate
+/// 设置缓存查找跳过率（0.0-1.0，传 null 关闭）
+pub async fn set_cache_skip_rate(
     State(state): State<AdminState>,
-    Json(payload): Json<SetCacheHitRateRequest>,
+    Json(payload): Json<SetCacheSkipRateRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_cache_hit_rate(payload) {
+    match state.service.set_cache_skip_rate(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

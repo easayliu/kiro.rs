@@ -117,14 +117,14 @@ export async function setGlobalCache(enabled: boolean): Promise<{ enabled: boole
   return data
 }
 
-// 获取手动缓存率 override
-export async function getCacheHitRate(): Promise<{ ratio: number | null }> {
-  const { data } = await api.get<{ ratio: number | null }>('/config/cache-hit-rate')
+// 获取缓存查找跳过率
+export async function getCacheSkipRate(): Promise<{ rate: number | null }> {
+  const { data } = await api.get<{ rate: number | null }>('/config/cache-skip-rate')
   return data
 }
 
-// 设置手动缓存率 override（0.0-1.0，传 null 关闭）
-export async function setCacheHitRate(ratio: number | null): Promise<{ ratio: number | null }> {
-  const { data } = await api.put<{ ratio: number | null }>('/config/cache-hit-rate', { ratio })
+// 设置缓存查找跳过率（0.0-1.0，传 null 关闭）
+export async function setCacheSkipRate(rate: number | null): Promise<{ rate: number | null }> {
+  const { data } = await api.put<{ rate: number | null }>('/config/cache-skip-rate', { rate })
   return data
 }
