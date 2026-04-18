@@ -30,7 +30,6 @@ use super::types::{CacheControl, Message, MessagesRequest};
 
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
 const ONE_HOUR_CACHE_TTL: Duration = Duration::from_secs(3600);
-const PREFIX_LOOKBACK_LIMIT: usize = 10;
 const MAX_BREAKPOINTS: usize = 4;
 const MAX_ENTRIES: usize = 100_000;
 
@@ -212,14 +211,11 @@ impl CacheTracker {
                 "查找缓存匹配"
             );
 
+            // 对齐 Anthropic：扫描从 last_breakpoint 向前的所有 block，
+            // 取最长的匹配 prefix（实际 cache 表内只有 breakpoint 位置的 entry，
+            // 所以非 breakpoint 位置的 fingerprint 不会误命中）。
             let last_index = last_breakpoint.block_index;
-            let mut scanned = 0usize;
             for idx in (0..=last_index).rev() {
-                if scanned >= PREFIX_LOOKBACK_LIMIT {
-                    break;
-                }
-                scanned += 1;
-
                 let block = &profile.blocks[idx];
                 if let Some(entry) = bucket.get_mut(&block.prefix_fingerprint) {
                     if entry.expires_at <= now {
@@ -397,7 +393,6 @@ fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
             let mut value = serde_json::to_value(block).unwrap_or(serde_json::Value::Null);
             let breakpoint_ttl = extract_cache_ttl(&value);
             strip_cache_control(&mut value);
-            canonicalize_system_block_for_cache(&mut value);
 
             blocks.push(PendingBlock {
                 value: canonicalize_json(serde_json::json!({
@@ -416,35 +411,6 @@ fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
     }
 
     blocks
-}
-
-/// 针对 Claude Code 注入的 `x-anthropic-billing-header` 做归一化，
-/// 使其只影响实际话术的 billing header，不会因为小改动导致整个 prefix 失效。
-fn canonicalize_system_block_for_cache(value: &mut serde_json::Value) {
-    let Some(obj) = value.as_object_mut() else {
-        return;
-    };
-
-    let is_text_block = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .map(|t| t == "text")
-        .unwrap_or(true);
-    if !is_text_block {
-        return;
-    }
-
-    let Some(text) = obj.get("text").and_then(|v| v.as_str()) else {
-        return;
-    };
-    if !text.starts_with("x-anthropic-billing-header:") {
-        return;
-    }
-
-    obj.insert(
-        "text".to_string(),
-        serde_json::Value::String("__anthropic_billing_header__".to_string()),
-    );
 }
 
 fn flatten_message_blocks(message_index: usize, message: &Message) -> Vec<PendingBlock> {
@@ -535,31 +501,50 @@ fn strip_cache_control(value: &mut serde_json::Value) {
     }
 }
 
+/// 对齐 Anthropic 官方 prompt caching 最小可缓存 tokens
+/// 参考: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
 fn minimum_cacheable_tokens_for_model(model: &str) -> i32 {
     let m = model.to_lowercase();
-    if m.contains("opus-4-6")
+
+    // 4096 tokens: Opus 4.5+, Haiku 4.5, Haiku 3, Mythos Preview
+    if m.contains("mythos")
         || m.contains("opus-4-5")
-        || m.contains("opus-4.6")
         || m.contains("opus-4.5")
-    {
-        4096
-    } else if m.contains("opus") {
-        1024
-    } else if m.contains("sonnet-4-6") || m.contains("sonnet-4.6") || m.contains("sonnet_4_6") {
-        2048
-    } else if m.contains("sonnet") {
-        1024
-    } else if m.contains("haiku-4-5")
+        || m.contains("opus-4-6")
+        || m.contains("opus-4.6")
+        || m.contains("opus-4-7")
+        || m.contains("opus-4.7")
+        || m.contains("haiku-4-5")
         || m.contains("haiku-4.5")
         || m.contains("haiku_4_5")
         || m.contains("haiku_4.5")
     {
-        4096
-    } else if m.contains("haiku") {
-        2048
-    } else {
-        1024
+        return 4096;
     }
+
+    // 2048 tokens: Sonnet 4.6, Haiku 3.5
+    if m.contains("sonnet-4-6")
+        || m.contains("sonnet-4.6")
+        || m.contains("sonnet_4_6")
+        || m.contains("haiku-3-5")
+        || m.contains("haiku-3.5")
+        || m.contains("haiku_3_5")
+        || m.contains("haiku_3.5")
+    {
+        return 2048;
+    }
+
+    // 1024 tokens: Opus 4/4.1, Sonnet 3.5/3.7/4/4.5
+    if m.contains("opus") || m.contains("sonnet") {
+        return 1024;
+    }
+
+    // 未知 haiku 版本按 2048 兜底（最常见的 3.5）
+    if m.contains("haiku") {
+        return 2048;
+    }
+
+    1024
 }
 
 fn prune_expired(entries: &mut HashMap<u64, HashMap<[u8; 32], CacheEntry>>, now: Instant) {
