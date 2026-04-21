@@ -71,6 +71,8 @@ struct CacheEntry {
     token_count: i32,
     ttl: Duration,
     expires_at: Instant,
+    /// 命中或写入时刷新；容量淘汰按此字段升序删最久未用的 entry。
+    last_used_at: Instant,
 }
 
 /// 全局模式下使用的固定 credential_id
@@ -145,14 +147,18 @@ impl CacheTracker {
     ) -> CacheProfile {
         let flattened = flatten_cacheable_blocks(payload);
 
+        // prelude 只含 model，影响所有段；其它参数按段归入 extras。
         let request_prelude = canonicalize_json(serde_json::json!({
             "model": payload.model,
-            "tool_choice": payload.tool_choice,
         }));
         let prelude_bytes = serde_json::to_vec(&request_prelude).unwrap_or_default();
         let mut prefix_hasher = Sha256::new();
         prefix_hasher.update((prelude_bytes.len() as u64).to_be_bytes());
         prefix_hasher.update(&prelude_bytes);
+
+        let tools_extras = compute_segment_extras_hash(payload, BlockSegment::Tools);
+        let system_extras = compute_segment_extras_hash(payload, BlockSegment::System);
+        let messages_extras = compute_segment_extras_hash(payload, BlockSegment::Messages);
 
         let mut blocks = Vec::with_capacity(flattened.len());
         let mut breakpoints = Vec::new();
@@ -164,14 +170,23 @@ impl CacheTracker {
             let block_bytes = serde_json::to_vec(&block.value).unwrap_or_default();
             let block_hash: [u8; 32] = Sha256::digest(&block_bytes).into();
 
+            // content_fingerprint 仅随 block 内容级联（不含 extras），
+            // 下一轮的级联也用它，确保 extras 只作用于当前段。
             let mut next_prefix_hasher = prefix_hasher.clone();
             next_prefix_hasher.update(block_hash);
-            let prefix_fingerprint: [u8; 32] = next_prefix_hasher.finalize().into();
+            let content_fingerprint: [u8; 32] = next_prefix_hasher.finalize().into();
             prefix_hasher = Sha256::new();
-            prefix_hasher.update(prefix_fingerprint);
+            prefix_hasher.update(content_fingerprint);
+
+            let segment_extras = match block.segment {
+                BlockSegment::Tools => &tools_extras,
+                BlockSegment::System => &system_extras,
+                BlockSegment::Messages => &messages_extras,
+            };
+            let effective_fingerprint = mix_fingerprint(&content_fingerprint, segment_extras);
 
             blocks.push(CacheBlock {
-                prefix_fingerprint,
+                prefix_fingerprint: effective_fingerprint,
                 cumulative_tokens,
             });
 
@@ -184,10 +199,15 @@ impl CacheTracker {
             }
         }
 
-        // Anthropic 限制最多 4 个 breakpoint，超出时只保留最后 4 个
+        // Anthropic 限制最多 4 个 cache_control breakpoint，超出时 API 返回 400；
+        // 本地退化为无缓存以贴近真实失败路径。
         if breakpoints.len() > MAX_BREAKPOINTS {
-            let start = breakpoints.len() - MAX_BREAKPOINTS;
-            breakpoints = breakpoints.split_off(start);
+            tracing::warn!(
+                breakpoint_count = breakpoints.len(),
+                max = MAX_BREAKPOINTS,
+                "cache_control breakpoint 超过 4 个上限，Anthropic 会返回 400，本地按无缓存处理"
+            );
+            breakpoints.clear();
         }
 
         // Anthropic 要求 1h breakpoint 必须排在所有 5m breakpoint 之前，
@@ -289,6 +309,7 @@ impl CacheTracker {
                         continue;
                     }
                     entry.expires_at = now + entry.ttl;
+                    entry.last_used_at = now;
                     matched_tokens =
                         block.cumulative_tokens.min(profile.total_input_tokens);
                     matched_block_index = Some(idx);
@@ -299,7 +320,8 @@ impl CacheTracker {
             tracing::debug!(credential_id, effective_id, "首次请求，无缓存条目");
         }
 
-        // 更新 checkpoint 表（在同一个锁范围内）
+        // 更新 checkpoint 表（在同一个锁范围内）。
+        // 同位置重复写入时直接覆盖 ttl / expires_at，支持 1h → 5m 的 downgrade。
         let bucket = all_entries.entry(effective_id).or_default();
         for breakpoint in profile.cacheable_breakpoints() {
             let block = &profile.blocks[breakpoint.block_index];
@@ -308,8 +330,9 @@ impl CacheTracker {
             match bucket.get_mut(&block.prefix_fingerprint) {
                 Some(existing) => {
                     existing.token_count = existing.token_count.max(block.cumulative_tokens);
-                    existing.ttl = existing.ttl.max(breakpoint.ttl);
-                    existing.expires_at = existing.expires_at.max(next_expiry);
+                    existing.ttl = breakpoint.ttl;
+                    existing.expires_at = next_expiry;
+                    existing.last_used_at = now;
                 }
                 None => {
                     bucket.insert(
@@ -318,19 +341,20 @@ impl CacheTracker {
                             token_count: block.cumulative_tokens,
                             ttl: breakpoint.ttl,
                             expires_at: next_expiry,
+                            last_used_at: now,
                         },
                     );
                 }
             }
         }
 
-        // 容量淘汰：按过期时间删除最旧的条目
+        // 容量淘汰：按 last_used_at 升序删最久未用的条目（LRU）。
         if bucket.len() > MAX_ENTRIES {
             let mut sorted: Vec<_> = bucket
                 .iter()
-                .map(|(k, v)| (*k, v.expires_at))
+                .map(|(k, v)| (*k, v.last_used_at))
                 .collect();
-            sorted.sort_by_key(|(_, expires)| *expires);
+            sorted.sort_by_key(|(_, last_used)| *last_used);
             let to_remove = bucket.len() - MAX_ENTRIES;
             for (key, _) in sorted.into_iter().take(to_remove) {
                 bucket.remove(&key);
@@ -442,11 +466,19 @@ struct ResolvedBreakpoint {
     ttl: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockSegment {
+    Tools,
+    System,
+    Messages,
+}
+
 #[derive(Debug)]
 struct PendingBlock {
     value: serde_json::Value,
     tokens: i32,
     breakpoint_ttl: Option<Duration>,
+    segment: BlockSegment,
 }
 
 fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
@@ -466,6 +498,7 @@ fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
                 })),
                 tokens: count_tool_definition_tokens(tool) as i32,
                 breakpoint_ttl,
+                segment: BlockSegment::Tools,
             });
         }
     }
@@ -484,6 +517,7 @@ fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
                 })),
                 tokens: count_system_message_tokens(block) as i32,
                 breakpoint_ttl,
+                segment: BlockSegment::System,
             });
         }
     }
@@ -550,6 +584,7 @@ fn build_message_block(
             "block": block,
         })),
         breakpoint_ttl,
+        segment: BlockSegment::Messages,
     }
 }
 
@@ -594,6 +629,41 @@ fn strip_cache_control(value: &mut serde_json::Value) {
         }
         _ => {}
     }
+}
+
+/// 按官方 invalidation 表把请求级参数分类到对应段的 extras hash。
+///
+/// 参考 https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+/// 的 "Cache Invalidation Summary"（✘ = 失效，✓ = 保留）：
+/// - tool_choice ✓✓✘ / thinking ✓✓✘：只失效 messages
+/// - output_config（speed/citations 类）✓✘✘：失效 system + messages
+/// - Images ✓✓✘：靠 message block 内容级联天然满足
+/// - Tool definitions ✘✘✘：靠 tool block 内容级联天然满足
+/// - metadata：不影响 cache（session 级噪声）
+fn compute_segment_extras_hash(payload: &MessagesRequest, segment: BlockSegment) -> [u8; 32] {
+    let extras = match segment {
+        // tools 段保留：只受 tool block 内容变化（级联）影响，不混入任何请求级参数。
+        BlockSegment::Tools => serde_json::Value::Null,
+        // system 段：受 speed/citations 类（output_config）影响，不受 tool_choice/thinking 影响。
+        BlockSegment::System => serde_json::json!({
+            "output_config": payload.output_config,
+        }),
+        // messages 段：受 tool_choice / thinking / output_config 影响。
+        BlockSegment::Messages => serde_json::json!({
+            "tool_choice": payload.tool_choice,
+            "thinking": payload.thinking,
+            "output_config": payload.output_config,
+        }),
+    };
+    let bytes = serde_json::to_vec(&canonicalize_json(extras)).unwrap_or_default();
+    Sha256::digest(&bytes).into()
+}
+
+fn mix_fingerprint(content: &[u8; 32], extras: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(content);
+    hasher.update(extras);
+    hasher.finalize().into()
 }
 
 /// 对齐 Anthropic 官方 prompt caching 最小可缓存 tokens。
@@ -963,6 +1033,91 @@ mod tests {
         assert_eq!(r.uncached_input_tokens, 15_000);
     }
 
+    /// Cache Invalidation Summary: tool_choice ✓ ✓ ✘ —— 保留 tools/system，
+    /// 失效 messages。messages 段 breakpoint 在 tool_choice 变化后应完全未命中。
+    #[test]
+    fn tool_choice_change_invalidates_messages_cache() {
+        let tracker = tracker();
+        let credential_id = 1;
+        let system = large_text("S ", LARGE_SYSTEM_CHARS);
+
+        let build = |tool_choice: serde_json::Value| MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: system.clone(),
+                block_type: Some("text".to_string()),
+                cache_control: None,
+            }]),
+            messages: vec![user_message(vec![json!({
+                "type": "text",
+                "text": large_text("U ", 5_000),
+                "cache_control": ephemeral_5m(),
+            })])],
+            tools: None,
+            tool_choice: Some(tool_choice),
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let req1 = build(json!({"type": "auto"}));
+        let p1 = tracker.build_profile(&req1, 10_000);
+        let r1 = tracker.compute_and_update(credential_id, &p1);
+        assert!(r1.cache_creation_input_tokens > 0);
+
+        let req2 = build(json!({"type": "any"}));
+        let p2 = tracker.build_profile(&req2, 10_000);
+        let r2 = tracker.compute_and_update(credential_id, &p2);
+        assert_eq!(
+            r2.cache_read_input_tokens, 0,
+            "tool_choice 变化应让 messages 段 breakpoint 完全未命中: {:?}",
+            r2
+        );
+        assert!(r2.cache_creation_input_tokens > 0, "应重新创建缓存");
+    }
+
+    /// tool_choice 变化不应影响 tools 段 breakpoint 的命中（✓ tools 保留）。
+    #[test]
+    fn tool_choice_change_preserves_tools_cache() {
+        let tracker = CacheTracker::new(DEFAULT_CACHE_TTL, true, None);
+        let credential_id = 1;
+
+        let large_tool_desc = large_text("tool description ", 20_000);
+        let tool = json!({
+            "name": "big_tool",
+            "description": large_tool_desc,
+            "input_schema": {"type": "object"},
+            "cache_control": {"type": "ephemeral"},
+        });
+
+        let build = |tool_choice: serde_json::Value| MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            stream: false,
+            system: None,
+            messages: vec![user_message(vec![json!({"type": "text", "text": "hi"})])],
+            tools: Some(vec![serde_json::from_value(tool.clone()).unwrap()]),
+            tool_choice: Some(tool_choice),
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let p1 = tracker.build_profile(&build(json!({"type": "auto"})), 6_000);
+        let r1 = tracker.compute_and_update(credential_id, &p1);
+        assert!(r1.cache_creation_input_tokens > 0);
+
+        let p2 = tracker.build_profile(&build(json!({"type": "any"})), 6_000);
+        let r2 = tracker.compute_and_update(credential_id, &p2);
+        assert_eq!(
+            r2.cache_read_input_tokens, r1.cache_creation_input_tokens,
+            "tool_choice 变化不应失效 tools 段: {:?}",
+            r2
+        );
+    }
+
     /// thinking 块上的 cache_control 应被忽略（Anthropic 不允许）。
     #[test]
     fn cache_control_on_thinking_block_ignored() {
@@ -984,6 +1139,88 @@ mod tests {
         assert_eq!(
             r.uncached_input_tokens, 10_000,
             "thinking 块的 cache_control 无效，整段应为未缓存"
+        );
+    }
+
+    /// 超过 4 个 cache_control breakpoint 时按 Anthropic 行为退化为无缓存。
+    #[test]
+    fn too_many_breakpoints_falls_back_to_uncached() {
+        let tracker = tracker();
+        let system = large_text("S ", LARGE_SYSTEM_CHARS);
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: system,
+                block_type: Some("text".to_string()),
+                cache_control: Some(ephemeral_5m()),
+            }]),
+            messages: vec![user_message(
+                (0..5)
+                    .map(|i| {
+                        json!({
+                            "type": "text",
+                            "text": large_text(&format!("msg{} ", i), 3_000),
+                            "cache_control": ephemeral_5m(),
+                        })
+                    })
+                    .collect(),
+            )],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let profile = tracker.build_profile(&req, 15_000);
+        let r = tracker.compute_and_update(1, &profile);
+        assert_eq!(r.cache_read_input_tokens, 0);
+        assert_eq!(r.cache_creation_input_tokens, 0);
+        assert_eq!(r.uncached_input_tokens, 15_000);
+    }
+
+    /// 同一 breakpoint 位置从 1h 写入后被 5m 覆盖，TTL 应 downgrade。
+    #[test]
+    fn breakpoint_ttl_downgrades_from_1h_to_5m() {
+        let tracker = CacheTracker::new(ONE_HOUR_CACHE_TTL, true, None);
+        let system = large_text("S ", LARGE_SYSTEM_CHARS);
+
+        let build = |ttl_1h: bool| MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: system.clone(),
+                block_type: Some("text".to_string()),
+                cache_control: Some(if ttl_1h { ephemeral_1h() } else { ephemeral_5m() }),
+            }]),
+            messages: vec![user_message(vec![json!({"type": "text", "text": "hi"})])],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let p1 = tracker.build_profile(&build(true), 10_000);
+        let r1 = tracker.compute_and_update(1, &p1);
+        assert!(r1.cache_creation_1h_input_tokens > 0, "首轮应写入 1h 桶");
+
+        let p2 = tracker.build_profile(&build(false), 10_000);
+        let r2 = tracker.compute_and_update(1, &p2);
+        assert!(
+            r2.cache_read_input_tokens > 0,
+            "覆盖写入时仍能命中之前的 entry"
+        );
+
+        let entries = tracker.entries.lock();
+        let bucket = entries.get(&GLOBAL_CREDENTIAL_KEY).expect("bucket 存在");
+        let entry = bucket.values().next().expect("至少有一条 entry");
+        assert_eq!(
+            entry.ttl, DEFAULT_CACHE_TTL,
+            "覆盖写入后 TTL 应 downgrade 为 5m"
         );
     }
 
