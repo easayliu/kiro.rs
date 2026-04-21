@@ -143,11 +143,21 @@ async fn call_remote_count_tokens(
     Ok(result.input_tokens as u64)
 }
 
+/// 每条 message 的结构开销（role token、boundary 分隔符等）。
+///
+/// 对齐 Anthropic prompt caching 的 `input_tokens` 语义：该字段定义为
+/// "既不在 cache_read 也不在 cache_creation 的 tokens"，包含了不进缓存的
+/// per-message 结构开销。因此 total_input_tokens 必须比 Σ block.tokens
+/// 多出 `n_messages × OVERHEAD`，这样即使客户端把 cache_control 打到
+/// prompt 末尾（全缓存场景），uncached 也会等于 overhead 总和而非 0，与
+/// 官方返回的 input_tokens 语义一致。
+const TOKENS_PER_MESSAGE_OVERHEAD: u64 = 4;
+
 /// 本地计算请求的输入 tokens
 ///
-/// 只累加 block 级内容 tokens，不额外加 per-message overhead —— 为保持
-/// 确定性和与上游算法一致，任何恒定附加项都会被客户端的对账倍率吸收，
-/// 所以这里不做加法，改由 calibration 系数统一消化。
+/// 累加 block 级内容 tokens 后再为每条 message 加上结构 overhead，让
+/// `total_input_tokens > cache_tracker 内部累计的 block token 总和`，保证
+/// `uncached = total - (read + creation)` 在全缓存场景也 > 0（对齐 Anthropic）。
 fn count_all_tokens_local(
     system: Option<Vec<SystemMessage>>,
     messages: Vec<Message>,
@@ -169,6 +179,7 @@ fn count_all_tokens_local(
 
     for msg in &messages {
         total += count_message_content_tokens(&msg.content);
+        total += TOKENS_PER_MESSAGE_OVERHEAD;
     }
 
     total.max(1)
