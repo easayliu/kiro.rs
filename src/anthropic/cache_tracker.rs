@@ -366,29 +366,47 @@ impl CacheTracker {
                 "查找缓存匹配"
             );
 
-            // 对齐 Anthropic：从 last_breakpoint 向前最多扫 20 个 block，
-            // 取最长的匹配 prefix。cache 表内只有 breakpoint 位置的 entry，
-            // 非 breakpoint 位置的 fingerprint 不会误命中。
-            let last_index = last_breakpoint.block_index;
-            let mut scanned = 0usize;
-            for idx in (0..=last_index).rev() {
-                if scanned >= PREFIX_LOOKBACK_LIMIT {
-                    break;
-                }
-                scanned += 1;
+            // 对齐 Anthropic：每个 cache_control breakpoint 各自回扫最多
+            // 20 个 block（含自身），取跨所有 breakpoint 中最长的匹配 prefix。
+            // 先只读扫描锁定最佳 (idx, fingerprint)，再单独 get_mut 更新，
+            // 避免在循环中同时持有可变借用。
+            let mut best: Option<(usize, [u8; 32], i32)> = None;
+            for bp in profile.cacheable_breakpoints() {
+                let mut scanned = 0usize;
+                for idx in (0..=bp.block_index).rev() {
+                    if scanned >= PREFIX_LOOKBACK_LIMIT {
+                        break;
+                    }
+                    scanned += 1;
 
-                let block = &profile.blocks[idx];
-                if let Some(entry) = bucket.get_mut(&block.prefix_fingerprint) {
+                    let block = &profile.blocks[idx];
+                    let Some(entry) = bucket.get(&block.prefix_fingerprint) else {
+                        continue;
+                    };
                     if entry.expires_at <= now {
                         continue;
                     }
-                    entry.expires_at = now + entry.ttl;
-                    entry.last_used_at = now;
-                    matched_tokens =
+                    let candidate_tokens =
                         block.cumulative_tokens.min(profile.total_input_tokens);
-                    matched_block_index = Some(idx);
+                    // 同一 bp 内回扫 idx 递减，cumulative_tokens 单调递减，
+                    // 第一个命中即该 bp 的最佳匹配；break 去跑下一个 bp。
+                    match best {
+                        Some((_, _, existing)) if existing >= candidate_tokens => {}
+                        _ => {
+                            best = Some((idx, block.prefix_fingerprint, candidate_tokens));
+                        }
+                    }
                     break;
                 }
+            }
+
+            if let Some((idx, fingerprint, cum_tokens)) = best {
+                if let Some(entry) = bucket.get_mut(&fingerprint) {
+                    entry.expires_at = now + entry.ttl;
+                    entry.last_used_at = now;
+                }
+                matched_tokens = cum_tokens;
+                matched_block_index = Some(idx);
             }
         } else {
             tracing::debug!(credential_id, effective_id, "首次请求，无缓存条目");
@@ -1406,6 +1424,77 @@ mod tests {
         assert_eq!(
             r2.cache_read_input_tokens, 0,
             "PerCredential 模式下即使同 billing 也按 credential 隔离: {:?}",
+            r2
+        );
+    }
+
+    /// last_breakpoint 与更早的稳定 breakpoint（如 system）之间间隔 > 20 block
+    /// 时，仍应通过 per-breakpoint 回扫命中更早的 breakpoint。
+    #[test]
+    fn per_breakpoint_lookback_finds_stable_prefix_beyond_20_blocks() {
+        let tracker = tracker();
+        let credential_id = 1;
+        let system = large_text("S ", LARGE_SYSTEM_CHARS);
+
+        // Turn 1: system 打 cache_control,user 不打 —— 只在 block 0 写 entry。
+        let req1 = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: system.clone(),
+                block_type: Some("text".to_string()),
+                cache_control: Some(ephemeral_5m()),
+            }]),
+            messages: vec![user_message(vec![json!({ "type": "text", "text": "hi" })])],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let p1 = tracker.build_profile(&req1, 10_000);
+        let r1 = tracker.compute_and_update(credential_id, &p1);
+        assert!(
+            r1.cache_creation_input_tokens > 0,
+            "turn 1 应为 system 建立缓存"
+        );
+        let system_tokens = r1.cache_creation_input_tokens;
+
+        // Turn 2: 同样 system 打 cache_control,中间塞 25 个 padding block,
+        // 只在最后一个 block 打 cache_control。last_bp 位于 ≥ block 26,
+        // 与 system bp（block 0）相距 > 20。
+        let mut padding: Vec<serde_json::Value> = (0..25)
+            .map(|i| json!({ "type": "text", "text": format!("pad {}", i) }))
+            .collect();
+        padding.push(json!({
+            "type": "text",
+            "text": "final",
+            "cache_control": ephemeral_5m(),
+        }));
+
+        let req2 = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: system,
+                block_type: Some("text".to_string()),
+                cache_control: Some(ephemeral_5m()),
+            }]),
+            messages: vec![user_message(padding)],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let p2 = tracker.build_profile(&req2, 15_000);
+        let r2 = tracker.compute_and_update(credential_id, &p2);
+
+        assert_eq!(
+            r2.cache_read_input_tokens, system_tokens,
+            "system bp 距 last_bp > 20 block 时,per-breakpoint 回扫仍应命中 system: {:?}",
             r2
         );
     }
