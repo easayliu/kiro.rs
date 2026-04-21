@@ -602,13 +602,21 @@ fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
             strip_cache_control(&mut value);
             strip_billing_header_line(&mut value);
 
+            // token 计数用 strip 后的文本，与 fingerprint 一致；
+            // billing header 是 Claude Code 注入的元数据，不属于真实 prompt 内容。
+            let tokens = value
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(|t| crate::token::count_tokens(t) as i32)
+                .unwrap_or_else(|| count_system_message_tokens(block) as i32);
+
             blocks.push(PendingBlock {
                 value: canonicalize_json(serde_json::json!({
                     "kind": "system",
                     "system_index": system_index,
                     "block": value,
                 })),
-                tokens: count_system_message_tokens(block) as i32,
+                tokens,
                 breakpoint_ttl,
                 segment: BlockSegment::System,
             });

@@ -540,13 +540,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
   }
 
-  // 缓存分桶策略：两态切换（两者都按 billing_header 基础分桶）
+  // 缓存分桶策略：两态切换（两者都按用户身份 metadata.user_id 基础分桶）
   const cacheScopeLabel = (scope?: CacheScope) =>
     scope === 'per_credential' ? '凭据隔离' : '全局共享'
   const cacheScopeTitle = (scope?: CacheScope) =>
     scope === 'per_credential'
-      ? '当前：按 billing + credential 双层分桶（同 billing 用户跨凭据不共享） · 点击切换到全局共享'
-      : '当前：按 billing_header 分桶（同 billing 用户跨凭据共享，不同 billing 天然隔离） · 点击切换到凭据隔离'
+      ? '当前：按用户身份 + credential 双层分桶（同一用户跨凭据不共享） · 点击切换到全局共享'
+      : '当前：按用户身份分桶（同一用户跨凭据共享，不同用户天然隔离） · 点击切换到凭据隔离'
   const handleCycleCacheScope = () => {
     const current = cacheScopeData?.scope ?? 'global'
     const next: CacheScope = current === 'global' ? 'per_credential' : 'global'
