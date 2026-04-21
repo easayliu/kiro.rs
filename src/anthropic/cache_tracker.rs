@@ -600,6 +600,7 @@ fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
             let mut value = serde_json::to_value(block).unwrap_or(serde_json::Value::Null);
             let breakpoint_ttl = extract_cache_ttl(&value);
             strip_cache_control(&mut value);
+            strip_billing_header_line(&mut value);
 
             blocks.push(PendingBlock {
                 value: canonicalize_json(serde_json::json!({
@@ -720,6 +721,22 @@ fn strip_cache_control(value: &mut serde_json::Value) {
             }
         }
         _ => {}
+    }
+}
+
+/// 从 system block 的 text 字段中移除 `x-anthropic-billing-header: ...` 行。
+/// billing header 的 cch 字段每次请求都变，如果留在 fingerprint 里会导致
+/// system prefix 永远无法命中缓存。
+fn strip_billing_header_line(value: &mut serde_json::Value) {
+    if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
+        let filtered: String = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("x-anthropic-billing-header:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if filtered.len() != text.len() {
+            value["text"] = serde_json::Value::String(filtered);
+        }
     }
 }
 
