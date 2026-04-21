@@ -1,13 +1,18 @@
 //! Token 计算模块
 //!
-//! 采用字符启发式算法：非西文字符每个计 4.5 字符单位、西文字符每个计 1 单位，
-//! 除以 4 得基础 tokens 后按长度分段放大系数。优点是纯计算、0 依赖、完全
-//! 确定性、跨版本/环境/语言实现一致 —— 同一段文本无论何时何地结果恒定，
-//! 便于客户端通过稳定倍率做对账校正。
+//! 算法：`tokens = ceil(utf8_byte_len / 4)`。单行实现，零分支、零依赖、
+//! O(1) 时间。
 //!
-//! 代价：相对 Claude 真实分词，绝对值会系统性偏高（中文尤甚），**不是精度
-//! 工具**。需要 100% 精确值请配置 `count_tokens_api_url` 走远程
-//! `/v1/messages/count_tokens`，本地计算仅作为回退。
+//! 为什么取字节数而不是字符数：UTF-8 编码下英文 1 字节、中文 3 字节、
+//! 日韩 3 字节、阿拉伯 2 字节 —— 字节数天然反映真实 tokenizer 对不同
+//! 语种的密度差异（中文更密），不需要写 Unicode 分类表或分段放大系数。
+//!
+//! 为什么除以 4：社区实测 Claude 家族的 BPE 平均压缩比约 3.5–4 字节/token，
+//! 取 4 更接近真实值；如需保留"偏高以防爆窗口"的裕度方向，可改为 3。
+//!
+//! 这套实现的目标是**稳定可预测**而非精度：同一字符串任何时间/环境/语言
+//! 实现下结果恒定，客户端用单一倍率校正即可对账。需要 100% 精确值请配置
+//! `count_tokens_api_url` 走远程 `/v1/messages/count_tokens`。
 
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
@@ -46,56 +51,15 @@ fn get_config() -> Option<&'static CountTokensConfig> {
     COUNT_TOKENS_CONFIG.get()
 }
 
-/// 计算文本的 token 数量（字符启发式）。空串返回 0。
-///
-/// 非西文字符 × 4.5、西文字符 × 1，除以 4 得基础 tokens，
-/// 再按下列分段乘放大系数（短文本放得更多，长文本回归 1.0）：
-/// - `< 100` → ×1.5
-/// - `< 200` → ×1.3
-/// - `< 300` → ×1.25
-/// - `< 800` → ×1.2
-/// - `≥ 800` → ×1.0
+/// UTF-8 字节数到 token 的换算基数。取 4 贴近 Claude 家族 BPE 的平均压缩比。
+const BYTES_PER_TOKEN: u64 = 4;
+
+/// 计算文本的 token 数量（UTF-8 字节 / `BYTES_PER_TOKEN`，向上取整）。空串返回 0。
 pub fn count_tokens(text: &str) -> u64 {
     if text.is_empty() {
         return 0;
     }
-
-    let char_units: f64 = text
-        .chars()
-        .map(|c| if is_non_western_char(c) { 4.5 } else { 1.0 })
-        .sum();
-    let tokens = char_units / 4.0;
-
-    let scaled = if tokens < 100.0 {
-        tokens * 1.5
-    } else if tokens < 200.0 {
-        tokens * 1.3
-    } else if tokens < 300.0 {
-        tokens * 1.25
-    } else if tokens < 800.0 {
-        tokens * 1.2
-    } else {
-        tokens
-    };
-
-    scaled as u64
-}
-
-/// 判断字符是否为非西文字符。
-///
-/// 西文范围覆盖基本 ASCII、拉丁扩展 A/B、Latin Extended Additional，
-/// 以及几块拉丁变体（C/D/E）。其余一律视为非西文（中日韩、阿拉伯、
-/// 符号等），按更高系数计 token。
-fn is_non_western_char(c: char) -> bool {
-    !matches!(
-        c,
-        '\u{0000}'..='\u{00FF}'
-            | '\u{0100}'..='\u{024F}'
-            | '\u{1E00}'..='\u{1EFF}'
-            | '\u{2C60}'..='\u{2C7F}'
-            | '\u{A720}'..='\u{A7FF}'
-            | '\u{AB30}'..='\u{AB6F}'
-    )
+    (text.len() as u64).div_ceil(BYTES_PER_TOKEN)
 }
 
 /// 估算请求的输入 tokens
@@ -278,27 +242,27 @@ mod tests {
 
     #[test]
     fn count_tokens_english_sanity() {
-        // "Hello, world!" 13 西文字符 → 13/4=3.25 → ×1.5 ≈ 4，区间 [3,6] 防护
-        let n = count_tokens("Hello, world!");
-        assert!((3..=6).contains(&n), "got {n}");
+        // "Hello, world!" = 13 字节 → ceil(13/4) = 4
+        assert_eq!(count_tokens("Hello, world!"), 4);
     }
 
     #[test]
     fn count_tokens_chinese_sanity() {
-        // 字符启发式：非西文 ×4.5、西文 ×1，/4 后按段放大。
-        // 该文本主体为中文（非西文），结果稳定落在约 50-80 区间。
+        // UTF-8 下中文 3 字节/字，字节数天然反映 tokenizer 对中文更密的事实。
+        // 该文本 107 字节 → ceil(107/4) = 27 tokens。
         let text = "你好世界，这是一个测试。一个很长的测试文本，用来对比不同 tokenizer 的差异。";
-        let n = count_tokens(text);
-        assert!((50..=80).contains(&n), "got {n}");
+        assert_eq!(count_tokens(text), 27);
     }
 
-    /// 回归防护：西文字符按 1 单位、非西文按 4.5 单位分别计入。
+    /// 回归防护：纯 ASCII 与纯 CJK 的字节→token 换算关键定点。
     #[test]
-    fn count_tokens_char_classification() {
-        // 纯西文 8 字符 → 8/4=2 → ×1.5 = 3
-        assert_eq!(count_tokens("abcdefgh"), 3);
-        // 纯非西文 4 字符 → 4*4.5/4=4.5 → ×1.5 = 6
-        assert_eq!(count_tokens("你好世界"), 6);
+    fn count_tokens_byte_basis() {
+        // 8 字节 ASCII → ceil(8/4) = 2
+        assert_eq!(count_tokens("abcdefgh"), 2);
+        // 4 个中文 = 12 字节 → ceil(12/4) = 3
+        assert_eq!(count_tokens("你好世界"), 3);
+        // 向上取整：15 字节 → ceil(15/4) = 4
+        assert_eq!(count_tokens("abcdefghijklmno"), 4);
     }
 
     /// 回归防护：tokenizer 成功初始化，连续两次调用返回相同结果（单例）。
