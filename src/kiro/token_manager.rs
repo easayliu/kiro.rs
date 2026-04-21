@@ -969,11 +969,13 @@ impl MultiTokenManager {
         })
     }
 
-    /// 将凭据列表回写到源文件（统一输出为数组格式）
+    /// 将凭据列表回写到源文件。
     ///
-    /// 历史上仅多凭据格式回写，导致单对象格式在 Admin API 添加/修改凭据、
-    /// 或 token 轮换后新 refresh_token 无法持久化，重启即丢失。
-    /// 现改为无条件以数组格式回写，单对象格式会在首次回写时自动升级。
+    /// 格式选择：
+    /// - 凭据数 > 1：一律数组（避免历史 bug —— 单对象格式多凭据时丢数据）
+    /// - 凭据数 == 1 且原格式为数组：数组（尊重用户选择）
+    /// - 凭据数 == 1 且原格式为单对象：保持单对象（不强制升级）
+    /// - 凭据数 == 0：空数组
     ///
     /// # Returns
     /// - `Ok(true)` - 成功写入文件
@@ -982,15 +984,11 @@ impl MultiTokenManager {
     fn persist_credentials(&self) -> anyhow::Result<bool> {
         use anyhow::Context;
 
-        // 无论原始文件是单对象还是数组格式，都以数组格式回写；
-        // 单对象格式首次回写后即自动升级为数组格式，便于 Admin API
-        // 新增/更新/刷新后的凭据持久化，避免容器重启后丢失。
         let path = match &self.credentials_path {
             Some(p) => p,
             None => return Ok(false),
         };
 
-        // 收集所有凭据
         let credentials: Vec<KiroCredentials> = {
             let entries = self.entries.lock();
             entries
@@ -998,17 +996,18 @@ impl MultiTokenManager {
                 .map(|e| {
                     let mut cred = e.credentials.clone();
                     cred.canonicalize_auth_method();
-                    // 同步 disabled 状态到凭据对象
                     cred.disabled = e.disabled;
                     cred
                 })
                 .collect()
         };
 
-        // 序列化为 pretty JSON
-        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
+        let json = if credentials.len() == 1 && !self.is_multiple_format {
+            serde_json::to_string_pretty(&credentials[0]).context("序列化凭据失败")?
+        } else {
+            serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?
+        };
 
-        // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::block_in_place(|| std::fs::write(path, &json))
                 .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
@@ -2091,6 +2090,48 @@ mod tests {
             content.contains("ksk_real_new"),
             "Admin 新增的凭据应被持久化到文件"
         );
+
+        std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+
+    /// 回归测试：单凭据 + is_multiple_format=false → 持久化保持单对象格式，
+    /// 不强制升级到数组。只有当凭据数 > 1 时才自动升级。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_single_credential_preserves_single_object_format() {
+        let tmp_dir = std::env::temp_dir()
+            .join(format!("kiro_test_preserve_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let creds_path = tmp_dir.join("credentials.json");
+
+        std::fs::write(
+            &creds_path,
+            r#"{"kiroApiKey":"ksk_initial","authMethod":"api_key"}"#,
+        )
+        .unwrap();
+
+        let mut cred = KiroCredentials::default();
+        cred.id = Some(1);
+        cred.kiro_api_key = Some("ksk_initial".to_string());
+        cred.auth_method = Some("api_key".to_string());
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred],
+            None,
+            Some(creds_path.clone()),
+            false,
+        )
+        .unwrap();
+
+        manager.set_priority(1, 5).unwrap();
+
+        let content = std::fs::read_to_string(&creds_path).unwrap();
+        assert!(
+            content.trim_start().starts_with('{'),
+            "单凭据 + is_multiple_format=false 时应保持单对象格式，实际: {}",
+            content
+        );
+        assert!(content.contains("\"priority\": 5"));
 
         std::fs::remove_dir_all(&tmp_dir).ok();
     }
