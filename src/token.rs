@@ -1,11 +1,13 @@
 //! Token 计算模块
 //!
-//! 提供文本 token 数量计算功能。
+//! 使用 `claude-tokenizer` 内嵌的 Claude v3 BPE 表（来自 Anthropic Python SDK
+//! 早期 bundle 的 `claude-v3-tokenizer.json`），是目前和官方最接近的开源
+//! tokenizer。Claude 4+ 的 tokenizer Anthropic 未公开，理论上可能有细微差异，
+//! 但远优于字符启发式；需要 100% 精确值请配置 `count_tokens_api_url` 走远程
+//! `/v1/messages/count_tokens`。
 //!
-//! # 计算规则
-//! - 非西文字符：每个计 4.5 个字符单位
-//! - 西文字符：每个计 1 个字符单位
-//! - 4 个字符单位 = 1 token（四舍五入）
+//! `claude-tokenizer::count_tokens` 源码里每次都重建 Tokenizer（几十 ms 的
+//! 开销），这里用 OnceLock 缓存单例避免热路径重复加载。
 
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
@@ -13,6 +15,8 @@ use crate::anthropic::types::{
 use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
 use std::sync::OnceLock;
+use tokenizers::Tokenizer;
+use tokenizers::tokenizer::{EncodeInput, InputSequence};
 
 /// Count Tokens API 配置
 #[derive(Clone, Default)]
@@ -44,62 +48,26 @@ fn get_config() -> Option<&'static CountTokensConfig> {
     COUNT_TOKENS_CONFIG.get()
 }
 
-/// 判断字符是否为非西文字符
-///
-/// 西文字符包括：
-/// - ASCII 字符 (U+0000..U+007F)
-/// - 拉丁字母扩展 (U+0080..U+024F)
-/// - 拉丁字母扩展附加 (U+1E00..U+1EFF)
-///
-/// 返回 true 表示该字符是非西文字符（如中文、日文、韩文、阿拉伯文等）
-fn is_non_western_char(c: char) -> bool {
-    !matches!(c,
-        // 基本 ASCII
-        '\u{0000}'..='\u{007F}' |
-        // 拉丁字母扩展-A (Latin Extended-A)
-        '\u{0080}'..='\u{00FF}' |
-        // 拉丁字母扩展-B (Latin Extended-B)
-        '\u{0100}'..='\u{024F}' |
-        // 拉丁字母扩展附加 (Latin Extended Additional)
-        '\u{1E00}'..='\u{1EFF}' |
-        // 拉丁字母扩展-C/D/E
-        '\u{2C60}'..='\u{2C7F}' |
-        '\u{A720}'..='\u{A7FF}' |
-        '\u{AB30}'..='\u{AB6F}'
-    )
+/// 缓存的 Claude v3 tokenizer 实例。
+static CLAUDE_TOKENIZER: OnceLock<Tokenizer> = OnceLock::new();
+
+fn claude_tokenizer() -> &'static Tokenizer {
+    CLAUDE_TOKENIZER.get_or_init(claude_tokenizer::get_tokenizer)
 }
 
-/// 计算文本的 token 数量
-///
-/// # 计算规则
-/// - 非西文字符：每个计 4.5 个字符单位
-/// - 西文字符：每个计 1 个字符单位
-/// - 4 个字符单位 = 1 token（四舍五入）
-/// ```
+/// 计算文本的 token 数量（Claude v3 BPE）。空串返回 0。
 pub fn count_tokens(text: &str) -> u64 {
-    // println!("text: {}", text);
-
-    let char_units: f64 = text
-        .chars()
-        .map(|c| if is_non_western_char(c) { 4.0 } else { 1.0 })
-        .sum();
-
-    let tokens = char_units / 4.0;
-
-    let acc_token = if tokens < 100.0 {
-        tokens * 1.5
-    } else if tokens < 200.0 {
-        tokens * 1.3
-    } else if tokens < 300.0 {
-        tokens * 1.25
-    } else if tokens < 800.0 {
-        tokens * 1.2
-    } else {
-        tokens * 1.0
-    } as u64;
-
-    // println!("tokens: {}, acc_tokens: {}", tokens, acc_token);
-    acc_token
+    if text.is_empty() {
+        return 0;
+    }
+    let input = EncodeInput::Single(InputSequence::Raw(text.into()));
+    match claude_tokenizer().encode(input, false) {
+        Ok(encoded) => encoded.len() as u64,
+        Err(e) => {
+            tracing::warn!(error = ?e, "claude tokenizer encode 失败，回退到字符数/4 估算");
+            (text.chars().count() as u64 / 4).max(1)
+        }
+    }
 }
 
 /// 估算请求的输入 tokens
@@ -271,5 +239,40 @@ pub(crate) fn count_message_content_tokens(value: &serde_json::Value) -> u64 {
             0
         }
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_tokens_empty_is_zero() {
+        assert_eq!(count_tokens(""), 0);
+    }
+
+    #[test]
+    fn count_tokens_english_sanity() {
+        // "Hello, world!" 在 Claude v3 BPE 下通常是 4 tokens 左右（≤ 6 可接受）
+        let n = count_tokens("Hello, world!");
+        assert!((3..=6).contains(&n), "got {n}");
+    }
+
+    #[test]
+    fn count_tokens_chinese_sanity() {
+        // 43 中文字符用 Claude v3 tokenizer 是 27 tokens（实测）。
+        // 给个宽松区间 [20, 40] 作为回归防护。
+        let text = "你好世界，这是一个测试。一个很长的测试文本，用来对比不同 tokenizer 的差异。";
+        let n = count_tokens(text);
+        assert!((20..=40).contains(&n), "got {n}");
+    }
+
+    /// 回归防护：tokenizer 成功初始化，连续两次调用返回相同结果（单例）。
+    #[test]
+    fn count_tokens_singleton_stable() {
+        let a = count_tokens("the quick brown fox jumps over the lazy dog");
+        let b = count_tokens("the quick brown fox jumps over the lazy dog");
+        assert_eq!(a, b);
+        assert!(a > 0);
     }
 }

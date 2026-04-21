@@ -32,3 +32,5 @@ parking_lot = "0.12"  # 高性能同步原语
 subtle = "2.6"        # 常量时间比较（防止时序攻击）
 rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断
+claude-tokenizer = "0.3"  # 内嵌 Claude v3 BPE（最接近官方的开源 tokenizer）
+tokenizers = "0.20"       # claude-tokenizer 依赖的底层 BPE 引擎
