@@ -314,6 +314,49 @@ impl AdminService {
         })
     }
 
+    /// 获取缓存分桶策略
+    pub fn get_cache_scope(&self) -> crate::admin::types::CacheScopeResponse {
+        use crate::anthropic::CacheScope;
+        let scope = match self.cache_tracker.cache_scope() {
+            CacheScope::Global => "global",
+            CacheScope::PerCredential => "per_credential",
+        };
+        crate::admin::types::CacheScopeResponse {
+            scope: scope.to_string(),
+        }
+    }
+
+    /// 设置缓存分桶策略（同时持久化到 config.json）
+    pub fn set_cache_scope(
+        &self,
+        req: crate::admin::types::SetCacheScopeRequest,
+    ) -> Result<crate::admin::types::CacheScopeResponse, AdminServiceError> {
+        use crate::anthropic::CacheScope;
+        let scope = CacheScope::parse(&req.scope);
+        self.cache_tracker.set_cache_scope(scope);
+
+        if let Some(config_path) = self.token_manager.config().config_path() {
+            match crate::model::config::Config::load(config_path) {
+                Ok(mut config) => {
+                    let canonical = match scope {
+                        CacheScope::Global => "global",
+                        CacheScope::PerCredential => "per_credential",
+                    };
+                    config.cache_scope = Some(canonical.to_string());
+                    config.global_cache = matches!(scope, CacheScope::Global);
+                    if let Err(e) = config.save() {
+                        tracing::warn!("保存缓存分桶策略失败: {}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("加载配置文件失败: {}", e);
+                }
+            }
+        }
+
+        Ok(self.get_cache_scope())
+    }
+
     /// 获取缓存查找跳过率
     pub fn get_cache_skip_rate(&self) -> CacheSkipRateResponse {
         CacheSkipRateResponse {

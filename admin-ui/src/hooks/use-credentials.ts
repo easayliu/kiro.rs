@@ -12,6 +12,8 @@ import {
   setLoadBalancingMode,
   getGlobalCache,
   setGlobalCache,
+  getCacheScope,
+  setCacheScope,
   getCacheSkipRate,
   setCacheSkipRate,
 } from '@/api/credentials'
@@ -137,6 +139,27 @@ export function useSetGlobalCache() {
   return useMutation({
     mutationFn: setGlobalCache,
     onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['globalCache'] })
+      queryClient.invalidateQueries({ queryKey: ['cacheScope'] })
+    },
+  })
+}
+
+// 获取缓存分桶策略
+export function useCacheScope() {
+  return useQuery({
+    queryKey: ['cacheScope'],
+    queryFn: getCacheScope,
+  })
+}
+
+// 设置缓存分桶策略
+export function useSetCacheScope() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setCacheScope,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['cacheScope'] })
       queryClient.invalidateQueries({ queryKey: ['globalCache'] })
     },
   })

@@ -12,7 +12,8 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
-import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useGlobalCache, useSetGlobalCache, useCacheSkipRate, useSetCacheSkipRate } from '@/hooks/use-credentials'
+import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode, useCacheScope, useSetCacheScope, useCacheSkipRate, useSetCacheSkipRate } from '@/hooks/use-credentials'
+import type { CacheScope } from '@/api/credentials'
 import {
   Dialog,
   DialogContent,
@@ -63,8 +64,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
-  const { data: globalCacheData, isLoading: isLoadingGlobalCache } = useGlobalCache()
-  const { mutate: setGlobalCacheMutation, isPending: isSettingGlobalCache } = useSetGlobalCache()
+  const { data: cacheScopeData, isLoading: isLoadingCacheScope } = useCacheScope()
+  const { mutate: setCacheScopeMutation, isPending: isSettingCacheScope } = useSetCacheScope()
   const { data: cacheSkipRateData, isLoading: isLoadingCacheSkipRate } = useCacheSkipRate()
   const { mutate: setCacheSkipRateMutation, isPending: isSettingCacheSkipRate } = useSetCacheSkipRate()
   const [cacheSkipRateDialogOpen, setCacheSkipRateDialogOpen] = useState(false)
@@ -539,17 +540,23 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
   }
 
-  // 切换全局缓存模式
-  const handleToggleGlobalCache = () => {
-    const current = globalCacheData?.enabled ?? true
-    setGlobalCacheMutation(!current, {
+  // 缓存分桶策略：两态切换（两者都按 billing_header 基础分桶）
+  const cacheScopeLabel = (scope?: CacheScope) =>
+    scope === 'per_credential' ? '凭据隔离' : '全局共享'
+  const cacheScopeTitle = (scope?: CacheScope) =>
+    scope === 'per_credential'
+      ? '当前：按 billing + credential 双层分桶（同 billing 用户跨凭据不共享） · 点击切换到全局共享'
+      : '当前：按 billing_header 分桶（同 billing 用户跨凭据共享，不同 billing 天然隔离） · 点击切换到凭据隔离'
+  const handleCycleCacheScope = () => {
+    const current = cacheScopeData?.scope ?? 'global'
+    const next: CacheScope = current === 'global' ? 'per_credential' : 'global'
+    setCacheScopeMutation(next, {
       onSuccess: () => {
-        const modeName = !current ? '全局共享' : '按凭据隔离'
-        toast.success(`缓存模式已切换到${modeName}`)
+        toast.success(`缓存模式已切换到 ${cacheScopeLabel(next)}`)
       },
       onError: (error) => {
         toast.error(`切换失败: ${extractErrorMessage(error)}`)
-      }
+      },
     })
   }
 
@@ -610,15 +617,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <Button
               variant="outline"
               size="sm"
-              onClick={handleToggleGlobalCache}
-              disabled={isLoadingGlobalCache || isSettingGlobalCache}
-              title={
-                globalCacheData?.enabled
-                  ? '当前：全局共享缓存（所有凭据共享 checkpoint）· 点击切换到按凭据隔离'
-                  : '当前：按凭据隔离缓存（每个凭据独立 checkpoint）· 点击切换到全局共享'
-              }
+              onClick={handleCycleCacheScope}
+              disabled={isLoadingCacheScope || isSettingCacheScope}
+              title={cacheScopeTitle(cacheScopeData?.scope)}
             >
-              {isLoadingGlobalCache ? '加载中...' : (globalCacheData?.enabled ? '全局缓存' : '隔离缓存')}
+              {isLoadingCacheScope ? '加载中...' : cacheScopeLabel(cacheScopeData?.scope)}
             </Button>
             <Button
               variant="outline"

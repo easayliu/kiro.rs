@@ -101,8 +101,17 @@ pub struct Config {
     ///
     /// 启用后，所有凭据共享同一份 prompt cache checkpoint 表；
     /// 关闭后，每个凭据独立维护 checkpoint，互不影响。
+    /// 注：存在 `cache_scope` 时以 `cache_scope` 为准。
     #[serde(default = "default_global_cache")]
     pub global_cache: bool,
+
+    /// 缓存分桶策略（覆盖 `global_cache`）。可选值：
+    /// - `"global"`：所有 credential 共享（等价于 `global_cache=true`）
+    /// - `"per_credential"`：按 Kiro credential 隔离（等价于 `global_cache=false`）
+    /// - `"per_billing_header"`：按 Claude Code 的 `x-anthropic-billing-header`
+    ///   分桶，同一用户跨 credential 共享，不同用户隔离
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<String>,
 
     /// 缓存查找跳过率（0.0-1.0，默认 None 不启用）
     ///
@@ -186,6 +195,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             global_cache: default_global_cache(),
+            cache_scope: None,
             cache_skip_rate: None,
             config_path: None,
         }

@@ -8,9 +8,9 @@ use axum::{
 use super::{
     handlers::{
         add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_cache_skip_rate, get_credential_balance, get_global_cache, get_load_balancing_mode,
-        reset_failure_count, set_cache_skip_rate, set_credential_disabled, set_credential_priority,
-        set_global_cache, set_load_balancing_mode,
+        get_cache_scope, get_cache_skip_rate, get_credential_balance, get_global_cache,
+        get_load_balancing_mode, reset_failure_count, set_cache_scope, set_cache_skip_rate,
+        set_credential_disabled, set_credential_priority, set_global_cache, set_load_balancing_mode,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -54,6 +54,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/global-cache",
             get(get_global_cache).put(set_global_cache),
+        )
+        .route(
+            "/config/cache-scope",
+            get(get_cache_scope).put(set_cache_scope),
         )
         .route(
             "/config/cache-skip-rate",

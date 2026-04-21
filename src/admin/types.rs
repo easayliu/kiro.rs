@@ -204,6 +204,21 @@ pub struct SetGlobalCacheRequest {
     pub enabled: bool,
 }
 
+/// 缓存分桶策略响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheScopeResponse {
+    /// `"global"` / `"per_credential"` / `"per_billing_header"`
+    pub scope: String,
+}
+
+/// 设置缓存分桶策略请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCacheScopeRequest {
+    pub scope: String,
+}
+
 /// 缓存查找跳过率响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

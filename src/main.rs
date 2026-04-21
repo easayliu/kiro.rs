@@ -116,12 +116,19 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    // 解析缓存分桶策略：cache_scope 优先，否则回落到 global_cache 布尔
+    let cache_scope = match config.cache_scope.as_deref() {
+        Some(s) => anthropic::CacheScope::parse(s),
+        None if config.global_cache => anthropic::CacheScope::Global,
+        None => anthropic::CacheScope::PerCredential,
+    };
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let (anthropic_app, app_state) = anthropic::create_router_with_provider(
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
-        config.global_cache,
+        cache_scope,
         config.cache_skip_rate,
     );
 

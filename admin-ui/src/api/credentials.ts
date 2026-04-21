@@ -117,6 +117,21 @@ export async function setGlobalCache(enabled: boolean): Promise<{ enabled: boole
   return data
 }
 
+// 缓存分桶策略（两种都按 billing_header 分桶，PerCredential 在 billing 之上再按凭据切分）
+export type CacheScope = 'global' | 'per_credential'
+
+// 获取缓存分桶策略
+export async function getCacheScope(): Promise<{ scope: CacheScope }> {
+  const { data } = await api.get<{ scope: CacheScope }>('/config/cache-scope')
+  return data
+}
+
+// 设置缓存分桶策略
+export async function setCacheScope(scope: CacheScope): Promise<{ scope: CacheScope }> {
+  const { data } = await api.put<{ scope: CacheScope }>('/config/cache-scope', { scope })
+  return data
+}
+
 // 获取缓存查找跳过率
 export async function getCacheSkipRate(): Promise<{ rate: number | null }> {
   const { data } = await api.get<{ rate: number | null }>('/config/cache-skip-rate')

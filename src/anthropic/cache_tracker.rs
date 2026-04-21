@@ -5,9 +5,13 @@
 //! `cache_read_input_tokens`（及 5m / 1h 细分），使客户端能感知命中情况。
 //!
 //! 上游 Kiro API 不支持 prompt caching，本追踪器纯本地模拟。
-//! 支持两种模式（运行时可切换）：
-//! - 全局共享：所有凭据共享同一份 checkpoint 表
-//! - 按凭据隔离：每个 credential_id 独立维护 checkpoint
+//! 两种分桶模式（运行时可切换，见 `CacheScope`）：
+//! - `Global`：按 `x-anthropic-billing-header` 分桶（同 billing 用户跨
+//!   credential 共享），无 billing_header 时退化为共享 bucket
+//! - `PerCredential`：在 billing 基础上再按 credential_id 细分，同一 billing
+//!   用户的不同凭据也互不共享
+//!
+//! 两种模式都天然按 billing 隔离，对齐 Anthropic 官方的 per-workspace 隔离。
 //!
 //! 对齐 Anthropic 官方 prompt caching 行为：
 //! - 仅在显式 `cache_control` 标记处建立 breakpoint（不自动在 message 边界插入）
@@ -16,7 +20,7 @@
 //! - `total_processed = cache_read + cache_creation + input_tokens`
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -51,6 +55,9 @@ pub struct CacheProfile {
     min_cacheable_tokens: i32,
     blocks: Vec<CacheBlock>,
     breakpoints: Vec<CacheBreakpoint>,
+    /// 从 system 里提取的 `x-anthropic-billing-header` 的 hash，
+    /// 仅在 `CacheScope::PerBillingHeader` 模式下用作 bucket key。
+    billing_header_key: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,10 +85,48 @@ struct CacheEntry {
 /// 全局模式下使用的固定 credential_id
 const GLOBAL_CREDENTIAL_KEY: u64 = 0;
 
+/// 缓存分桶策略。两种模式都先按 billing_header 分桶，保证不同 billing
+/// 用户永远不共享 cache（对齐 Anthropic 官方 per-workspace 隔离）。
+///
+/// - `Global`：bucket 仅由 billing_header 决定。同 billing 用户的所有
+///   credential 共享 cache；无 billing_header 时退化到共享 bucket（key=0）。
+/// - `PerCredential`：在 billing 基础上再按 credential_id 细分。同一 billing
+///   用户的不同凭据**互不共享** cache，适合想严格按凭据隔离的场景。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheScope {
+    Global,
+    PerCredential,
+}
+
+impl CacheScope {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Global => 0,
+            Self::PerCredential => 1,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::PerCredential,
+            _ => Self::Global,
+        }
+    }
+
+    /// 从配置字符串解析。未知值映射到 `Global`。
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "per_credential" | "percredential" => Self::PerCredential,
+            _ => Self::Global,
+        }
+    }
+}
+
 pub struct CacheTracker {
     entries: Mutex<HashMap<u64, HashMap<[u8; 32], CacheEntry>>>,
     max_supported_ttl: Duration,
-    global_cache: AtomicBool,
+    /// 分桶模式（运行时可切换）。用 AtomicU8 编码 CacheScope。
+    scope: AtomicU8,
     /// 缓存查找跳过率（0.0-1.0）。对每个有 breakpoint 的请求，以此概率
     /// 跳过 cache 查找（当作首次请求，cache_read = 0），但仍正常写入 checkpoint；
     /// 用于在自然命中率偏高时整体降低可观察到的缓存命中率。
@@ -91,23 +136,38 @@ pub struct CacheTracker {
 impl CacheTracker {
     pub fn new(
         max_supported_ttl: Duration,
-        global_cache: bool,
+        scope: CacheScope,
         cache_skip_rate: Option<f32>,
     ) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
             max_supported_ttl,
-            global_cache: AtomicBool::new(global_cache),
+            scope: AtomicU8::new(scope.as_u8()),
             cache_skip_rate: Mutex::new(cache_skip_rate.map(clamp_skip_rate)),
         }
     }
 
-    pub fn is_global_cache(&self) -> bool {
-        self.global_cache.load(Ordering::Relaxed)
+    pub fn cache_scope(&self) -> CacheScope {
+        CacheScope::from_u8(self.scope.load(Ordering::Relaxed))
     }
 
+    pub fn set_cache_scope(&self, scope: CacheScope) {
+        self.scope.store(scope.as_u8(), Ordering::Relaxed);
+    }
+
+    /// 向后兼容：Global → true，其他 → false。
+    pub fn is_global_cache(&self) -> bool {
+        matches!(self.cache_scope(), CacheScope::Global)
+    }
+
+    /// 向后兼容：true → Global，false → PerCredential（保留历史二态行为）。
     pub fn set_global_cache(&self, enabled: bool) {
-        self.global_cache.store(enabled, Ordering::Relaxed);
+        let scope = if enabled {
+            CacheScope::Global
+        } else {
+            CacheScope::PerCredential
+        };
+        self.set_cache_scope(scope);
     }
 
     pub fn cache_skip_rate(&self) -> Option<f32> {
@@ -132,11 +192,22 @@ impl CacheTracker {
         fastrand::f32() < rate
     }
 
-    fn effective_credential_id(&self, credential_id: u64) -> u64 {
-        if self.global_cache.load(Ordering::Relaxed) {
-            GLOBAL_CREDENTIAL_KEY
-        } else {
-            credential_id
+    fn effective_bucket_key(&self, credential_id: u64, profile: &CacheProfile) -> u64 {
+        // 所有模式都先按 billing_header 分桶；无 billing_header 时退化为
+        // 共享 key（Global）或按 credential 隔离（PerCredential）。
+        let billing_key = profile.billing_header_key.unwrap_or(GLOBAL_CREDENTIAL_KEY);
+        match self.cache_scope() {
+            CacheScope::Global => billing_key,
+            CacheScope::PerCredential => {
+                // billing 作为 salt 与 credential_id 混合
+                let mut hasher = Sha256::new();
+                hasher.update(billing_key.to_be_bytes());
+                hasher.update(credential_id.to_be_bytes());
+                let hash: [u8; 32] = hasher.finalize().into();
+                u64::from_be_bytes([
+                    hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+                ])
+            }
         }
     }
 
@@ -230,11 +301,14 @@ impl CacheTracker {
             breakpoints.clear();
         }
 
+        let billing_header_key = extract_billing_header(payload).map(billing_header_to_key);
+
         CacheProfile {
             total_input_tokens: total_input_tokens.max(0),
             min_cacheable_tokens: minimum_cacheable_tokens_for_model(&payload.model),
             blocks,
             breakpoints,
+            billing_header_key,
         }
     }
 
@@ -245,7 +319,7 @@ impl CacheTracker {
     /// 之前建立的缓存位置命中 —— 对应到本实现里即从本次请求的所有
     /// block 前缀指纹（倒序扫描，取最长匹配）中找命中。
     pub fn compute_and_update(&self, credential_id: u64, profile: &CacheProfile) -> CacheResult {
-        let effective_id = self.effective_credential_id(credential_id);
+        let effective_id = self.effective_bucket_key(credential_id, profile);
         let breakpoints_info: Vec<(usize, i32)> = profile
             .cacheable_breakpoints()
             .iter()
@@ -659,6 +733,33 @@ fn compute_segment_extras_hash(payload: &MessagesRequest, segment: BlockSegment)
     Sha256::digest(&bytes).into()
 }
 
+/// 从 system 块里提取 Claude Code 注入的 `x-anthropic-billing-header` 值。
+/// 仅用于 `CacheScope::PerBillingHeader` 模式的 bucket key。
+fn extract_billing_header(payload: &MessagesRequest) -> Option<String> {
+    const PREFIX: &str = "x-anthropic-billing-header:";
+    let system = payload.system.as_ref()?;
+    for block in system {
+        for line in block.text.lines() {
+            let trimmed = line.trim_start();
+            if let Some(value) = trimmed.strip_prefix(PREFIX) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 把 billing_header 字符串压成 u64 bucket key。SHA256 前 8 字节。
+fn billing_header_to_key(value: String) -> u64 {
+    let hash: [u8; 32] = Sha256::digest(value.as_bytes()).into();
+    u64::from_be_bytes([
+        hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+    ])
+}
+
 fn mix_fingerprint(content: &[u8; 32], extras: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(content);
@@ -745,11 +846,16 @@ mod tests {
     const LARGE_SYSTEM_CHARS: usize = 20_000; // 约 5k tokens（按 ~4 字符/token 估算，超过 sonnet-4.6 的 2048 门槛）
 
     fn tracker() -> CacheTracker {
-        CacheTracker::new(DEFAULT_CACHE_TTL, true, None)
+        CacheTracker::new(DEFAULT_CACHE_TTL, CacheScope::Global, None)
     }
 
     fn tracker_per_credential() -> CacheTracker {
-        CacheTracker::new(DEFAULT_CACHE_TTL, false, None)
+        CacheTracker::new(DEFAULT_CACHE_TTL, CacheScope::PerCredential, None)
+    }
+
+    /// 构造一个带指定 billing_header 的 system 块。header 放在 system 第一个块的首行。
+    fn system_with_billing_header(billing: &str, body: &str) -> String {
+        format!("x-anthropic-billing-header: {billing}\n{body}")
     }
 
     fn large_text(prefix: &str, size: usize) -> String {
@@ -945,7 +1051,7 @@ mod tests {
     /// 混合 TTL：每个 breakpoint 按自己的 TTL 单独计 cache_creation。
     #[test]
     fn mixed_ttl_breakpoints_segmented_into_own_buckets() {
-        let tracker = CacheTracker::new(ONE_HOUR_CACHE_TTL, true, None);
+        let tracker = CacheTracker::new(ONE_HOUR_CACHE_TTL, CacheScope::Global, None);
         let system = large_text("S ", LARGE_SYSTEM_CHARS);
 
         let req = MessagesRequest {
@@ -1002,7 +1108,7 @@ mod tests {
     /// 本地退化为无缓存。
     #[test]
     fn invalid_ttl_ordering_falls_back_to_uncached() {
-        let tracker = CacheTracker::new(ONE_HOUR_CACHE_TTL, true, None);
+        let tracker = CacheTracker::new(ONE_HOUR_CACHE_TTL, CacheScope::Global, None);
         let system = large_text("S ", LARGE_SYSTEM_CHARS);
 
         let req = MessagesRequest {
@@ -1081,7 +1187,7 @@ mod tests {
     /// tool_choice 变化不应影响 tools 段 breakpoint 的命中（✓ tools 保留）。
     #[test]
     fn tool_choice_change_preserves_tools_cache() {
-        let tracker = CacheTracker::new(DEFAULT_CACHE_TTL, true, None);
+        let tracker = CacheTracker::new(DEFAULT_CACHE_TTL, CacheScope::Global, None);
         let credential_id = 1;
 
         let large_tool_desc = large_text("tool description ", 20_000);
@@ -1184,7 +1290,7 @@ mod tests {
     /// 同一 breakpoint 位置从 1h 写入后被 5m 覆盖，TTL 应 downgrade。
     #[test]
     fn breakpoint_ttl_downgrades_from_1h_to_5m() {
-        let tracker = CacheTracker::new(ONE_HOUR_CACHE_TTL, true, None);
+        let tracker = CacheTracker::new(ONE_HOUR_CACHE_TTL, CacheScope::Global, None);
         let system = large_text("S ", LARGE_SYSTEM_CHARS);
 
         let build = |ttl_1h: bool| MessagesRequest {
@@ -1221,6 +1327,86 @@ mod tests {
         assert_eq!(
             entry.ttl, DEFAULT_CACHE_TTL,
             "覆盖写入后 TTL 应 downgrade 为 5m"
+        );
+    }
+
+    /// Global 模式：同一 billing_header 的不同 credential 共享 cache。
+    #[test]
+    fn global_scope_shares_by_billing_header_across_credentials() {
+        let tracker = tracker(); // Global
+        let sys = system_with_billing_header("user-42", &large_text("S ", LARGE_SYSTEM_CHARS));
+        let req = build_request(
+            &sys,
+            vec![user_message(vec![json!({
+                "type": "text",
+                "text": "hello",
+                "cache_control": ephemeral_5m(),
+            })])],
+        );
+
+        let p1 = tracker.build_profile(&req, 10_000);
+        let r1 = tracker.compute_and_update(7, &p1);
+        assert!(r1.cache_creation_input_tokens > 0);
+
+        let p2 = tracker.build_profile(&req, 10_000);
+        let r2 = tracker.compute_and_update(99, &p2);
+        assert_eq!(
+            r2.cache_read_input_tokens, r1.cache_creation_input_tokens,
+            "同 billing_header 跨 credential 应共享 cache: {:?}",
+            r2
+        );
+    }
+
+    /// Global 模式：不同 billing_header 自动隔离（不再全用户共享）。
+    #[test]
+    fn global_scope_isolates_different_billing_headers() {
+        let tracker = tracker();
+        let body = large_text("S ", LARGE_SYSTEM_CHARS);
+        let user = vec![user_message(vec![json!({
+            "type": "text",
+            "text": "hello",
+            "cache_control": ephemeral_5m(),
+        })])];
+
+        let req_a = build_request(&system_with_billing_header("alice", &body), user.clone());
+        let p_a = tracker.build_profile(&req_a, 10_000);
+        let r_a = tracker.compute_and_update(1, &p_a);
+        assert!(r_a.cache_creation_input_tokens > 0);
+
+        let req_b = build_request(&system_with_billing_header("bob", &body), user);
+        let p_b = tracker.build_profile(&req_b, 10_000);
+        let r_b = tracker.compute_and_update(1, &p_b);
+        assert_eq!(
+            r_b.cache_read_input_tokens, 0,
+            "不同 billing_header 应相互隔离: {:?}",
+            r_b
+        );
+    }
+
+    /// PerCredential 模式：同 billing_header 的不同 credential 互不共享。
+    #[test]
+    fn per_credential_scope_isolates_credentials_even_with_same_billing() {
+        let tracker = tracker_per_credential();
+        let sys = system_with_billing_header("same-user", &large_text("S ", LARGE_SYSTEM_CHARS));
+        let req = build_request(
+            &sys,
+            vec![user_message(vec![json!({
+                "type": "text",
+                "text": "hello",
+                "cache_control": ephemeral_5m(),
+            })])],
+        );
+
+        let p1 = tracker.build_profile(&req, 10_000);
+        let r1 = tracker.compute_and_update(1, &p1);
+        assert!(r1.cache_creation_input_tokens > 0);
+
+        let p2 = tracker.build_profile(&req, 10_000);
+        let r2 = tracker.compute_and_update(2, &p2);
+        assert_eq!(
+            r2.cache_read_input_tokens, 0,
+            "PerCredential 模式下即使同 billing 也按 credential 隔离: {:?}",
+            r2
         );
     }
 

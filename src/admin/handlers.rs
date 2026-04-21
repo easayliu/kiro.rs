@@ -160,6 +160,25 @@ pub async fn set_global_cache(
     }
 }
 
+/// GET /api/admin/config/cache-scope
+/// 获取缓存分桶策略
+pub async fn get_cache_scope(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_cache_scope();
+    Json(response)
+}
+
+/// PUT /api/admin/config/cache-scope
+/// 设置缓存分桶策略（"global" / "per_credential" / "per_billing_header"）
+pub async fn set_cache_scope(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::admin::types::SetCacheScopeRequest>,
+) -> impl IntoResponse {
+    match state.service.set_cache_scope(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/config/cache-skip-rate
 /// 获取缓存查找跳过率
 pub async fn get_cache_skip_rate(State(state): State<AdminState>) -> impl IntoResponse {

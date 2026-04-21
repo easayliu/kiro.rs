@@ -38,7 +38,7 @@ impl AppState {
     pub fn new(
         api_key: impl Into<String>,
         extract_thinking: bool,
-        global_cache: bool,
+        cache_scope: super::CacheScope,
         cache_skip_rate: Option<f32>,
     ) -> Self {
         Self {
@@ -47,7 +47,7 @@ impl AppState {
             extract_thinking,
             cache_tracker: Arc::new(CacheTracker::new(
                 std::time::Duration::from_secs(DEFAULT_PROMPT_CACHE_TTL_SECS),
-                global_cache,
+                cache_scope,
                 cache_skip_rate,
             )),
         }
