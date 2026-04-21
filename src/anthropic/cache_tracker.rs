@@ -549,19 +549,17 @@ fn strip_cache_control(value: &mut serde_json::Value) {
     }
 }
 
-/// 对齐 Anthropic 官方 prompt caching 最小可缓存 tokens
-/// 参考: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+/// 本地模拟使用的最小可缓存 tokens。
+/// opus-4.7 / mythos 官方是 4096，这里特意归到 1024 档：
+/// 阈值决定 breakpoint 是否写入 checkpoint 表，小 breakpoint 作为
+/// 前缀降级匹配锚点能显著提升跨请求命中率（见 compute_and_update）。
 fn minimum_cacheable_tokens_for_model(model: &str) -> i32 {
     let m = model.to_lowercase();
 
-    // 4096 tokens: Opus 4.5+, Haiku 4.5, Haiku 3, Mythos Preview
-    if m.contains("mythos")
-        || m.contains("opus-4-5")
+    if m.contains("opus-4-5")
         || m.contains("opus-4.5")
         || m.contains("opus-4-6")
         || m.contains("opus-4.6")
-        || m.contains("opus-4-7")
-        || m.contains("opus-4.7")
         || m.contains("haiku-4-5")
         || m.contains("haiku-4.5")
         || m.contains("haiku_4_5")
@@ -570,7 +568,6 @@ fn minimum_cacheable_tokens_for_model(model: &str) -> i32 {
         return 4096;
     }
 
-    // 2048 tokens: Sonnet 4.6, Haiku 3.5
     if m.contains("sonnet-4-6")
         || m.contains("sonnet-4.6")
         || m.contains("sonnet_4_6")
@@ -582,12 +579,10 @@ fn minimum_cacheable_tokens_for_model(model: &str) -> i32 {
         return 2048;
     }
 
-    // 1024 tokens: Opus 4/4.1, Sonnet 3.5/3.7/4/4.5
-    if m.contains("opus") || m.contains("sonnet") {
+    if m.contains("opus") || m.contains("sonnet") || m.contains("mythos") {
         return 1024;
     }
 
-    // 未知 haiku 版本按 2048 兜底（最常见的 3.5）
     if m.contains("haiku") {
         return 2048;
     }
