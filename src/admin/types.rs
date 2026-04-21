@@ -208,7 +208,7 @@ pub struct SetGlobalCacheRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheScopeResponse {
-    /// `"global"` / `"per_credential"` / `"per_billing_header"`
+    /// `"global"` / `"per_credential"`
     pub scope: String,
 }
 

@@ -168,7 +168,7 @@ pub async fn get_cache_scope(State(state): State<AdminState>) -> impl IntoRespon
 }
 
 /// PUT /api/admin/config/cache-scope
-/// 设置缓存分桶策略（"global" / "per_credential" / "per_billing_header"）
+/// 设置缓存分桶策略（"global" / "per_credential"）
 pub async fn set_cache_scope(
     State(state): State<AdminState>,
     Json(payload): Json<crate::admin::types::SetCacheScopeRequest>,

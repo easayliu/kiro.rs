@@ -106,10 +106,8 @@ pub struct Config {
     pub global_cache: bool,
 
     /// 缓存分桶策略（覆盖 `global_cache`）。可选值：
-    /// - `"global"`：所有 credential 共享（等价于 `global_cache=true`）
-    /// - `"per_credential"`：按 Kiro credential 隔离（等价于 `global_cache=false`）
-    /// - `"per_billing_header"`：按 Claude Code 的 `x-anthropic-billing-header`
-    ///   分桶，同一用户跨 credential 共享，不同用户隔离
+    /// - `"global"`：按用户身份（metadata.user_id）分桶，同一用户跨 credential 共享
+    /// - `"per_credential"`：在用户身份基础上再按 credential 隔离
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_scope: Option<String>,
 

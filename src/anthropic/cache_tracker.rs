@@ -6,12 +6,12 @@
 //!
 //! 上游 Kiro API 不支持 prompt caching，本追踪器纯本地模拟。
 //! 两种分桶模式（运行时可切换，见 `CacheScope`）：
-//! - `Global`：按 `x-anthropic-billing-header` 分桶（同 billing 用户跨
-//!   credential 共享），无 billing_header 时退化为共享 bucket
-//! - `PerCredential`：在 billing 基础上再按 credential_id 细分，同一 billing
-//!   用户的不同凭据也互不共享
+//! - `Global`：按 `metadata.user_id`（device_id + account_uuid + session_id）
+//!   分桶，同一用户身份跨 credential 共享，无 metadata 时退化为共享 bucket
+//! - `PerCredential`：在用户身份基础上再按 credential_id 细分，同一用户的
+//!   不同凭据也互不共享
 //!
-//! 两种模式都天然按 billing 隔离，对齐 Anthropic 官方的 per-workspace 隔离。
+//! 两种模式都天然按用户身份隔离，对齐 Anthropic 官方的 per-workspace 隔离。
 //!
 //! 对齐 Anthropic 官方 prompt caching 行为：
 //! - 仅在显式 `cache_control` 标记处建立 breakpoint（不自动在 message 边界插入）
@@ -55,9 +55,9 @@ pub struct CacheProfile {
     min_cacheable_tokens: i32,
     blocks: Vec<CacheBlock>,
     breakpoints: Vec<CacheBreakpoint>,
-    /// 从 system 里提取的 `x-anthropic-billing-header` 的 hash，
-    /// 仅在 `CacheScope::PerBillingHeader` 模式下用作 bucket key。
-    billing_header_key: Option<u64>,
+    /// 从 metadata.user_id 提取的用户身份 hash（device_id + account_uuid + session_id），
+    /// 用作缓存分桶的 bucket key，对齐 Anthropic 官方 per-workspace 隔离。
+    identity_key: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,13 +85,13 @@ struct CacheEntry {
 /// 全局模式下使用的固定 credential_id
 const GLOBAL_CREDENTIAL_KEY: u64 = 0;
 
-/// 缓存分桶策略。两种模式都先按 billing_header 分桶，保证不同 billing
+/// 缓存分桶策略。两种模式都先按用户身份（metadata.user_id）分桶，保证不同
 /// 用户永远不共享 cache（对齐 Anthropic 官方 per-workspace 隔离）。
 ///
-/// - `Global`：bucket 仅由 billing_header 决定。同 billing 用户的所有
-///   credential 共享 cache；无 billing_header 时退化到共享 bucket（key=0）。
-/// - `PerCredential`：在 billing 基础上再按 credential_id 细分。同一 billing
-///   用户的不同凭据**互不共享** cache，适合想严格按凭据隔离的场景。
+/// - `Global`：bucket 仅由用户身份决定。同一用户的所有
+///   credential 共享 cache；无 metadata 时退化到共享 bucket（key=0）。
+/// - `PerCredential`：在用户身份基础上再按 credential_id 细分。同一用户
+///   的不同凭据**互不共享** cache，适合想严格按凭据隔离的场景。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheScope {
     Global,
@@ -193,15 +193,15 @@ impl CacheTracker {
     }
 
     fn effective_bucket_key(&self, credential_id: u64, profile: &CacheProfile) -> u64 {
-        // 所有模式都先按 billing_header 分桶；无 billing_header 时退化为
+        // 所有模式都先按用户身份分桶；无 identity 时退化为
         // 共享 key（Global）或按 credential 隔离（PerCredential）。
-        let billing_key = profile.billing_header_key.unwrap_or(GLOBAL_CREDENTIAL_KEY);
+        let identity_key = profile.identity_key.unwrap_or(GLOBAL_CREDENTIAL_KEY);
         match self.cache_scope() {
-            CacheScope::Global => billing_key,
+            CacheScope::Global => identity_key,
             CacheScope::PerCredential => {
-                // billing 作为 salt 与 credential_id 混合
+                // identity 作为 salt 与 credential_id 混合
                 let mut hasher = Sha256::new();
-                hasher.update(billing_key.to_be_bytes());
+                hasher.update(identity_key.to_be_bytes());
                 hasher.update(credential_id.to_be_bytes());
                 let hash: [u8; 32] = hasher.finalize().into();
                 u64::from_be_bytes([
@@ -301,14 +301,14 @@ impl CacheTracker {
             breakpoints.clear();
         }
 
-        let billing_header_key = extract_billing_header(payload).map(billing_header_to_key);
+        let identity_key = extract_identity_key(payload);
 
         CacheProfile {
             total_input_tokens: total_input_tokens.max(0),
             min_cacheable_tokens: minimum_cacheable_tokens_for_model(&payload.model),
             blocks,
             breakpoints,
-            billing_header_key,
+            identity_key,
         }
     }
 
@@ -751,31 +751,34 @@ fn compute_segment_extras_hash(payload: &MessagesRequest, segment: BlockSegment)
     Sha256::digest(&bytes).into()
 }
 
-/// 从 system 块里提取 Claude Code 注入的 `x-anthropic-billing-header` 值。
-/// 仅用于 `CacheScope::PerBillingHeader` 模式的 bucket key。
-fn extract_billing_header(payload: &MessagesRequest) -> Option<String> {
-    const PREFIX: &str = "x-anthropic-billing-header:";
-    let system = payload.system.as_ref()?;
-    for block in system {
-        for line in block.text.lines() {
-            let trimmed = line.trim_start();
-            if let Some(value) = trimmed.strip_prefix(PREFIX) {
-                let value = value.trim();
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
-            }
-        }
+/// 从 metadata.user_id 提取用户身份并压成 u64 bucket key。
+///
+/// user_id 支持两种格式：
+/// 1. JSON: `{"device_id":"...","account_uuid":"...","session_id":"..."}`
+/// 2. 字符串: `user_xxx_account__session_UUID`（fallback 整串 hash）
+///
+/// 用 device_id + account_uuid + session_id 拼接后 SHA256 取前 8 字节。
+/// 这三个字段在同一会话内稳定，不像 billing header 的 cch 每次请求都变。
+fn extract_identity_key(payload: &MessagesRequest) -> Option<u64> {
+    let user_id = payload.metadata.as_ref()?.user_id.as_ref()?;
+    let user_id = user_id.trim();
+    if user_id.is_empty() {
+        return None;
     }
-    None
-}
 
-/// 把 billing_header 字符串压成 u64 bucket key。SHA256 前 8 字节。
-fn billing_header_to_key(value: String) -> u64 {
-    let hash: [u8; 32] = Sha256::digest(value.as_bytes()).into();
-    u64::from_be_bytes([
+    let identity_str = if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
+        let device_id = json.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
+        let account_uuid = json.get("account_uuid").and_then(|v| v.as_str()).unwrap_or("");
+        let session_id = json.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        format!("{device_id}\x00{account_uuid}\x00{session_id}")
+    } else {
+        user_id.to_string()
+    };
+
+    let hash: [u8; 32] = Sha256::digest(identity_str.as_bytes()).into();
+    Some(u64::from_be_bytes([
         hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
-    ])
+    ]))
 }
 
 fn mix_fingerprint(content: &[u8; 32], extras: &[u8; 32]) -> [u8; 32] {
@@ -858,7 +861,7 @@ fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::types::{CacheControl, Message, MessagesRequest, SystemMessage};
+    use super::super::types::{CacheControl, Message, Metadata, MessagesRequest, SystemMessage};
     use serde_json::json;
 
     const LARGE_SYSTEM_CHARS: usize = 20_000; // 约 5k tokens（按 ~4 字符/token 估算，超过 sonnet-4.6 的 2048 门槛）
@@ -871,9 +874,18 @@ mod tests {
         CacheTracker::new(DEFAULT_CACHE_TTL, CacheScope::PerCredential, None)
     }
 
-    /// 构造一个带指定 billing_header 的 system 块。header 放在 system 第一个块的首行。
-    fn system_with_billing_header(billing: &str, body: &str) -> String {
-        format!("x-anthropic-billing-header: {billing}\n{body}")
+    /// 构造一个 JSON 格式的 metadata.user_id
+    fn make_metadata(device_id: &str, account_uuid: &str, session_id: &str) -> Option<Metadata> {
+        Some(Metadata {
+            user_id: Some(
+                serde_json::json!({
+                    "device_id": device_id,
+                    "account_uuid": account_uuid,
+                    "session_id": session_id,
+                })
+                .to_string(),
+            ),
+        })
     }
 
     fn large_text(prefix: &str, size: usize) -> String {
@@ -917,6 +929,14 @@ mod tests {
         system_text: &str,
         messages: Vec<Message>,
     ) -> MessagesRequest {
+        build_request_with_metadata(system_text, messages, None)
+    }
+
+    fn build_request_with_metadata(
+        system_text: &str,
+        messages: Vec<Message>,
+        metadata: Option<Metadata>,
+    ) -> MessagesRequest {
         MessagesRequest {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 1024,
@@ -931,7 +951,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: None,
-            metadata: None,
+            metadata,
         }
     }
 
@@ -1348,18 +1368,20 @@ mod tests {
         );
     }
 
-    /// Global 模式：同一 billing_header 的不同 credential 共享 cache。
+    /// Global 模式：同一用户身份的不同 credential 共享 cache。
     #[test]
-    fn global_scope_shares_by_billing_header_across_credentials() {
+    fn global_scope_shares_by_identity_across_credentials() {
         let tracker = tracker(); // Global
-        let sys = system_with_billing_header("user-42", &large_text("S ", LARGE_SYSTEM_CHARS));
-        let req = build_request(
+        let sys = large_text("S ", LARGE_SYSTEM_CHARS);
+        let meta = make_metadata("device-42", "acct-42", "sess-42");
+        let req = build_request_with_metadata(
             &sys,
             vec![user_message(vec![json!({
                 "type": "text",
                 "text": "hello",
                 "cache_control": ephemeral_5m(),
             })])],
+            meta,
         );
 
         let p1 = tracker.build_profile(&req, 10_000);
@@ -1370,49 +1392,51 @@ mod tests {
         let r2 = tracker.compute_and_update(99, &p2);
         assert_eq!(
             r2.cache_read_input_tokens, r1.cache_creation_input_tokens,
-            "同 billing_header 跨 credential 应共享 cache: {:?}",
+            "同一用户身份跨 credential 应共享 cache: {:?}",
             r2
         );
     }
 
-    /// Global 模式：不同 billing_header 自动隔离（不再全用户共享）。
+    /// Global 模式：不同用户身份自动隔离。
     #[test]
-    fn global_scope_isolates_different_billing_headers() {
+    fn global_scope_isolates_different_identities() {
         let tracker = tracker();
-        let body = large_text("S ", LARGE_SYSTEM_CHARS);
+        let sys = large_text("S ", LARGE_SYSTEM_CHARS);
         let user = vec![user_message(vec![json!({
             "type": "text",
             "text": "hello",
             "cache_control": ephemeral_5m(),
         })])];
 
-        let req_a = build_request(&system_with_billing_header("alice", &body), user.clone());
+        let req_a = build_request_with_metadata(&sys, user.clone(), make_metadata("dev-alice", "acct-a", "sess-a"));
         let p_a = tracker.build_profile(&req_a, 10_000);
         let r_a = tracker.compute_and_update(1, &p_a);
         assert!(r_a.cache_creation_input_tokens > 0);
 
-        let req_b = build_request(&system_with_billing_header("bob", &body), user);
+        let req_b = build_request_with_metadata(&sys, user, make_metadata("dev-bob", "acct-b", "sess-b"));
         let p_b = tracker.build_profile(&req_b, 10_000);
         let r_b = tracker.compute_and_update(1, &p_b);
         assert_eq!(
             r_b.cache_read_input_tokens, 0,
-            "不同 billing_header 应相互隔离: {:?}",
+            "不同用户身份应相互隔离: {:?}",
             r_b
         );
     }
 
-    /// PerCredential 模式：同 billing_header 的不同 credential 互不共享。
+    /// PerCredential 模式：同一用户身份的不同 credential 互不共享。
     #[test]
-    fn per_credential_scope_isolates_credentials_even_with_same_billing() {
+    fn per_credential_scope_isolates_credentials_even_with_same_identity() {
         let tracker = tracker_per_credential();
-        let sys = system_with_billing_header("same-user", &large_text("S ", LARGE_SYSTEM_CHARS));
-        let req = build_request(
+        let sys = large_text("S ", LARGE_SYSTEM_CHARS);
+        let meta = make_metadata("same-dev", "same-acct", "same-sess");
+        let req = build_request_with_metadata(
             &sys,
             vec![user_message(vec![json!({
                 "type": "text",
                 "text": "hello",
                 "cache_control": ephemeral_5m(),
             })])],
+            meta,
         );
 
         let p1 = tracker.build_profile(&req, 10_000);
@@ -1423,7 +1447,7 @@ mod tests {
         let r2 = tracker.compute_and_update(2, &p2);
         assert_eq!(
             r2.cache_read_input_tokens, 0,
-            "PerCredential 模式下即使同 billing 也按 credential 隔离: {:?}",
+            "PerCredential 模式下即使同一用户身份也按 credential 隔离: {:?}",
             r2
         );
     }
