@@ -8,7 +8,16 @@ RUN pnpm build
 
 FROM rust:1.92-alpine AS builder
 
-RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static
+# tokenizers 0.20 默认启用 onig/esaxx_fast，需要 C/C++ 工具链 + cmake
+RUN apk add --no-cache \
+    musl-dev \
+    openssl-dev \
+    openssl-libs-static \
+    build-base \
+    cmake \
+    pkgconfig \
+    perl \
+    git
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock* ./
