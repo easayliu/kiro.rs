@@ -1,6 +1,6 @@
 [package]
 name = "kiro-rs"
-version = "2026.3.19"
+version = "2026.3.20"
 edition = "2024"
 
 [profile.release]
@@ -32,5 +32,4 @@ parking_lot = "0.12"  # 高性能同步原语
 subtle = "2.6"        # 常量时间比较（防止时序攻击）
 rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断
-claude-tokenizer = "0.3"  # 内嵌 Claude v3 BPE（最接近官方的开源 tokenizer）
-tokenizers = "0.20"       # claude-tokenizer 依赖的底层 BPE 引擎
+tiktoken-rs = "0.11"  # 纯 Rust BPE（cl100k_base，对 Claude 英文/代码场景精度等同 claude-v3，无 C 依赖）
