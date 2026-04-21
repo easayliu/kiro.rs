@@ -632,7 +632,7 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.cache_usage.uncached_input_tokens,
+                    "input_tokens": self.cache_usage.uncached_input_tokens.max(1),
                     "output_tokens": 1,
                     "cache_creation_input_tokens": self.cache_usage.cache_creation_input_tokens,
                     "cache_read_input_tokens": self.cache_usage.cache_read_input_tokens,
@@ -1174,11 +1174,12 @@ impl StreamContext {
         // 把 cache usage 透传给 state_manager，让 message_delta 输出 cache_* 字段
         self.state_manager.set_final_usage(self.cache_usage);
 
-        // 生成最终事件（input_tokens 使用 uncached_input_tokens）
-        events.extend(
-            self.state_manager
-                .generate_final_events(self.cache_usage.uncached_input_tokens, self.output_tokens),
-        );
+        // 生成最终事件（input_tokens 使用 uncached_input_tokens，对齐 Anthropic
+        // 行为保底 1：即使 breakpoint 之后无新内容，官方也不会返回 0）
+        events.extend(self.state_manager.generate_final_events(
+            self.cache_usage.uncached_input_tokens.max(1),
+            self.output_tokens,
+        ));
         events
     }
 }

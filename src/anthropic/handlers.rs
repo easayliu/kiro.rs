@@ -663,7 +663,7 @@ async fn handle_non_stream_request(
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
-            "input_tokens": cache_context.uncached_input_tokens,
+            "input_tokens": cache_context.uncached_input_tokens.max(1),
             "output_tokens": output_tokens,
             "cache_creation_input_tokens": cache_context.cache_creation_input_tokens,
             "cache_read_input_tokens": cache_context.cache_read_input_tokens,
