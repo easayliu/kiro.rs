@@ -32,6 +32,8 @@ const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
 const ONE_HOUR_CACHE_TTL: Duration = Duration::from_secs(3600);
 const MAX_BREAKPOINTS: usize = 4;
 const MAX_ENTRIES: usize = 100_000;
+/// Anthropic 官方：命中查找从 breakpoint 往前最多扫 20 个 block（含自身）。
+const PREFIX_LOOKBACK_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CacheResult {
@@ -188,6 +190,26 @@ impl CacheTracker {
             breakpoints = breakpoints.split_off(start);
         }
 
+        // Anthropic 要求 1h breakpoint 必须排在所有 5m breakpoint 之前，
+        // 违反时 API 返回 400；本地退化为无缓存以贴近真实失败路径。
+        let mut seen_5m = false;
+        let mut ttl_violation = false;
+        for bp in &breakpoints {
+            if bp.ttl == ONE_HOUR_CACHE_TTL && seen_5m {
+                ttl_violation = true;
+                break;
+            }
+            if bp.ttl == DEFAULT_CACHE_TTL {
+                seen_5m = true;
+            }
+        }
+        if ttl_violation {
+            tracing::warn!(
+                "cache_control TTL 顺序非法：1h breakpoint 出现在 5m 之后，Anthropic 会返回 400，本地按无缓存处理"
+            );
+            breakpoints.clear();
+        }
+
         CacheProfile {
             total_input_tokens: total_input_tokens.max(0),
             min_cacheable_tokens: minimum_cacheable_tokens_for_model(&payload.model),
@@ -250,11 +272,17 @@ impl CacheTracker {
                 "查找缓存匹配"
             );
 
-            // 对齐 Anthropic：扫描从 last_breakpoint 向前的所有 block，
-            // 取最长的匹配 prefix（实际 cache 表内只有 breakpoint 位置的 entry，
-            // 所以非 breakpoint 位置的 fingerprint 不会误命中）。
+            // 对齐 Anthropic：从 last_breakpoint 向前最多扫 20 个 block，
+            // 取最长的匹配 prefix。cache 表内只有 breakpoint 位置的 entry，
+            // 非 breakpoint 位置的 fingerprint 不会误命中。
             let last_index = last_breakpoint.block_index;
+            let mut scanned = 0usize;
             for idx in (0..=last_index).rev() {
+                if scanned >= PREFIX_LOOKBACK_LIMIT {
+                    break;
+                }
+                scanned += 1;
+
                 let block = &profile.blocks[idx];
                 if let Some(entry) = bucket.get_mut(&block.prefix_fingerprint) {
                     if entry.expires_at <= now {
@@ -355,26 +383,32 @@ fn clamp_skip_rate(rate: f32) -> f32 {
     }
 }
 
+/// 按每个 cacheable breakpoint 的 TTL 分段累加 cache_creation。
+/// 每个 breakpoint 覆盖 [prev_cum, cum] 区间，已命中的 [0, matched] 部分扣除。
 fn compute_ttl_breakdown(profile: &CacheProfile, matched_tokens: i32) -> (i32, i32) {
-    let Some(last_breakpoint) = profile.last_cacheable_breakpoint() else {
-        return (0, 0);
-    };
+    let total_limit = profile.total_input_tokens;
+    let mut five_min = 0i32;
+    let mut one_hour = 0i32;
+    let mut prev_cum = 0i32;
 
-    let new_tokens = last_breakpoint
-        .cumulative_tokens
-        .min(profile.total_input_tokens)
-        .saturating_sub(matched_tokens)
-        .max(0);
-
-    if new_tokens == 0 {
-        return (0, 0);
+    for bp in profile.cacheable_breakpoints() {
+        let cum = bp.cumulative_tokens.min(total_limit);
+        if cum <= prev_cum {
+            continue;
+        }
+        let segment_start = prev_cum.max(matched_tokens);
+        let new_tokens = cum.saturating_sub(segment_start).max(0);
+        if new_tokens > 0 {
+            if bp.ttl == ONE_HOUR_CACHE_TTL {
+                one_hour = one_hour.saturating_add(new_tokens);
+            } else {
+                five_min = five_min.saturating_add(new_tokens);
+            }
+        }
+        prev_cum = cum;
     }
 
-    if last_breakpoint.ttl == ONE_HOUR_CACHE_TTL {
-        (0, new_tokens)
-    } else {
-        (new_tokens, 0)
-    }
+    (five_min, one_hour)
 }
 
 impl CacheProfile {
@@ -526,6 +560,19 @@ fn extract_cache_ttl(value: &serde_json::Value) -> Option<Duration> {
         return None;
     }
 
+    // Anthropic 不允许 thinking / 空 text block 被 cache_control 标记。
+    if let Some(block_type) = value.get("type").and_then(|v| v.as_str()) {
+        if block_type == "thinking" || block_type == "redacted_thinking" {
+            return None;
+        }
+        if block_type == "text" {
+            let text = value.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if text.is_empty() {
+                return None;
+            }
+        }
+    }
+
     Some(match cache_control.ttl.as_deref() {
         Some("1h") => ONE_HOUR_CACHE_TTL,
         _ => DEFAULT_CACHE_TTL,
@@ -549,17 +596,18 @@ fn strip_cache_control(value: &mut serde_json::Value) {
     }
 }
 
-/// 本地模拟使用的最小可缓存 tokens。
-/// opus-4.7 / mythos 官方是 4096，这里特意归到 1024 档：
-/// 阈值决定 breakpoint 是否写入 checkpoint 表，小 breakpoint 作为
-/// 前缀降级匹配锚点能显著提升跨请求命中率（见 compute_and_update）。
+/// 对齐 Anthropic 官方 prompt caching 最小可缓存 tokens。
+/// 参考: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
 fn minimum_cacheable_tokens_for_model(model: &str) -> i32 {
     let m = model.to_lowercase();
 
-    if m.contains("opus-4-5")
+    if m.contains("mythos")
+        || m.contains("opus-4-5")
         || m.contains("opus-4.5")
         || m.contains("opus-4-6")
         || m.contains("opus-4.6")
+        || m.contains("opus-4-7")
+        || m.contains("opus-4.7")
         || m.contains("haiku-4-5")
         || m.contains("haiku-4.5")
         || m.contains("haiku_4_5")
@@ -579,7 +627,7 @@ fn minimum_cacheable_tokens_for_model(model: &str) -> i32 {
         return 2048;
     }
 
-    if m.contains("opus") || m.contains("sonnet") || m.contains("mythos") {
+    if m.contains("opus") || m.contains("sonnet") {
         return 1024;
     }
 
@@ -647,6 +695,13 @@ mod tests {
         CacheControl {
             cache_type: "ephemeral".to_string(),
             ttl: None,
+        }
+    }
+
+    fn ephemeral_1h() -> CacheControl {
+        CacheControl {
+            cache_type: "ephemeral".to_string(),
+            ttl: Some("1h".to_string()),
         }
     }
 
@@ -815,6 +870,121 @@ mod tests {
             "全局模式下 credential 2 应能命中 credential 1 建立的缓存"
         );
         assert_eq!(r2.cache_creation_input_tokens, 0);
+    }
+
+    /// 混合 TTL：每个 breakpoint 按自己的 TTL 单独计 cache_creation。
+    #[test]
+    fn mixed_ttl_breakpoints_segmented_into_own_buckets() {
+        let tracker = CacheTracker::new(ONE_HOUR_CACHE_TTL, true, None);
+        let system = large_text("S ", LARGE_SYSTEM_CHARS);
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: system,
+                block_type: Some("text".to_string()),
+                cache_control: Some(ephemeral_1h()),
+            }]),
+            messages: vec![
+                user_message(vec![json!({
+                    "type": "text",
+                    "text": large_text("U1 ", 12_000),
+                    "cache_control": ephemeral_5m(),
+                })]),
+                assistant_text("reply"),
+                user_message(vec![json!({
+                    "type": "text",
+                    "text": large_text("U2 ", 12_000),
+                    "cache_control": ephemeral_5m(),
+                })]),
+            ],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let profile = tracker.build_profile(&req, 20_000);
+        let r = tracker.compute_and_update(1, &profile);
+
+        assert!(
+            r.cache_creation_1h_input_tokens > 0,
+            "system 1h breakpoint 应贡献 1h 桶，got={:?}",
+            r
+        );
+        assert!(
+            r.cache_creation_5m_input_tokens > 0,
+            "user 5m breakpoints 应贡献 5m 桶，got={:?}",
+            r
+        );
+        assert_eq!(
+            r.cache_creation_5m_input_tokens + r.cache_creation_1h_input_tokens,
+            r.cache_creation_input_tokens,
+            "5m + 1h 之和应等于总 cache_creation，got={:?}",
+            r
+        );
+    }
+
+    /// TTL 顺序违规（1h 出现在 5m 之后）：Anthropic 会返回 400，
+    /// 本地退化为无缓存。
+    #[test]
+    fn invalid_ttl_ordering_falls_back_to_uncached() {
+        let tracker = CacheTracker::new(ONE_HOUR_CACHE_TTL, true, None);
+        let system = large_text("S ", LARGE_SYSTEM_CHARS);
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 1024,
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: system,
+                block_type: Some("text".to_string()),
+                cache_control: Some(ephemeral_5m()),
+            }]),
+            messages: vec![user_message(vec![json!({
+                "type": "text",
+                "text": large_text("U ", 12_000),
+                "cache_control": ephemeral_1h(),
+            })])],
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let profile = tracker.build_profile(&req, 15_000);
+        let r = tracker.compute_and_update(1, &profile);
+        assert_eq!(r.cache_read_input_tokens, 0);
+        assert_eq!(r.cache_creation_input_tokens, 0);
+        assert_eq!(r.uncached_input_tokens, 15_000);
+    }
+
+    /// thinking 块上的 cache_control 应被忽略（Anthropic 不允许）。
+    #[test]
+    fn cache_control_on_thinking_block_ignored() {
+        let tracker = tracker();
+        let system = large_text("S ", LARGE_SYSTEM_CHARS);
+        let req = build_request(
+            &system,
+            vec![user_message(vec![json!({
+                "type": "thinking",
+                "thinking": "internal reasoning",
+                "cache_control": ephemeral_5m(),
+            })])],
+        );
+
+        let profile = tracker.build_profile(&req, 10_000);
+        let r = tracker.compute_and_update(1, &profile);
+        assert_eq!(r.cache_read_input_tokens, 0);
+        assert_eq!(r.cache_creation_input_tokens, 0);
+        assert_eq!(
+            r.uncached_input_tokens, 10_000,
+            "thinking 块的 cache_control 无效，整段应为未缓存"
+        );
     }
 
     /// 按凭据隔离模式：不同 credential 互不影响。
