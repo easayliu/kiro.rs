@@ -1,14 +1,13 @@
 //! Token 计算模块
 //!
-//! 使用 `tiktoken-rs` 的 `cl100k_base` BPE（OpenAI GPT-4 同款，纯 Rust 实现）
-//! 作为 Claude tokenizer 的近似。实测对英文/代码/JSON 场景，cl100k_base 和
-//! Anthropic 内嵌的 claude-v3-tokenizer 给出完全相同的 token 数（0% 差异）；
-//! 中文场景 cl100k_base 偏高 10-16%。需要 100% 精确值请配置
-//! `count_tokens_api_url` 走远程 `/v1/messages/count_tokens`。
+//! 采用字符启发式算法：非西文字符每个计 4.5 字符单位、西文字符每个计 1 单位，
+//! 除以 4 得基础 tokens 后按长度分段放大系数。优点是纯计算、0 依赖、完全
+//! 确定性、跨版本/环境/语言实现一致 —— 同一段文本无论何时何地结果恒定，
+//! 便于客户端通过稳定倍率做对账校正。
 //!
-//! 选 tiktoken-rs 而非 claude-tokenizer，是因为后者的 `tokenizers` 依赖
-//! 需要 C/C++ 工具链（onig/esaxx_fast），在 alpine 等轻量容器里构建成本
-//! 显著，而 tiktoken-rs 是纯 Rust，零额外系统依赖。
+//! 代价：相对 Claude 真实分词，绝对值会系统性偏高（中文尤甚），**不是精度
+//! 工具**。需要 100% 精确值请配置 `count_tokens_api_url` 走远程
+//! `/v1/messages/count_tokens`，本地计算仅作为回退。
 
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
@@ -16,7 +15,6 @@ use crate::anthropic::types::{
 use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
 use std::sync::OnceLock;
-use tiktoken_rs::cl100k_base_singleton;
 
 /// Count Tokens API 配置
 #[derive(Clone, Default)]
@@ -48,13 +46,56 @@ fn get_config() -> Option<&'static CountTokensConfig> {
     COUNT_TOKENS_CONFIG.get()
 }
 
-/// 计算文本的 token 数量（cl100k_base BPE）。空串返回 0。
-/// `cl100k_base_singleton` 内部已缓存实例，无需额外 OnceLock。
+/// 计算文本的 token 数量（字符启发式）。空串返回 0。
+///
+/// 非西文字符 × 4.5、西文字符 × 1，除以 4 得基础 tokens，
+/// 再按下列分段乘放大系数（短文本放得更多，长文本回归 1.0）：
+/// - `< 100` → ×1.5
+/// - `< 200` → ×1.3
+/// - `< 300` → ×1.25
+/// - `< 800` → ×1.2
+/// - `≥ 800` → ×1.0
 pub fn count_tokens(text: &str) -> u64 {
     if text.is_empty() {
         return 0;
     }
-    cl100k_base_singleton().encode_with_special_tokens(text).len() as u64
+
+    let char_units: f64 = text
+        .chars()
+        .map(|c| if is_non_western_char(c) { 4.5 } else { 1.0 })
+        .sum();
+    let tokens = char_units / 4.0;
+
+    let scaled = if tokens < 100.0 {
+        tokens * 1.5
+    } else if tokens < 200.0 {
+        tokens * 1.3
+    } else if tokens < 300.0 {
+        tokens * 1.25
+    } else if tokens < 800.0 {
+        tokens * 1.2
+    } else {
+        tokens
+    };
+
+    scaled as u64
+}
+
+/// 判断字符是否为非西文字符。
+///
+/// 西文范围覆盖基本 ASCII、拉丁扩展 A/B、Latin Extended Additional，
+/// 以及几块拉丁变体（C/D/E）。其余一律视为非西文（中日韩、阿拉伯、
+/// 符号等），按更高系数计 token。
+fn is_non_western_char(c: char) -> bool {
+    !matches!(
+        c,
+        '\u{0000}'..='\u{00FF}'
+            | '\u{0100}'..='\u{024F}'
+            | '\u{1E00}'..='\u{1EFF}'
+            | '\u{2C60}'..='\u{2C7F}'
+            | '\u{A720}'..='\u{A7FF}'
+            | '\u{AB30}'..='\u{AB6F}'
+    )
 }
 
 /// 估算请求的输入 tokens
@@ -138,13 +179,11 @@ async fn call_remote_count_tokens(
     Ok(result.input_tokens as u64)
 }
 
-/// 每条 message 的结构开销（role token、分隔符等），模拟 Anthropic 内部 overhead
-const TOKENS_PER_MESSAGE_OVERHEAD: u64 = 4;
-
 /// 本地计算请求的输入 tokens
 ///
-/// 使用与 cache_tracker 相同的 block 级函数计算内容 tokens，
-/// 再加上消息结构 overhead 来模拟 Anthropic 的总量计算。
+/// 只累加 block 级内容 tokens，不额外加 per-message overhead —— 为保持
+/// 确定性和与上游算法一致，任何恒定附加项都会被客户端的对账倍率吸收，
+/// 所以这里不做加法，改由 calibration 系数统一消化。
 fn count_all_tokens_local(
     system: Option<Vec<SystemMessage>>,
     messages: Vec<Message>,
@@ -166,7 +205,6 @@ fn count_all_tokens_local(
 
     for msg in &messages {
         total += count_message_content_tokens(&msg.content);
-        total += TOKENS_PER_MESSAGE_OVERHEAD;
     }
 
     total.max(1)
@@ -240,18 +278,27 @@ mod tests {
 
     #[test]
     fn count_tokens_english_sanity() {
-        // "Hello, world!" 在 Claude v3 BPE 下通常是 4 tokens 左右（≤ 6 可接受）
+        // "Hello, world!" 13 西文字符 → 13/4=3.25 → ×1.5 ≈ 4，区间 [3,6] 防护
         let n = count_tokens("Hello, world!");
         assert!((3..=6).contains(&n), "got {n}");
     }
 
     #[test]
     fn count_tokens_chinese_sanity() {
-        // 43 中文字符用 Claude v3 tokenizer 是 27 tokens（实测）。
-        // 给个宽松区间 [20, 40] 作为回归防护。
+        // 字符启发式：非西文 ×4.5、西文 ×1，/4 后按段放大。
+        // 该文本主体为中文（非西文），结果稳定落在约 50-80 区间。
         let text = "你好世界，这是一个测试。一个很长的测试文本，用来对比不同 tokenizer 的差异。";
         let n = count_tokens(text);
-        assert!((20..=40).contains(&n), "got {n}");
+        assert!((50..=80).contains(&n), "got {n}");
+    }
+
+    /// 回归防护：西文字符按 1 单位、非西文按 4.5 单位分别计入。
+    #[test]
+    fn count_tokens_char_classification() {
+        // 纯西文 8 字符 → 8/4=2 → ×1.5 = 3
+        assert_eq!(count_tokens("abcdefgh"), 3);
+        // 纯非西文 4 字符 → 4*4.5/4=4.5 → ×1.5 = 6
+        assert_eq!(count_tokens("你好世界"), 6);
     }
 
     /// 回归防护：tokenizer 成功初始化，连续两次调用返回相同结果（单例）。
