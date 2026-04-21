@@ -173,7 +173,7 @@ fn count_all_tokens_local(
 
     if let Some(ref system) = system {
         for msg in system {
-            total += count_system_message_tokens(msg);
+            total += count_system_message_tokens_stripped(msg);
         }
     }
 
@@ -208,6 +208,21 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
 /// 计算系统消息的 tokens
 pub(crate) fn count_system_message_tokens(message: &SystemMessage) -> u64 {
     count_tokens(&message.text)
+}
+
+/// 计算系统消息的 tokens（剥离 billing header 行）。
+///
+/// 与 cache_tracker 的 `strip_billing_header_line` 对齐：billing header 的
+/// cch 字段每次请求都变，cache_tracker 在计算 block token 时已将其剥离，
+/// total_input_tokens 也需要同样剥离，否则 uncached 会虚高。
+fn count_system_message_tokens_stripped(message: &SystemMessage) -> u64 {
+    let filtered: String = message
+        .text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("x-anthropic-billing-header:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    count_tokens(&filtered)
 }
 
 /// 计算工具定义的 tokens
