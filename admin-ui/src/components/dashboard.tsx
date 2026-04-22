@@ -1,9 +1,9 @@
-import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { useState, useEffect, useRef, type ReactNode } from 'react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, MoreHorizontal, Database, ShieldCheck, AlertTriangle, Ban, Clock, Zap } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
@@ -23,9 +23,37 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
-import { extractErrorMessage } from '@/lib/utils'
+import { cn, extractErrorMessage, formatLastUsed } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
+
+interface StatBoxProps {
+  icon: ReactNode
+  label: string
+  value: number
+  accent?: string
+}
+
+function StatBox({ icon, label, value, accent }: StatBoxProps) {
+  return (
+    <div className="flex items-center gap-3 rounded-md border bg-muted/30 px-3 py-2.5">
+      <div className={cn('flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-background text-muted-foreground', accent)}>
+        {icon}
+      </div>
+      <div className="min-w-0">
+        <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{label}</div>
+        <div className={cn('text-lg font-semibold leading-tight tabular-nums', accent)}>{value}</div>
+      </div>
+    </div>
+  )
+}
 
 interface DashboardProps {
   onLogout: () => void
@@ -42,7 +70,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
-  const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(new Map())
+  const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(() => storage.loadBalanceCache())
   const [loadingBalanceIds, setLoadingBalanceIds] = useState<Set<number>>(new Set())
   const [queryingInfo, setQueryingInfo] = useState(false)
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
@@ -77,6 +105,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const endIndex = startIndex + itemsPerPage
   const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
   const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
+  const faultyCredentialCount = data?.credentials.filter(
+    c => !c.disabled && (c.failureCount > 0 || c.refreshFailureCount > 0),
+  ).length || 0
+  const totalCount = data?.total || 0
+  const availableCount = data?.available || 0
+  const activeCredential = data?.currentId
+    ? data.credentials.find(c => c.id === data.currentId)
+    : undefined
+  const activeBalance = data?.currentId ? balanceMap.get(data.currentId) : undefined
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
     const credential = data?.credentials.find(c => c.id === id)
     return Boolean(credential?.disabled)
@@ -86,6 +123,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
   useEffect(() => {
     setCurrentPage(1)
   }, [data?.credentials.length])
+
+  // balance 缓存变化时同步到 localStorage（刷新页面后仍可见）
+  useEffect(() => {
+    storage.saveBalanceCache(balanceMap)
+  }, [balanceMap])
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -138,6 +180,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   const handleLogout = () => {
     storage.removeApiKey()
+    storage.clearBalanceCache()
     queryClient.clear()
     onLogout()
   }
@@ -607,59 +650,31 @@ export function Dashboard({ onLogout }: DashboardProps) {
   return (
     <div className="min-h-screen bg-background">
       {/* 顶部导航 */}
-      <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-        <div className="container flex h-14 items-center justify-between px-4 md:px-8">
+      <header
+        className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60"
+        style={{ paddingTop: 'env(safe-area-inset-top)' }}
+      >
+        <div
+          className="container mx-auto flex h-14 items-center justify-between px-4 md:px-8"
+          style={{ paddingLeft: 'max(1rem, env(safe-area-inset-left))', paddingRight: 'max(1rem, env(safe-area-inset-right))' }}
+        >
           <div className="flex items-center gap-2">
-            <Server className="h-5 w-5" />
-            <span className="font-semibold">Kiro Admin</span>
+            <div className="flex h-8 w-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
+              <Server className="h-4 w-4" />
+            </div>
+            <div className="flex flex-col leading-tight">
+              <span className="text-sm font-semibold">Kiro Admin</span>
+              <span className="hidden text-[11px] text-muted-foreground sm:inline">凭据与缓存治理</span>
+            </div>
           </div>
-          <div className="flex items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleCycleCacheScope}
-              disabled={isLoadingCacheScope || isSettingCacheScope}
-              title={cacheScopeTitle(cacheScopeData?.scope)}
-            >
-              {isLoadingCacheScope ? '加载中...' : cacheScopeLabel(cacheScopeData?.scope)}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleOpenCacheSkipRateDialog}
-              disabled={isLoadingCacheSkipRate || isSettingCacheSkipRate}
-              title={
-                cacheSkipRateData?.rate == null
-                  ? '未启用缓存跳过 · 点击设置跳过概率（0.0-1.0），按概率跳过 cache 查找以降低观察到的命中率'
-                  : `当前跳过率：${(cacheSkipRateData.rate * 100).toFixed(0)}% · 点击修改或关闭`
-              }
-            >
-              {isLoadingCacheSkipRate
-                ? '加载中...'
-                : cacheSkipRateData?.rate == null
-                  ? '跳过率：关闭'
-                  : `跳过率：${(cacheSkipRateData.rate * 100).toFixed(0)}%`}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleToggleLoadBalancing}
-              disabled={isLoadingMode || isSettingMode}
-              title={
-                loadBalancingData?.mode === 'balanced'
-                  ? '当前：均衡负载（LRU，选择最久未使用的凭据）· 点击切换到优先级模式'
-                  : '当前：优先级模式（固定使用优先级最高的凭据）· 点击切换到均衡负载'
-              }
-            >
-              {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
-            </Button>
-            <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
+          <div className="flex items-center gap-1">
+            <Button variant="ghost" size="icon" onClick={toggleDarkMode} title={darkMode ? '切换到浅色' : '切换到深色'}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleRefresh}>
+            <Button variant="ghost" size="icon" onClick={handleRefresh} title="刷新凭据列表">
               <RefreshCw className="h-5 w-5" />
             </Button>
-            <Button variant="ghost" size="icon" onClick={handleLogout}>
+            <Button variant="ghost" size="icon" onClick={handleLogout} title="退出登录">
               <LogOut className="h-5 w-5" />
             </Button>
           </div>
@@ -667,138 +682,307 @@ export function Dashboard({ onLogout }: DashboardProps) {
       </header>
 
       {/* 主内容 */}
-      <main className="container mx-auto px-4 md:px-8 py-6">
-        {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-3 mb-6">
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                凭据总数
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{data?.total || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                可用凭据
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-green-600">{data?.available || 0}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
-                当前活跃
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold flex items-center gap-2">
-                #{data?.currentId || '-'}
-                <Badge variant="success">活跃</Badge>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-
-        {/* 凭据列表 */}
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <h2 className="text-xl font-semibold">凭据管理</h2>
-              {selectedIds.size > 0 && (
-                <div className="flex items-center gap-2">
-                  <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
-                  <Button onClick={deselectAll} size="sm" variant="ghost">
-                    取消选择
-                  </Button>
+      <main
+        className="container mx-auto px-4 md:px-8 py-6 space-y-6"
+        style={{
+          paddingLeft: 'max(1rem, env(safe-area-inset-left))',
+          paddingRight: 'max(1rem, env(safe-area-inset-right))',
+          paddingBottom: 'max(1.5rem, env(safe-area-inset-bottom))',
+        }}
+      >
+        {/* 系统策略面板 */}
+        <Card>
+          <CardContent className="grid gap-4 p-4 md:grid-cols-3">
+            <div className="flex items-center justify-between gap-3 md:border-r md:pr-4">
+              <div className="min-w-0">
+                <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">缓存分桶</div>
+                <div className="mt-0.5 truncate text-xs text-muted-foreground/80">
+                  {cacheScopeData?.scope === 'per_credential' ? '按用户 + 凭据双层' : '按用户身份共享'}
                 </div>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 shrink-0"
+                onClick={handleCycleCacheScope}
+                disabled={isLoadingCacheScope || isSettingCacheScope}
+                title={cacheScopeTitle(cacheScopeData?.scope)}
+              >
+                {isLoadingCacheScope ? '加载中...' : cacheScopeLabel(cacheScopeData?.scope)}
+              </Button>
+            </div>
+            <div className="flex items-center justify-between gap-3 md:border-r md:pr-4">
+              <div className="min-w-0">
+                <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">缓存跳过率</div>
+                <div className="mt-0.5 truncate text-xs text-muted-foreground/80">
+                  {cacheSkipRateData?.rate == null ? '按自然 breakpoint 计算' : '按概率跳过 cache 查找'}
+                </div>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 shrink-0 tabular-nums"
+                onClick={handleOpenCacheSkipRateDialog}
+                disabled={isLoadingCacheSkipRate || isSettingCacheSkipRate}
+                title={
+                  cacheSkipRateData?.rate == null
+                    ? '未启用缓存跳过 · 点击设置跳过概率（0.0-1.0）'
+                    : `当前跳过率：${(cacheSkipRateData.rate * 100).toFixed(0)}% · 点击修改或关闭`
+                }
+              >
+                {isLoadingCacheSkipRate
+                  ? '加载中...'
+                  : cacheSkipRateData?.rate == null
+                    ? '关闭'
+                    : `${(cacheSkipRateData.rate * 100).toFixed(0)}%`}
+              </Button>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">负载均衡</div>
+                <div className="mt-0.5 truncate text-xs text-muted-foreground/80">
+                  {loadBalancingData?.mode === 'balanced' ? 'LRU，最久未使用优先' : '固定最高优先级'}
+                </div>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 shrink-0"
+                onClick={handleToggleLoadBalancing}
+                disabled={isLoadingMode || isSettingMode}
+                title={
+                  loadBalancingData?.mode === 'balanced'
+                    ? '当前：均衡负载（LRU）· 点击切换到优先级模式'
+                    : '当前：优先级模式 · 点击切换到均衡负载'
+                }
+              >
+                {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* 状态栏 */}
+        <Card>
+          <CardContent className="flex flex-col gap-4 p-4">
+            {/* 4 指标 */}
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <StatBox
+                icon={<Database className="h-4 w-4" />}
+                label="凭据总数"
+                value={totalCount}
+              />
+              <StatBox
+                icon={<ShieldCheck className="h-4 w-4" />}
+                label="可用"
+                value={availableCount}
+                accent={availableCount > 0 ? 'text-emerald-600 dark:text-emerald-500' : ''}
+              />
+              <StatBox
+                icon={<AlertTriangle className="h-4 w-4" />}
+                label="异常"
+                value={faultyCredentialCount}
+                accent={faultyCredentialCount > 0 ? 'text-amber-600 dark:text-amber-500' : 'text-muted-foreground/70'}
+              />
+              <StatBox
+                icon={<Ban className="h-4 w-4" />}
+                label="已禁用"
+                value={disabledCredentialCount}
+                accent={disabledCredentialCount > 0 ? 'text-red-500' : 'text-muted-foreground/70'}
+              />
+            </div>
+
+            {/* 当前活跃 */}
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 border-t pt-3">
+              <div className="flex items-center gap-2">
+                <Zap className="h-3.5 w-3.5 text-emerald-500" aria-hidden />
+                <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">当前活跃</span>
+              </div>
+              {data?.currentId ? (
+                <>
+                  <Badge variant="success" className="h-5 px-1.5 font-mono text-[10px] tabular-nums">
+                    #{data.currentId}
+                  </Badge>
+                  <span
+                    className="min-w-0 flex-1 truncate text-sm font-medium"
+                    title={activeCredential?.email || undefined}
+                  >
+                    {activeCredential?.email || `凭据 #${data.currentId}`}
+                  </span>
+                  <div className="ml-auto flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                    {activeBalance?.subscriptionTitle && (
+                      <span className="inline-flex items-center gap-1">
+                        <span className="h-1.5 w-1.5 rounded-full bg-primary/60" aria-hidden />
+                        {activeBalance.subscriptionTitle}
+                      </span>
+                    )}
+                    <span className="inline-flex items-center gap-1 tabular-nums">
+                      <Clock className="h-3 w-3" />
+                      {formatLastUsed(activeCredential?.lastUsedAt)}
+                    </span>
+                  </div>
+                </>
+              ) : (
+                <span className="text-sm text-muted-foreground">暂无活跃凭据</span>
               )}
             </div>
-            <div className="flex gap-2">
-              {selectedIds.size > 0 && (
-                <>
-                  <Button onClick={handleBatchVerify} size="sm" variant="outline">
-                    <CheckCircle2 className="h-4 w-4 mr-2" />
-                    批量验活
-                  </Button>
-                  <Button
-                    onClick={handleBatchForceRefresh}
-                    size="sm"
-                    variant="outline"
-                    disabled={batchRefreshing}
-                  >
-                    <RefreshCw className={`h-4 w-4 mr-2 ${batchRefreshing ? 'animate-spin' : ''}`} />
-                    {batchRefreshing ? `刷新中... ${batchRefreshProgress.current}/${batchRefreshProgress.total}` : '批量刷新 Token'}
-                  </Button>
-                  <Button onClick={handleBatchResetFailure} size="sm" variant="outline">
-                    <RotateCcw className="h-4 w-4 mr-2" />
-                    恢复异常
-                  </Button>
-                  <Button
-                    onClick={handleBatchDelete}
-                    size="sm"
-                    variant="destructive"
-                    disabled={selectedDisabledCount === 0}
-                    title={selectedDisabledCount === 0 ? '只能删除已禁用凭据' : undefined}
-                  >
-                    <Trash2 className="h-4 w-4 mr-2" />
-                    批量删除
-                  </Button>
-                </>
-              )}
+          </CardContent>
+        </Card>
+
+        {/* 凭据列表 */}
+        <section className="space-y-4">
+          {/* 标题行：标题 + 次要工具 + 主要入口 */}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <h2 className="text-xl font-semibold tracking-tight">凭据管理</h2>
+              <Badge variant="secondary" className="font-normal">
+                共 {data?.credentials.length || 0} 个
+              </Badge>
               {verifying && !verifyDialogOpen && (
                 <Button onClick={() => setVerifyDialogOpen(true)} size="sm" variant="secondary">
                   <CheckCircle2 className="h-4 w-4 mr-2 animate-spin" />
-                  验活中... {verifyProgress.current}/{verifyProgress.total}
+                  验活中 {verifyProgress.current}/{verifyProgress.total}
                 </Button>
               )}
-              {data?.credentials && data.credentials.length > 0 && (
-                <Button
-                  onClick={handleQueryCurrentPageInfo}
-                  size="sm"
-                  variant="outline"
-                  disabled={queryingInfo}
-                >
-                  <RefreshCw className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
-                  {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询信息'}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {/* md+ 平铺次要动作 */}
+              <div className="hidden items-center gap-2 md:flex">
+                {data?.credentials && data.credentials.length > 0 && (
+                  <>
+                    <Button
+                      onClick={handleQueryCurrentPageInfo}
+                      size="sm"
+                      variant="ghost"
+                      disabled={queryingInfo}
+                    >
+                      <RefreshCw className={`h-4 w-4 mr-2 ${queryingInfo ? 'animate-spin' : ''}`} />
+                      {queryingInfo ? `查询中 ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询信息'}
+                    </Button>
+                    <Button
+                      onClick={handleClearAll}
+                      size="sm"
+                      variant="ghost"
+                      className="text-destructive hover:text-destructive"
+                      disabled={disabledCredentialCount === 0}
+                      title={disabledCredentialCount === 0 ? '没有可清除的已禁用凭据' : undefined}
+                    >
+                      <Trash2 className="h-4 w-4 mr-2" />
+                      清除已禁用
+                    </Button>
+                    <div className="mx-1 h-6 w-px bg-border" aria-hidden />
+                  </>
+                )}
+                <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">
+                  <FileUp className="h-4 w-4 mr-2" />
+                  KAM 导入
                 </Button>
-              )}
-              {data?.credentials && data.credentials.length > 0 && (
-                <Button
-                  onClick={handleClearAll}
-                  size="sm"
-                  variant="outline"
-                  className="text-destructive hover:text-destructive"
-                  disabled={disabledCredentialCount === 0}
-                  title={disabledCredentialCount === 0 ? '没有可清除的已禁用凭据' : undefined}
-                >
-                  <Trash2 className="h-4 w-4 mr-2" />
-                  清除已禁用
+                <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">
+                  <Upload className="h-4 w-4 mr-2" />
+                  批量导入
                 </Button>
-              )}
-              <Button onClick={() => setKamImportDialogOpen(true)} size="sm" variant="outline">
-                <FileUp className="h-4 w-4 mr-2" />
-                Kiro Account Manager 导入
-              </Button>
-              <Button onClick={() => setBatchImportDialogOpen(true)} size="sm" variant="outline">
-                <Upload className="h-4 w-4 mr-2" />
-                批量导入
-              </Button>
+              </div>
+
+              {/* md 以下折叠到 dropdown */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button size="sm" variant="outline" className="md:hidden" title="更多操作">
+                    <MoreHorizontal className="h-4 w-4" />
+                    <span className="sr-only">更多操作</span>
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-52">
+                  {data?.credentials && data.credentials.length > 0 && (
+                    <>
+                      <DropdownMenuItem
+                        onClick={handleQueryCurrentPageInfo}
+                        disabled={queryingInfo}
+                      >
+                        <RefreshCw className={queryingInfo ? 'animate-spin' : ''} />
+                        {queryingInfo ? `查询中 ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询信息'}
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onClick={handleClearAll}
+                        disabled={disabledCredentialCount === 0}
+                        className="text-destructive focus:text-destructive"
+                      >
+                        <Trash2 />
+                        清除已禁用
+                      </DropdownMenuItem>
+                      <DropdownMenuSeparator />
+                    </>
+                  )}
+                  <DropdownMenuItem onClick={() => setKamImportDialogOpen(true)}>
+                    <FileUp />
+                    KAM 导入
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => setBatchImportDialogOpen(true)}>
+                    <Upload />
+                    批量导入
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+
               <Button onClick={() => setAddDialogOpen(true)} size="sm">
                 <Plus className="h-4 w-4 mr-2" />
                 添加凭据
               </Button>
             </div>
           </div>
+
+          {/* 批量操作条（选中时显示） */}
+          {selectedIds.size > 0 && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-primary/20 bg-accent/40 px-4 py-2.5">
+              <div className="flex items-center gap-3">
+                <Badge variant="secondary">已选 {selectedIds.size} 个</Badge>
+                <Button onClick={deselectAll} size="sm" variant="ghost" className="h-7 px-2 text-muted-foreground">
+                  取消选择
+                </Button>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button onClick={handleBatchVerify} size="sm" variant="outline">
+                  <CheckCircle2 className="h-4 w-4 mr-2" />
+                  批量验活
+                </Button>
+                <Button
+                  onClick={handleBatchForceRefresh}
+                  size="sm"
+                  variant="outline"
+                  disabled={batchRefreshing}
+                >
+                  <RefreshCw className={`h-4 w-4 mr-2 ${batchRefreshing ? 'animate-spin' : ''}`} />
+                  {batchRefreshing ? `刷新中 ${batchRefreshProgress.current}/${batchRefreshProgress.total}` : '批量刷新 Token'}
+                </Button>
+                <Button onClick={handleBatchResetFailure} size="sm" variant="outline">
+                  <RotateCcw className="h-4 w-4 mr-2" />
+                  恢复异常
+                </Button>
+                <Button
+                  onClick={handleBatchDelete}
+                  size="sm"
+                  variant="destructive"
+                  disabled={selectedDisabledCount === 0}
+                  title={selectedDisabledCount === 0 ? '只能删除已禁用凭据' : undefined}
+                >
+                  <Trash2 className="h-4 w-4 mr-2" />
+                  批量删除
+                </Button>
+              </div>
+            </div>
+          )}
+
           {data?.credentials.length === 0 ? (
             <Card>
-              <CardContent className="py-8 text-center text-muted-foreground">
-                暂无凭据
+              <CardContent className="flex flex-col items-center justify-center gap-3 py-16 text-center">
+                <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted">
+                  <Server className="h-5 w-5 text-muted-foreground" />
+                </div>
+                <div>
+                  <div className="text-sm font-medium">暂无凭据</div>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    使用右上角的「添加凭据」或「批量导入」开始。
+                  </p>
+                </div>
               </CardContent>
             </Card>
           ) : (
@@ -819,7 +1003,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
               {/* 分页控件 */}
               {totalPages > 1 && (
-                <div className="flex justify-center items-center gap-4 mt-6">
+                <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
                   <Button
                     variant="outline"
                     size="sm"
@@ -829,7 +1013,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     上一页
                   </Button>
                   <span className="text-sm text-muted-foreground">
-                    第 {currentPage} / {totalPages} 页（共 {data?.credentials.length} 个凭据）
+                    第 {currentPage} / {totalPages} 页 · 共 {data?.credentials.length} 个
                   </span>
                   <Button
                     variant="outline"
@@ -843,7 +1027,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               )}
             </>
           )}
-        </div>
+        </section>
       </main>
 
       {/* 余额对话框 */}
