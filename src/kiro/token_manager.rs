@@ -675,6 +675,23 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
+    /// 列出当前可用的凭据 id（供粘性绑定表作为候选池）
+    ///
+    /// 与 `select_next_credential` 的过滤条件一致：跳过 disabled；
+    /// 当 model 为 opus 时还需要凭据支持 opus。
+    pub fn available_credential_ids(&self, model: Option<&str>) -> Vec<u64> {
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .filter(|e| !e.disabled)
+            .filter(|e| !is_opus || e.credentials.supports_opus())
+            .map(|e| e.id)
+            .collect()
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
@@ -753,10 +770,21 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+    /// - `preferred`: 优先使用的凭据 id（来自用户粘性绑定）。仅在第一轮尝试；
+    ///   若该凭据不可用或本轮 Token 获取失败，后续轮次走默认选择逻辑。
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        preferred: Option<u64>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
+        let mut preferred_pending = preferred;
+
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
 
         loop {
             if attempt_count >= max_attempts {
@@ -768,6 +796,19 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
+                // 第一轮优先尝试粘性绑定凭据（只试一次，后续轮次 fallback）
+                let preferred_hit = preferred_pending.take().and_then(|pid| {
+                    let entries = self.entries.lock();
+                    entries
+                        .iter()
+                        .find(|e| e.id == pid && !e.disabled)
+                        .filter(|e| !is_opus || e.credentials.supports_opus())
+                        .map(|e| (e.id, e.credentials.clone()))
+                });
+
+                if let Some(hit) = preferred_hit {
+                    hit
+                } else {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
@@ -823,6 +864,7 @@ impl MultiTokenManager {
                         let available = entries.iter().filter(|e| !e.disabled).count();
                         anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                     }
+                }
                 }
             };
 
@@ -2434,7 +2476,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -2456,7 +2498,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -2501,7 +2543,7 @@ mod tests {
         }
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, None).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -2541,7 +2583,7 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager.acquire_context(None, None).await.err().unwrap().to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",

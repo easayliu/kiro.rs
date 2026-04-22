@@ -60,6 +60,16 @@ pub struct CacheProfile {
     identity_key: Option<u64>,
 }
 
+impl CacheProfile {
+    /// 从 metadata.user_id 提取的用户身份 hash，供上游粘性绑定表使用。
+    ///
+    /// 与 cache_tracker 分桶使用的是同一把 hash，保证"绑定命中"与"缓存命中"
+    /// 的统计口径对齐，不会出现绑定视角和缓存视角错位的情况。
+    pub fn identity_key(&self) -> Option<u64> {
+        self.identity_key
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CacheBlock {
     prefix_fingerprint: [u8; 32],
@@ -784,7 +794,7 @@ fn compute_segment_extras_hash(payload: &MessagesRequest, segment: BlockSegment)
 ///
 /// 用 device_id + account_uuid + session_id 拼接后 SHA256 取前 8 字节。
 /// 这三个字段在同一会话内稳定，不像 billing header 的 cch 每次请求都变。
-fn extract_identity_key(payload: &MessagesRequest) -> Option<u64> {
+pub fn extract_identity_key(payload: &MessagesRequest) -> Option<u64> {
     let user_id = payload.metadata.as_ref()?.user_id.as_ref()?;
     let user_id = user_id.trim();
     if user_id.is_empty() {

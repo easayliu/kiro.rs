@@ -29,6 +29,8 @@ use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
 use super::websearch;
+use crate::kiro::binding::BindingTable;
+use crate::kiro::provider::KiroProvider;
 
 /// 汇总 prompt caching 相关的 usage 数值
 #[derive(Debug, Clone, Copy, Default)]
@@ -39,6 +41,58 @@ pub(crate) struct CacheUsageContext {
     pub cache_creation_1h_input_tokens: i32,
     /// 最后 breakpoint 之后的未缓存 tokens，对应 Anthropic 返回的 input_tokens
     pub uncached_input_tokens: i32,
+}
+
+/// 粘性绑定解析：返回本次请求应优先使用的凭证 id。
+///
+/// - 未提供 identity_key（没有 metadata.user_id）→ 返回 None，走默认选择
+/// - 无可用凭证 → 返回 None
+/// - 首次见到的用户会在绑定表中创建新绑定
+fn resolve_sticky_preference(
+    binding_table: &BindingTable,
+    provider: &KiroProvider,
+    identity_key: Option<u64>,
+    model: &str,
+) -> Option<u64> {
+    let identity = identity_key?;
+    let available = provider.available_credential_ids(Some(model));
+    binding_table.resolve(identity, &available)
+}
+
+/// 调用完成后的粘性绑定维护。
+///
+/// - 成功但落在非 preferred 凭证 → preferred 本轮失败，累计错误，必要时改绑
+/// - 调用整体失败 → 累计错误，必要时改绑（下一次请求生效）
+fn update_binding_after_call(
+    binding_table: &BindingTable,
+    provider: &KiroProvider,
+    identity_key: Option<u64>,
+    preferred: Option<u64>,
+    actual: Option<u64>,
+    model: &str,
+) {
+    let (identity, pref) = match (identity_key, preferred) {
+        (Some(i), Some(p)) => (i, p),
+        _ => return,
+    };
+    let preferred_failed = match actual {
+        Some(used) => used != pref,
+        None => true,
+    };
+    if !preferred_failed {
+        return;
+    }
+    if binding_table.report_error(pref) {
+        let available = provider.available_credential_ids(Some(model));
+        if let Some(new_cred) = binding_table.rebind(identity, pref, &available) {
+            tracing::info!(
+                identity = identity,
+                from = pref,
+                to = new_cred,
+                "粘性绑定改绑：preferred 凭证累计错误达阈值"
+            );
+        }
+    }
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -231,7 +285,15 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let identity_key = super::cache_tracker::extract_identity_key(&payload);
+        return websearch::handle_websearch_request(
+            provider,
+            &payload,
+            input_tokens,
+            state.binding_table.clone(),
+            identity_key,
+        )
+        .await;
     }
 
     // 转换请求
@@ -290,6 +352,16 @@ pub async fn post_messages(
     let cache_tracker = state.cache_tracker.clone();
     let cache_profile = cache_tracker.build_profile(&payload, input_tokens);
 
+    // 粘性绑定：解析 user_id → preferred 凭证
+    let identity_key = cache_profile.identity_key();
+    let binding_table = state.binding_table.clone();
+    let preferred = resolve_sticky_preference(
+        &binding_table,
+        provider.as_ref(),
+        identity_key,
+        &payload.model,
+    );
+
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -310,6 +382,9 @@ pub async fn post_messages(
             tool_name_map,
             cache_tracker,
             cache_profile,
+            binding_table,
+            identity_key,
+            preferred,
         )
         .await
     } else {
@@ -324,6 +399,9 @@ pub async fn post_messages(
             tool_name_map,
             cache_tracker,
             cache_profile,
+            binding_table,
+            identity_key,
+            preferred,
         )
         .await
     }
@@ -339,12 +417,33 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     cache_tracker: Arc<CacheTracker>,
     cache_profile: CacheProfile,
+    binding_table: Arc<BindingTable>,
+    identity_key: Option<u64>,
+    preferred: Option<u64>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let api_result = match provider.call_api_stream(request_body).await {
+    let api_result = match provider.call_api_stream(request_body, preferred).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            update_binding_after_call(
+                &binding_table,
+                provider.as_ref(),
+                identity_key,
+                preferred,
+                None,
+                model,
+            );
+            return map_provider_error(e);
+        }
     };
+    update_binding_after_call(
+        &binding_table,
+        provider.as_ref(),
+        identity_key,
+        preferred,
+        Some(api_result.credential_id),
+        model,
+    );
 
     // 原子地计算缓存命中并更新 checkpoint 表
     let cache_result = cache_tracker.compute_and_update(api_result.credential_id, &cache_profile);
@@ -488,12 +587,33 @@ async fn handle_non_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     cache_tracker: Arc<CacheTracker>,
     cache_profile: CacheProfile,
+    binding_table: Arc<BindingTable>,
+    identity_key: Option<u64>,
+    preferred: Option<u64>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let api_result = match provider.call_api(request_body).await {
+    let api_result = match provider.call_api(request_body, preferred).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            update_binding_after_call(
+                &binding_table,
+                provider.as_ref(),
+                identity_key,
+                preferred,
+                None,
+                model,
+            );
+            return map_provider_error(e);
+        }
     };
+    update_binding_after_call(
+        &binding_table,
+        provider.as_ref(),
+        identity_key,
+        preferred,
+        Some(api_result.credential_id),
+        model,
+    );
 
     // 原子地计算缓存命中并更新 checkpoint 表
     let cache_result = cache_tracker.compute_and_update(api_result.credential_id, &cache_profile);
@@ -787,7 +907,15 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let identity_key = super::cache_tracker::extract_identity_key(&payload);
+        return websearch::handle_websearch_request(
+            provider,
+            &payload,
+            input_tokens,
+            state.binding_table.clone(),
+            identity_key,
+        )
+        .await;
     }
 
     // 转换请求
@@ -846,6 +974,16 @@ pub async fn post_messages_cc(
     let cache_tracker = state.cache_tracker.clone();
     let cache_profile = cache_tracker.build_profile(&payload, input_tokens);
 
+    // 粘性绑定：解析 user_id → preferred 凭证
+    let identity_key = cache_profile.identity_key();
+    let binding_table = state.binding_table.clone();
+    let preferred = resolve_sticky_preference(
+        &binding_table,
+        provider.as_ref(),
+        identity_key,
+        &payload.model,
+    );
+
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -866,6 +1004,9 @@ pub async fn post_messages_cc(
             tool_name_map,
             cache_tracker,
             cache_profile,
+            binding_table,
+            identity_key,
+            preferred,
         )
         .await
     } else {
@@ -880,6 +1021,9 @@ pub async fn post_messages_cc(
             tool_name_map,
             cache_tracker,
             cache_profile,
+            binding_table,
+            identity_key,
+            preferred,
         )
         .await
     }
@@ -898,12 +1042,33 @@ async fn handle_stream_request_buffered(
     tool_name_map: std::collections::HashMap<String, String>,
     cache_tracker: Arc<CacheTracker>,
     cache_profile: CacheProfile,
+    binding_table: Arc<BindingTable>,
+    identity_key: Option<u64>,
+    preferred: Option<u64>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let api_result = match provider.call_api_stream(request_body).await {
+    let api_result = match provider.call_api_stream(request_body, preferred).await {
         Ok(resp) => resp,
-        Err(e) => return map_provider_error(e),
+        Err(e) => {
+            update_binding_after_call(
+                &binding_table,
+                provider.as_ref(),
+                identity_key,
+                preferred,
+                None,
+                model,
+            );
+            return map_provider_error(e);
+        }
     };
+    update_binding_after_call(
+        &binding_table,
+        provider.as_ref(),
+        identity_key,
+        preferred,
+        Some(api_result.credential_id),
+        model,
+    );
 
     // 原子地计算缓存命中并更新 checkpoint 表
     let cache_result = cache_tracker.compute_and_update(api_result.credential_id, &cache_profile);

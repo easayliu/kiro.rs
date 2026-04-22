@@ -11,6 +11,7 @@ use axum::{
 };
 
 use crate::common::auth;
+use crate::kiro::binding::BindingTable;
 use crate::kiro::provider::KiroProvider;
 
 use super::cache_tracker::CacheTracker;
@@ -31,6 +32,11 @@ pub struct AppState {
     pub extract_thinking: bool,
     /// Prompt caching 本地追踪器（按 credential_id 维度分片）
     pub cache_tracker: Arc<CacheTracker>,
+    /// 用户 → 凭证粘性绑定表（内存版）
+    ///
+    /// 跨凭证场景下让同一用户的请求持续落在同一上游，避免上游 prompt cache
+    /// 在多凭证间反复预热。进程重启会清空绑定（首轮请求会重新选凭证）。
+    pub binding_table: Arc<BindingTable>,
 }
 
 impl AppState {
@@ -50,6 +56,7 @@ impl AppState {
                 cache_scope,
                 cache_skip_rate,
             )),
+            binding_table: Arc::new(BindingTable::new()),
         }
     }
 

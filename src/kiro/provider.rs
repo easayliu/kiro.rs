@@ -145,8 +145,18 @@ impl KiroProvider {
     ///
     /// # Returns
     /// 返回原始的 HTTP Response，不做解析
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<ApiCallResult> {
-        self.call_api_with_retry(request_body, false).await
+    pub async fn call_api(
+        &self,
+        request_body: &str,
+        preferred_credential: Option<u64>,
+    ) -> anyhow::Result<ApiCallResult> {
+        self.call_api_with_retry(request_body, false, preferred_credential)
+            .await
+    }
+
+    /// 列出当前可用的凭据 id（供粘性绑定表作为候选池）
+    pub fn available_credential_ids(&self, model: Option<&str>) -> Vec<u64> {
+        self.token_manager.available_credential_ids(model)
     }
 
     /// 发送流式 API 请求
@@ -162,8 +172,13 @@ impl KiroProvider {
     ///
     /// # Returns
     /// 返回原始的 HTTP Response，调用方负责处理流式数据
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<ApiCallResult> {
-        self.call_api_with_retry(request_body, true).await
+    pub async fn call_api_stream(
+        &self,
+        request_body: &str,
+        preferred_credential: Option<u64>,
+    ) -> anyhow::Result<ApiCallResult> {
+        self.call_api_with_retry(request_body, true, preferred_credential)
+            .await
     }
 
     /// 发送 MCP API 请求
@@ -172,24 +187,36 @@ impl KiroProvider {
     ///
     /// # Arguments
     /// * `request_body` - JSON 格式的 MCP 请求体字符串
+    /// * `preferred_credential` - 粘性绑定的凭据 id（仅首轮尝试）
     ///
     /// # Returns
-    /// 返回原始的 HTTP Response
-    pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_mcp_with_retry(request_body).await
+    /// 返回原始的 HTTP Response 及实际使用的 credential_id
+    pub async fn call_mcp(
+        &self,
+        request_body: &str,
+        preferred_credential: Option<u64>,
+    ) -> anyhow::Result<ApiCallResult> {
+        self.call_mcp_with_retry(request_body, preferred_credential)
+            .await
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
-    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    async fn call_mcp_with_retry(
+        &self,
+        request_body: &str,
+        preferred_credential: Option<u64>,
+    ) -> anyhow::Result<ApiCallResult> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
+            // 仅首轮使用粘性绑定凭据；后续轮次 fallback 走默认选择
+            let preferred = if attempt == 0 { preferred_credential } else { None };
             // 获取调用上下文
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let ctx = match self.token_manager.acquire_context(None, preferred).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -261,7 +288,10 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                return Ok(ApiCallResult {
+                    response,
+                    credential_id: ctx.id,
+                });
             }
 
             // 失败响应
@@ -350,6 +380,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
+        preferred_credential: Option<u64>,
     ) -> anyhow::Result<ApiCallResult> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -361,8 +392,14 @@ impl KiroProvider {
         let model = Self::extract_model_from_request(request_body);
 
         for attempt in 0..max_retries {
+            // 仅首轮使用粘性绑定凭据；后续轮次 fallback 走默认选择
+            let preferred = if attempt == 0 { preferred_credential } else { None };
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context(model.as_deref(), preferred)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);

@@ -15,8 +15,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use std::sync::Arc;
+
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
+use crate::kiro::binding::BindingTable;
 
 /// MCP 请求
 #[derive(Debug, Serialize)]
@@ -475,6 +478,8 @@ pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    binding_table: Arc<BindingTable>,
+    identity_key: Option<u64>,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -496,16 +501,31 @@ pub async fn handle_websearch_request(
     // 2. 创建 MCP 请求
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
-    // 3. 调用 Kiro MCP API
-    let search_results = match call_mcp_api(&provider, &mcp_request).await {
-        Ok(response) => parse_search_results(&response),
-        Err(e) => {
-            tracing::warn!("MCP API 调用失败: {}", e);
-            None
-        }
-    };
+    // 3. 粘性绑定：解析 preferred 凭证（MCP 不按模型过滤，传 None）
+    let preferred = identity_key
+        .map(|id| (id, provider.available_credential_ids(None)))
+        .and_then(|(id, available)| binding_table.resolve(id, &available));
 
-    // 4. 生成 SSE 响应
+    // 4. 调用 Kiro MCP API
+    let (search_results, actual_credential) =
+        match call_mcp_api(&provider, &mcp_request, preferred).await {
+            Ok((response, cred)) => (parse_search_results(&response), Some(cred)),
+            Err(e) => {
+                tracing::warn!("MCP API 调用失败: {}", e);
+                (None, None)
+            }
+        };
+
+    // 5. 绑定维护：actual != preferred 说明 preferred 失败/不可用
+    maintain_binding(
+        &binding_table,
+        &provider,
+        identity_key,
+        preferred,
+        actual_credential,
+    );
+
+    // 6. 生成 SSE 响应
     let model = payload.model.clone();
     let stream =
         create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
@@ -519,18 +539,20 @@ pub async fn handle_websearch_request(
         .unwrap()
 }
 
-/// 调用 Kiro MCP API
+/// 调用 Kiro MCP API，返回 MCP 响应体与实际服务该请求的 credential_id
 async fn call_mcp_api(
     provider: &crate::kiro::provider::KiroProvider,
     request: &McpRequest,
-) -> anyhow::Result<McpResponse> {
+    preferred: Option<u64>,
+) -> anyhow::Result<(McpResponse, u64)> {
     let request_body = serde_json::to_string(request)?;
 
     tracing::debug!("MCP request: {}", request_body);
 
-    let response = provider.call_mcp(&request_body).await?;
+    let api_result = provider.call_mcp(&request_body, preferred).await?;
+    let credential_id = api_result.credential_id;
 
-    let body = response.text().await?;
+    let body = api_result.response.text().await?;
     tracing::debug!("MCP response: {}", body);
 
     let mcp_response: McpResponse = serde_json::from_str(&body)?;
@@ -543,7 +565,39 @@ async fn call_mcp_api(
         );
     }
 
-    Ok(mcp_response)
+    Ok((mcp_response, credential_id))
+}
+
+/// 根据本次调用结果维护粘性绑定（与 handlers::update_binding_after_call 同构）
+fn maintain_binding(
+    binding_table: &BindingTable,
+    provider: &crate::kiro::provider::KiroProvider,
+    identity_key: Option<u64>,
+    preferred: Option<u64>,
+    actual: Option<u64>,
+) {
+    let (identity, pref) = match (identity_key, preferred) {
+        (Some(i), Some(p)) => (i, p),
+        _ => return,
+    };
+    let preferred_failed = match actual {
+        Some(used) => used != pref,
+        None => true,
+    };
+    if !preferred_failed {
+        return;
+    }
+    if binding_table.report_error(pref) {
+        let available = provider.available_credential_ids(None);
+        if let Some(new_cred) = binding_table.rebind(identity, pref, &available) {
+            tracing::info!(
+                identity = identity,
+                from = pref,
+                to = new_cred,
+                "粘性绑定改绑（websearch 路径）：preferred 凭证累计错误达阈值"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
