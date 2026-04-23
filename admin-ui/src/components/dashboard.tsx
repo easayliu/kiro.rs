@@ -14,6 +14,7 @@ import {
   AlertTriangle,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   X,
   Search,
   MoreHorizontal,
@@ -90,7 +91,34 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<FilterKey>('all')
   const [policiesOpen, setPoliciesOpen] = useState(false)
-  const itemsPerPage = 12
+  const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const
+  const [itemsPerPage, setItemsPerPage] = useState<number>(() => {
+    if (typeof window === 'undefined') return 12
+    const saved = Number(localStorage.getItem('kiro-page-size'))
+    return PAGE_SIZE_OPTIONS.includes(saved as (typeof PAGE_SIZE_OPTIONS)[number]) ? saved : 12
+  })
+  const handleChangePageSize = (size: number) => {
+    setItemsPerPage(size)
+    setCurrentPage(1)
+    localStorage.setItem('kiro-page-size', String(size))
+  }
+
+  type SortKey = 'default' | 'plan-desc' | 'plan-asc'
+  const SORT_OPTIONS: { key: SortKey; label: string }[] = [
+    { key: 'default', label: '默认（优先级）' },
+    { key: 'plan-desc', label: '订阅等级 · 高→低' },
+    { key: 'plan-asc', label: '订阅等级 · 低→高' },
+  ]
+  const [sortKey, setSortKey] = useState<SortKey>(() => {
+    if (typeof window === 'undefined') return 'default'
+    const saved = localStorage.getItem('kiro-sort') as SortKey | null
+    return saved && SORT_OPTIONS.some(o => o.key === saved) ? saved : 'default'
+  })
+  const handleChangeSort = (key: SortKey) => {
+    setSortKey(key)
+    setCurrentPage(1)
+    localStorage.setItem('kiro-sort', key)
+  }
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window === 'undefined') return true
     if (document.documentElement.classList.contains('dark')) return true
@@ -125,7 +153,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   const filteredCreds = useMemo(() => {
     const q = search.trim().toLowerCase()
-    return allCreds.filter(c => {
+    const filtered = allCreds.filter(c => {
       if (filter === 'available' && (c.disabled || c.failureCount > 0 || c.refreshFailureCount > 0)) return false
       if (filter === 'faulty' && !(c.failureCount > 0 || c.refreshFailureCount > 0)) return false
       if (filter === 'disabled' && !c.disabled) return false
@@ -136,7 +164,28 @@ export function Dashboard({ onLogout }: DashboardProps) {
         (c.proxyUrl || '').toLowerCase().includes(q)
       )
     })
-  }, [allCreds, filter, search])
+
+    if (sortKey === 'default') return filtered
+
+    const tierRank = (title: string | null | undefined): number => {
+      if (!title) return 0
+      const t = title.toUpperCase()
+      if (t.includes('POWER')) return 3
+      if (t.includes('PRO')) return 2
+      if (t.includes('FREE')) return 1
+      return 0
+    }
+    const direction = sortKey === 'plan-desc' ? -1 : 1
+    return [...filtered].sort((a, b) => {
+      const rankDelta =
+        (tierRank(balanceMap.get(a.id)?.subscriptionTitle) -
+          tierRank(balanceMap.get(b.id)?.subscriptionTitle)) * direction
+      if (rankDelta !== 0) return rankDelta
+      // Stable secondary order: priority asc, then id asc
+      if (a.priority !== b.priority) return a.priority - b.priority
+      return a.id - b.id
+    })
+  }, [allCreds, filter, search, sortKey, balanceMap])
 
   const totalPages = Math.max(1, Math.ceil(filteredCreds.length / itemsPerPage))
   const safePage = Math.min(currentPage, totalPages)
@@ -451,19 +500,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
         style={{ paddingTop: 'env(safe-area-inset-top)' }}
       >
         <div
-          className="mx-auto flex h-12 max-w-[1280px] items-center justify-between px-4 sm:h-14 sm:px-8 lg:px-12"
+          className="mx-auto flex h-12 max-w-[1440px] items-center justify-between px-4 sm:h-14 sm:px-8 lg:px-12"
           style={{
             paddingLeft: 'max(1rem, env(safe-area-inset-left))',
             paddingRight: 'max(1rem, env(safe-area-inset-right))',
           }}
         >
           <div className="flex items-center gap-2.5">
-            <div className="flex h-8 w-8 items-center justify-center rounded-md bg-foreground text-background">
-              <span className="font-mono text-sm font-bold">K</span>
+            <div className="flex h-7 w-7 items-center justify-center rounded-md bg-foreground text-background">
+              <span className="font-mono text-xs font-bold">K</span>
             </div>
-            <div className="leading-tight">
-              <div className="text-sm font-semibold tracking-tight">Kiro</div>
-              <div className="label-eyebrow hidden sm:block">Admin Console</div>
+            <div className="flex items-baseline gap-1.5">
+              <span className="text-sm font-semibold tracking-tight">Kiro</span>
+              <span className="hidden text-xs text-muted-foreground sm:inline">Admin</span>
             </div>
           </div>
           <div className="flex items-center gap-0.5">
@@ -482,61 +531,64 @@ export function Dashboard({ onLogout }: DashboardProps) {
         style={{ paddingBottom: 'max(5rem, env(safe-area-inset-bottom))' }}
       >
         <div
-          className="mx-auto max-w-[1280px] px-4 pt-4 sm:px-8 sm:pt-8 lg:px-12 lg:pt-10"
+          className="mx-auto max-w-[1440px] px-4 pt-4 sm:px-8 sm:pt-8 lg:px-12 lg:pt-10"
           style={{
             paddingLeft: 'max(1rem, env(safe-area-inset-left))',
             paddingRight: 'max(1rem, env(safe-area-inset-right))',
           }}
         >
-          {/* ━━━━━━━━━━━━ HERO — compact ━━━━━━━━━━━━ */}
+          {/* ━━━━━━━━━━━━ HERO — single inline row, flex-wrap ━━━━━━━━━━━━ */}
           <section className="mb-5 sm:mb-6">
-            <h1 className="flex flex-wrap items-baseline gap-x-2.5 gap-y-1 text-balance tracking-tight">
-              <span className="text-2xl font-semibold sm:text-3xl">凭据控制台</span>
-              <span className="tnum text-base font-medium text-muted-foreground sm:text-lg">
-                {availableCount}<span className="text-muted-foreground/60">/</span>{totalCount}
-              </span>
-            </h1>
-
-            {/* Active credential — one quiet meta line */}
-            {data?.currentId && (
-              <p className="mt-1.5 flex min-w-0 items-center gap-1.5 truncate font-mono text-xs text-muted-foreground">
-                <span className="shrink-0">当前</span>
-                <span className="shrink-0 text-border">·</span>
-                <span className="min-w-0 truncate text-foreground">
-                  {activeCredential?.email || `#${String(data.currentId).padStart(3, '0')}`}
+            <div className="flex flex-wrap items-baseline gap-x-5 gap-y-2">
+              {/* Title + ratio */}
+              <h1 className="flex items-baseline gap-2 text-balance tracking-tight">
+                <span className="text-2xl font-semibold sm:text-3xl">凭据控制台</span>
+                <span className="tnum text-base font-medium text-muted-foreground sm:text-lg">
+                  {availableCount}<span className="text-muted-foreground/60">/</span>{totalCount}
                 </span>
-                {activeBalance?.subscriptionTitle && (
-                  <>
-                    <span className="shrink-0 text-border">·</span>
-                    <span className="shrink-0">{activeBalance.subscriptionTitle}</span>
-                  </>
-                )}
-                <span className="shrink-0 text-border">·</span>
-                <span className="shrink-0"><RelativeTime value={activeCredential?.lastUsedAt} /></span>
-              </p>
-            )}
+              </h1>
 
-            {/* Policies — compact inline status, click to adjust */}
-            <button
-              onClick={() => setPoliciesOpen(true)}
-              className="mt-1.5 flex w-full cursor-pointer items-center gap-1.5 overflow-x-auto no-scrollbar text-left font-mono text-xs text-muted-foreground transition-colors hover:text-foreground"
-              title="运行时策略 · 点击调整"
-            >
-              <span className="shrink-0">策略</span>
-              <span className="shrink-0 text-border">·</span>
-              <span className="shrink-0 text-foreground">
-                {isLoadingCacheScope ? '—' : cacheScopeData?.scope === 'per_credential' ? '凭据隔离' : '全局共享'}
-              </span>
-              <span className="shrink-0 text-border">·</span>
-              <span className="shrink-0 text-foreground">
-                跳过{' '}
-                {isLoadingCacheSkipRate ? '—' : cacheSkipRateData?.rate == null ? '关' : `${(cacheSkipRateData.rate * 100).toFixed(0)}%`}
-              </span>
-              <span className="shrink-0 text-border">·</span>
-              <span className="shrink-0 text-foreground">
-                {isLoadingMode ? '—' : loadBalancingData?.mode === 'balanced' ? 'LRU' : '优先级'}
-              </span>
-            </button>
+              {/* Active credential */}
+              {data?.currentId && (
+                <p className="flex min-w-0 items-center gap-1.5 font-mono text-xs text-muted-foreground">
+                  <span className="shrink-0">当前</span>
+                  <span className="shrink-0 text-border">·</span>
+                  <span className="min-w-0 truncate text-foreground">
+                    {activeCredential?.email || `#${String(data.currentId).padStart(3, '0')}`}
+                  </span>
+                  {activeBalance?.subscriptionTitle && (
+                    <>
+                      <span className="shrink-0 text-border">·</span>
+                      <span className="shrink-0">{activeBalance.subscriptionTitle}</span>
+                    </>
+                  )}
+                  <span className="shrink-0 text-border">·</span>
+                  <span className="shrink-0"><RelativeTime value={activeCredential?.lastUsedAt} /></span>
+                </p>
+              )}
+
+              {/* Policies — pushed right on wide screens */}
+              <button
+                onClick={() => setPoliciesOpen(true)}
+                className="flex shrink-0 cursor-pointer items-center gap-1.5 font-mono text-xs text-muted-foreground transition-colors hover:text-foreground sm:ml-auto"
+                title="运行时策略 · 点击调整"
+              >
+                <span className="shrink-0">策略</span>
+                <span className="shrink-0 text-border">·</span>
+                <span className="shrink-0 text-foreground">
+                  {isLoadingCacheScope ? '—' : cacheScopeData?.scope === 'per_credential' ? '凭据隔离' : '全局共享'}
+                </span>
+                <span className="shrink-0 text-border">·</span>
+                <span className="shrink-0 text-foreground">
+                  跳过{' '}
+                  {isLoadingCacheSkipRate ? '—' : cacheSkipRateData?.rate == null ? '关' : `${(cacheSkipRateData.rate * 100).toFixed(0)}%`}
+                </span>
+                <span className="shrink-0 text-border">·</span>
+                <span className="shrink-0 text-foreground">
+                  {isLoadingMode ? '—' : loadBalancingData?.mode === 'balanced' ? 'LRU' : '优先级'}
+                </span>
+              </button>
+            </div>
           </section>
 
           {/* ━━━━━━━━━━━━ CONTENT ━━━━━━━━━━━━ */}
@@ -689,9 +741,65 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   </span>
                   {currentCredentials.length > 0 && currentCredentials.every(c => selectedIds.has(c.id)) ? '取消全选' : '全选本页'}
                 </button>
-                <span className="font-mono text-2xs text-muted-foreground">
-                  页 <span className="tnum text-foreground">{safePage}/{totalPages}</span>
-                </span>
+                <div className="flex items-center gap-3 font-mono text-2xs text-muted-foreground">
+                  {/* Sort */}
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <button
+                        className="inline-flex cursor-pointer items-center gap-1 rounded-md px-1.5 py-1 transition-colors hover:text-foreground"
+                        title="排序方式"
+                      >
+                        排序{' '}
+                        <span className="text-foreground">
+                          {sortKey === 'default' ? '默认' : sortKey === 'plan-desc' ? '等级 ↓' : '等级 ↑'}
+                        </span>
+                        <ChevronDown className="h-3 w-3" />
+                      </button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="w-44">
+                      {SORT_OPTIONS.map(opt => (
+                        <DropdownMenuItem
+                          key={opt.key}
+                          onClick={() => handleChangeSort(opt.key)}
+                          className={cn(opt.key === sortKey && 'bg-muted font-semibold')}
+                        >
+                          {opt.label}
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+
+                  {/* Page size */}
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <button
+                        className="inline-flex cursor-pointer items-center gap-1 rounded-md px-1.5 py-1 transition-colors hover:text-foreground"
+                        title="每页显示数量"
+                      >
+                        每页 <span className="tnum text-foreground">{itemsPerPage}</span>
+                        <ChevronDown className="h-3 w-3" />
+                      </button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="w-28">
+                      {PAGE_SIZE_OPTIONS.map(n => (
+                        <DropdownMenuItem
+                          key={n}
+                          onClick={() => handleChangePageSize(n)}
+                          className={cn(
+                            'tnum font-mono',
+                            n === itemsPerPage && 'bg-muted font-semibold',
+                          )}
+                        >
+                          {n} 条/页
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+
+                  <span>
+                    页 <span className="tnum text-foreground">{safePage}/{totalPages}</span>
+                  </span>
+                </div>
               </div>
             )}
 
@@ -718,7 +826,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </div>
             ) : (
               <>
-                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
                   {currentCredentials.map(credential => (
                     <CredentialCard
                       key={credential.id}
@@ -765,7 +873,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           className="fixed inset-x-0 bottom-0 z-40 border-t border-border bg-background/95 shadow-pop backdrop-blur-xl animate-fade-up"
           style={{ paddingBottom: 'max(0.5rem, env(safe-area-inset-bottom))' }}
         >
-          <div className="mx-auto flex max-w-[1280px] items-center gap-2 px-4 pt-2 sm:px-8 lg:px-12">
+          <div className="mx-auto flex max-w-[1440px] items-center gap-2 px-4 pt-2 sm:px-8 lg:px-12">
             <span className="inline-flex shrink-0 items-center gap-1.5 text-sm font-medium">
               <span className="tnum flex h-6 w-6 items-center justify-center rounded-full bg-foreground text-2xs font-bold text-background">
                 {selectedIds.size}

@@ -3,22 +3,27 @@ import { toast } from 'sonner'
 import {
   RefreshCw,
   RotateCcw,
-  ChevronUp,
-  ChevronDown,
   Wallet,
   Trash2,
   Loader2,
-  Clock,
-  Globe,
   Pencil,
   Check,
-  X,
+  MoreHorizontal,
+  ChevronUp,
+  ChevronDown,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { RelativeTime } from '@/components/relative-time'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import {
   Dialog,
   DialogContent,
@@ -88,6 +93,17 @@ export function CredentialCard({
     )
   }
 
+  const handlePriorityBump = (delta: number) => {
+    const newPriority = Math.max(0, credential.priority + delta)
+    setPriority.mutate(
+      { id: credential.id, priority: newPriority },
+      {
+        onSuccess: res => toast.success(res.message),
+        onError: err => toast.error('操作失败: ' + (err as Error).message),
+      },
+    )
+  }
+
   const handleReset = () => {
     resetFailure.mutate(credential.id, {
       onSuccess: res => toast.success(res.message),
@@ -119,23 +135,39 @@ export function CredentialCard({
   const isOverLimit = !!balance && balance.usagePercentage >= 100
 
   const tier = resolveTier(balance?.subscriptionTitle)
+  const displayName = credential.email || `凭据 #${credential.id}`
+  const initial = (credential.email?.[0] || '#').toUpperCase()
 
   const barColor =
     !balance
-      ? ''
+      ? 'bg-muted'
       : balance.usagePercentage >= 90
         ? 'bg-bad'
         : balance.usagePercentage >= 70
           ? 'bg-warn'
           : 'bg-ok'
 
+  // Status label for the subtitle row
+  const statusLabel = credential.disabled
+    ? credential.disabledReason || '已禁用'
+    : hasFailures
+      ? '异常'
+      : credential.isCurrent
+        ? '活跃'
+        : null
+  const statusClass = credential.disabled
+    ? 'text-bad'
+    : hasFailures
+      ? 'text-warn'
+      : credential.isCurrent
+        ? 'text-foreground'
+        : 'text-muted-foreground'
+
   return (
     <>
       <div
         className={cn(
-          'group relative flex flex-col overflow-hidden rounded-xl border transition-all duration-200 ease-out',
-          'hover:border-foreground/30 hover:shadow-card',
-          tier.cardBg,
+          'group relative flex flex-col overflow-hidden rounded-lg border bg-surface shadow-sm transition-shadow duration-200 hover:shadow-md',
           selected
             ? 'border-primary ring-2 ring-primary/20'
             : credential.isCurrent
@@ -144,41 +176,49 @@ export function CredentialCard({
           credential.disabled && 'opacity-75',
         )}
       >
-        {/* ─── PRIMARY: email + switch ─── */}
-        <div className="flex items-center gap-2.5 px-4 pt-3.5 pb-3">
+        {/* ─── HEADER: avatar + name/meta + switch ─── */}
+        <div className={cn('flex items-start gap-3 p-4', tier.cardBg)}>
+          {/* Avatar — click to select */}
           <button
             onClick={onToggleSelect}
-            className="group/cb relative -m-1.5 flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-muted"
-            aria-label={selected ? 'unselect' : 'select'}
+            aria-label={selected ? '取消选择' : '选择'}
+            className={cn(
+              'relative flex h-10 w-10 shrink-0 cursor-pointer items-center justify-center rounded-full text-sm font-semibold transition-all',
+              selected
+                ? 'bg-primary text-primary-foreground ring-2 ring-primary/30 ring-offset-2 ring-offset-background'
+                : tier.avatarBg,
+              tier.avatarText,
+            )}
           >
-            <span
-              className={cn(
-                'flex h-4 w-4 items-center justify-center rounded border transition-colors',
-                selected
-                  ? 'border-primary bg-primary text-primary-foreground'
-                  : 'border-border bg-background group-hover/cb:border-foreground/40',
-              )}
-            >
-              {selected && <Check className="h-3 w-3" />}
-            </span>
+            {selected ? <Check className="h-4 w-4" /> : initial}
           </button>
 
-          <div className="min-w-0 flex-1">
+          <div className="min-w-0 flex-1 pt-0.5">
             <h3
-              className="truncate text-[15px] font-semibold leading-tight"
+              className="truncate text-sm font-semibold leading-tight"
               title={credential.email || undefined}
             >
-              {credential.email || `凭据 #${credential.id}`}
+              {displayName}
             </h3>
-            <div className="mt-0.5 flex items-center gap-1.5 font-mono text-2xs text-muted-foreground">
+            <div className="mt-1 flex items-center gap-1.5 font-mono text-2xs text-muted-foreground">
               <span className="tnum">#{String(credential.id).padStart(3, '0')}</span>
-              {credential.isCurrent && <span className="text-foreground">· 活跃</span>}
-              {credential.hasProfileArn && <span>· ARN</span>}
-              {hasFailures && !credential.disabled && <span className="text-warn">· 异常</span>}
-              {credential.disabled && (
-                <span className="text-bad" title={credential.disabledReason || undefined}>
-                  · {credential.disabledReason ? (credential.disabledReason.length > 10 ? credential.disabledReason.slice(0, 10) + '…' : credential.disabledReason) : '已禁用'}
-                </span>
+              {balance?.subscriptionTitle && (
+                <>
+                  <span className="text-border">·</span>
+                  <span className={cn('font-medium', tier.labelText)}>{balance.subscriptionTitle}</span>
+                </>
+              )}
+              {statusLabel && (
+                <>
+                  <span className="text-border">·</span>
+                  <span className={cn('font-medium', statusClass)}>{statusLabel}</span>
+                </>
+              )}
+              {credential.hasProfileArn && (
+                <>
+                  <span className="text-border">·</span>
+                  <span>ARN</span>
+                </>
               )}
             </div>
           </div>
@@ -192,187 +232,149 @@ export function CredentialCard({
           />
         </div>
 
-        {/* ─── SECONDARY: usage bar + numbers ─── */}
-        <div className="px-4 pb-3">
-          <div className="mb-1.5 flex items-center justify-between gap-2 text-2xs">
-            <span className={cn('font-mono font-medium', tier.labelText)}>
-              {balance?.subscriptionTitle || 'Plan —'}
-            </span>
-            {loadingBalance ? (
-              <span className="flex items-center gap-1 font-mono text-muted-foreground">
-                <Loader2 className="h-2.5 w-2.5 animate-spin" /> loading
-              </span>
-            ) : balance ? (
-              <span className="tnum min-w-0 truncate text-right font-mono">
-                <span className={cn('font-semibold text-foreground', isOverLimit && 'text-bad')}>
-                  {balance.currentUsage.toFixed(2)}
-                </span>
-                <span className="text-muted-foreground">/{balance.usageLimit.toFixed(2)}</span>
-                <span className={cn('ml-1.5 font-semibold', isOverLimit ? 'text-bad' : 'text-muted-foreground')}>
-                  {balance.usagePercentage.toFixed(1)}%
-                </span>
-              </span>
-            ) : (
-              <span className="font-mono text-muted-foreground">—</span>
-            )}
-          </div>
-          <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
-            {balance && (
+        {/* ─── BODY: usage + meta ─── */}
+        <dl className="space-y-2.5 px-4 pb-4">
+          {/* Usage row */}
+          <div>
+            <div className="mb-1.5 flex items-center justify-between text-xs">
+              <dt className="font-medium text-muted-foreground">用量</dt>
+              <dd className="tnum font-mono">
+                {loadingBalance ? (
+                  <span className="flex items-center gap-1 text-muted-foreground">
+                    <Loader2 className="h-3 w-3 animate-spin" /> 加载中
+                  </span>
+                ) : balance ? (
+                  <>
+                    <span className={cn('font-semibold', isOverLimit ? 'text-bad' : 'text-foreground')}>
+                      {balance.usagePercentage.toFixed(1)}%
+                    </span>
+                    <span className="ml-1.5 text-muted-foreground">
+                      {balance.currentUsage.toFixed(2)}/{balance.usageLimit.toFixed(2)}
+                    </span>
+                  </>
+                ) : (
+                  <span className="text-muted-foreground">—</span>
+                )}
+              </dd>
+            </div>
+            <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
               <div
                 className={cn('h-full rounded-full transition-[width] duration-500 ease-out', barColor)}
-                style={{ width: `${usedPercent}%` }}
+                style={{ width: balance ? `${usedPercent}%` : '0%' }}
               />
-            )}
+            </div>
           </div>
-        </div>
 
-        {/* ─── TERTIARY: meta row + priority ─── */}
-        <div className="flex items-center justify-between gap-2 border-t border-border/50 px-4 py-2 font-mono text-2xs text-muted-foreground">
-          <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-0.5">
-            <span className="inline-flex items-center gap-1">
-              <Clock className="h-2.5 w-2.5" />
-              <RelativeTime value={credential.lastUsedAt} />
-            </span>
-            <span>·</span>
-            <span>
-              P <span className="text-foreground tnum">{credential.priority}</span>
-            </span>
-            <span>·</span>
-            <span>
-              ✓ <span className="tnum text-foreground">{credential.successCount}</span>
-              {hasFailures && (
-                <>
-                  {' '}
-                  <span className="text-bad">✕ <span className="tnum">{credential.failureCount}/{credential.refreshFailureCount}</span></span>
-                </>
+          {/* Meta key-values — definition-list style grid */}
+          <div className="grid grid-cols-3 gap-2 text-xs">
+            <MetaCell label="优先级">
+              {editingPriority ? (
+                <div className="flex items-center gap-0.5">
+                  <Input
+                    type="number"
+                    value={priorityValue}
+                    onChange={e => setPriorityValue(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') handlePriorityChange()
+                      if (e.key === 'Escape') {
+                        setEditingPriority(false)
+                        setPriorityValue(String(credential.priority))
+                      }
+                    }}
+                    className="h-6 w-10 rounded-md border-primary px-1 text-center font-mono text-xs"
+                    min="0"
+                    autoFocus
+                  />
+                  <button
+                    onClick={handlePriorityChange}
+                    disabled={setPriority.isPending}
+                    className="flex h-6 w-5 cursor-pointer items-center justify-center rounded text-ok hover:bg-ok-soft"
+                    aria-label="确认"
+                  >
+                    <Check className="h-3 w-3" />
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setEditingPriority(true)}
+                  className="group/p inline-flex items-center gap-1 tnum font-mono font-semibold text-foreground hover:text-primary"
+                  title="点击编辑优先级"
+                >
+                  {credential.priority}
+                  <Pencil className="h-2.5 w-2.5 opacity-0 transition-opacity group-hover/p:opacity-60" />
+                </button>
               )}
-            </span>
-            {credential.hasProxy && (
-              <>
-                <span>·</span>
-                <span className="inline-flex min-w-0 items-center gap-1" title={credential.proxyUrl}>
-                  <Globe className="h-2.5 w-2.5 shrink-0" />
-                  <span className="truncate">{credential.proxyUrl}</span>
+            </MetaCell>
+            <MetaCell label="成功/失败">
+              <span className="tnum font-mono">
+                <span className="text-foreground">{credential.successCount}</span>
+                <span className="text-muted-foreground/60"> / </span>
+                <span className={cn(hasFailures ? 'text-bad font-medium' : 'text-muted-foreground')}>
+                  {credential.failureCount}
                 </span>
-              </>
-            )}
+              </span>
+            </MetaCell>
+            <MetaCell label="最近">
+              <span className="tnum font-mono text-foreground">
+                <RelativeTime value={credential.lastUsedAt} />
+              </span>
+            </MetaCell>
           </div>
-        </div>
+        </dl>
 
-        {/* ─── ACTIONS: subtle, always visible ─── */}
-        <div className="flex items-center gap-1 border-t border-border/50 px-2 py-1.5">
-          <SubtleAction onClick={() => onViewBalance(credential.id)} icon={<Wallet className="h-3.5 w-3.5" />} label="余额" />
-          <SubtleAction
+        {/* ─── FOOTER: divided action cells ─── */}
+        <div className="mt-auto grid grid-cols-3 divide-x divide-border border-t border-border">
+          <FooterAction
+            onClick={() => onViewBalance(credential.id)}
+            icon={<Wallet className="h-4 w-4" />}
+            label="余额"
+          />
+          <FooterAction
             onClick={handleForceRefresh}
             disabled={forceRefresh.isPending || credential.disabled}
-            icon={<RefreshCw className={cn('h-3.5 w-3.5', forceRefresh.isPending && 'animate-spin')} />}
+            icon={<RefreshCw className={cn('h-4 w-4', forceRefresh.isPending && 'animate-spin')} />}
             label="Token"
             title={credential.disabled ? '已禁用的凭据无法刷新 Token' : '强制刷新 Token'}
           />
-          <SubtleAction
-            onClick={handleReset}
-            disabled={resetFailure.isPending || !hasFailures}
-            icon={<RotateCcw className="h-3.5 w-3.5" />}
-            label="重置"
-            title={!hasFailures ? '无失败计数可重置' : '重置失败计数'}
-          />
-
-          <div className="ml-auto flex items-center gap-0.5">
-            {/* Priority edit */}
-            {editingPriority ? (
-              <div className="flex items-center gap-0.5 rounded-md bg-muted px-1">
-                <Input
-                  type="number"
-                  value={priorityValue}
-                  onChange={e => setPriorityValue(e.target.value)}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter') handlePriorityChange()
-                    if (e.key === 'Escape') {
-                      setEditingPriority(false)
-                      setPriorityValue(String(credential.priority))
-                    }
-                  }}
-                  className="h-6 w-10 rounded border-0 bg-transparent px-0 text-center font-mono text-xs focus:ring-0"
-                  min="0"
-                  autoFocus
-                />
-                <button
-                  onClick={handlePriorityChange}
-                  disabled={setPriority.isPending}
-                  className="flex h-6 w-6 cursor-pointer items-center justify-center rounded-sm text-ok hover:bg-ok-soft"
-                >
-                  <Check className="h-3 w-3" />
-                </button>
-                <button
-                  onClick={() => {
-                    setEditingPriority(false)
-                    setPriorityValue(String(credential.priority))
-                  }}
-                  className="flex h-6 w-6 cursor-pointer items-center justify-center rounded-sm text-muted-foreground hover:bg-muted"
-                >
-                  <X className="h-3 w-3" />
-                </button>
-              </div>
-            ) : (
-              <>
-                <button
-                  onClick={() => setEditingPriority(true)}
-                  className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                  title="编辑优先级"
-                  aria-label="edit priority"
-                >
-                  <Pencil className="h-3 w-3" />
-                </button>
-                <div className="inline-flex items-center">
-                  <button
-                    onClick={() => {
-                      const newPriority = Math.max(0, credential.priority - 1)
-                      setPriority.mutate(
-                        { id: credential.id, priority: newPriority },
-                        {
-                          onSuccess: res => toast.success(res.message),
-                          onError: err => toast.error('操作失败: ' + (err as Error).message),
-                        },
-                      )
-                    }}
-                    disabled={setPriority.isPending || credential.priority === 0}
-                    className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
-                    title="提高优先级"
-                    aria-label="priority up"
-                  >
-                    <ChevronUp className="h-3.5 w-3.5" />
-                  </button>
-                  <button
-                    onClick={() => {
-                      const newPriority = credential.priority + 1
-                      setPriority.mutate(
-                        { id: credential.id, priority: newPriority },
-                        {
-                          onSuccess: res => toast.success(res.message),
-                          onError: err => toast.error('操作失败: ' + (err as Error).message),
-                        },
-                      )
-                    }}
-                    disabled={setPriority.isPending}
-                    className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
-                    title="降低优先级"
-                    aria-label="priority down"
-                  >
-                    <ChevronDown className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              </>
-            )}
-            <button
-              onClick={() => setShowDeleteDialog(true)}
-              disabled={!credential.disabled}
-              className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-bad-soft hover:text-bad disabled:cursor-not-allowed disabled:opacity-30"
-              title={!credential.disabled ? '需要先禁用凭据才能删除' : '删除凭据'}
-              aria-label="delete"
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-            </button>
-          </div>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                className="group/more flex cursor-pointer items-center justify-center gap-1.5 py-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                aria-label="更多操作"
+              >
+                <MoreHorizontal className="h-4 w-4" />
+                更多
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-44">
+              <DropdownMenuItem
+                onClick={handleReset}
+                disabled={resetFailure.isPending || !hasFailures}
+              >
+                <RotateCcw /> 重置失败计数
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => handlePriorityBump(-1)}
+                disabled={setPriority.isPending || credential.priority === 0}
+              >
+                <ChevronUp /> 提高优先级
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => handlePriorityBump(1)}
+                disabled={setPriority.isPending}
+              >
+                <ChevronDown /> 降低优先级
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onClick={() => setShowDeleteDialog(true)}
+                disabled={!credential.disabled}
+                className="text-bad focus:text-bad"
+              >
+                <Trash2 /> 删除凭据
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </div>
 
@@ -399,52 +401,18 @@ export function CredentialCard({
   )
 }
 
-interface Tier {
-  key: 'free' | 'pro' | 'power' | 'unknown'
-  cardBg: string
-  labelText: string
+// ─── Primitives ───
+
+function MetaCell({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <dt className="label-eyebrow text-[0.625rem]">{label}</dt>
+      <dd>{children}</dd>
+    </div>
+  )
 }
 
-function resolveTier(title: string | null | undefined): Tier {
-  if (!title) {
-    return {
-      key: 'unknown',
-      cardBg: 'bg-surface',
-      labelText: 'text-muted-foreground',
-    }
-  }
-  const t = title.toUpperCase()
-  if (t.includes('POWER')) {
-    return {
-      key: 'power',
-      cardBg:
-        'bg-gradient-to-br from-amber-500/[0.09] via-surface to-surface dark:from-amber-400/[0.08]',
-      labelText: 'text-amber-700 dark:text-amber-400',
-    }
-  }
-  if (t.includes('PRO')) {
-    return {
-      key: 'pro',
-      cardBg:
-        'bg-gradient-to-br from-sky-500/[0.07] via-surface to-surface dark:from-sky-400/[0.07]',
-      labelText: 'text-sky-700 dark:text-sky-400',
-    }
-  }
-  if (t.includes('FREE')) {
-    return {
-      key: 'free',
-      cardBg: 'bg-surface',
-      labelText: 'text-muted-foreground',
-    }
-  }
-  return {
-    key: 'unknown',
-    cardBg: 'bg-surface',
-    labelText: 'text-muted-foreground',
-  }
-}
-
-function SubtleAction({
+function FooterAction({
   onClick, disabled, icon, label, title,
 }: {
   onClick?: () => void
@@ -458,10 +426,67 @@ function SubtleAction({
       onClick={onClick}
       disabled={disabled}
       title={title}
-      className="inline-flex h-7 cursor-pointer items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
+      className="flex cursor-pointer items-center justify-center gap-1.5 py-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
     >
       {icon}
       {label}
     </button>
   )
+}
+
+// ─── Tier resolution ───
+
+interface Tier {
+  key: 'free' | 'pro' | 'power' | 'unknown'
+  cardBg: string
+  avatarBg: string
+  avatarText: string
+  labelText: string
+}
+
+function resolveTier(title: string | null | undefined): Tier {
+  if (!title) {
+    return {
+      key: 'unknown',
+      cardBg: '',
+      avatarBg: 'bg-muted',
+      avatarText: 'text-muted-foreground',
+      labelText: 'text-muted-foreground',
+    }
+  }
+  const t = title.toUpperCase()
+  if (t.includes('POWER')) {
+    return {
+      key: 'power',
+      cardBg: 'bg-gradient-to-br from-amber-500/[0.06] to-transparent dark:from-amber-400/[0.06]',
+      avatarBg: 'bg-amber-100 dark:bg-amber-950',
+      avatarText: 'text-amber-700 dark:text-amber-400',
+      labelText: 'text-amber-700 dark:text-amber-400',
+    }
+  }
+  if (t.includes('PRO')) {
+    return {
+      key: 'pro',
+      cardBg: 'bg-gradient-to-br from-sky-500/[0.05] to-transparent dark:from-sky-400/[0.05]',
+      avatarBg: 'bg-sky-100 dark:bg-sky-950',
+      avatarText: 'text-sky-700 dark:text-sky-400',
+      labelText: 'text-sky-700 dark:text-sky-400',
+    }
+  }
+  if (t.includes('FREE')) {
+    return {
+      key: 'free',
+      cardBg: '',
+      avatarBg: 'bg-muted',
+      avatarText: 'text-muted-foreground',
+      labelText: 'text-muted-foreground',
+    }
+  }
+  return {
+    key: 'unknown',
+    cardBg: '',
+    avatarBg: 'bg-muted',
+    avatarText: 'text-muted-foreground',
+    labelText: 'text-muted-foreground',
+  }
 }
