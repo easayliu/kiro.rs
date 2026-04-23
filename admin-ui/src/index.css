@@ -4,45 +4,98 @@
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
+    --background: 210 40% 98%;
+    --surface: 0 0% 100%;
+    --surface-2: 210 40% 96%;
+    --foreground: 222 47% 12%;
+
     --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
+    --card-foreground: 222 47% 12%;
+
     --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
-    --primary: 222.2 47.4% 11.2%;
+    --popover-foreground: 222 47% 12%;
+
+    --primary: 222 47% 12%;
     --primary-foreground: 210 40% 98%;
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
-    --destructive: 0 84.2% 60.2%;
+    --primary-soft: 210 40% 94%;
+
+    --secondary: 210 40% 96%;
+    --secondary-foreground: 222 47% 12%;
+
+    --cta: 222 47% 12%;
+    --cta-foreground: 0 0% 100%;
+
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 16% 44%;
+
+    --accent: 210 40% 96%;
+    --accent-foreground: 222 47% 12%;
+
+    --destructive: 0 72% 51%;
     --destructive-foreground: 210 40% 98%;
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 222.2 84% 4.9%;
+
+    --ok: 160 60% 35%;
+    --ok-foreground: 0 0% 100%;
+    --ok-soft: 160 50% 94%;
+
+    --warn: 28 85% 45%;
+    --warn-foreground: 0 0% 100%;
+    --warn-soft: 28 90% 94%;
+
+    --bad: 0 72% 51%;
+    --bad-foreground: 210 40% 98%;
+    --bad-soft: 0 90% 96%;
+
+    --border: 214 32% 91%;
+    --input: 214 32% 91%;
+    --ring: 222 47% 12%;
     --radius: 0.5rem;
   }
 
   .dark {
-    --background: 222.2 84% 4.9%;
-    --foreground: 210 40% 98%;
-    --card: 222.2 84% 4.9%;
+    /* Standard slate dark (shadcn/ui canonical) */
+    --background: 222.2 84% 4.9%;           /* #020617 slate-950 */
+    --surface: 217.2 32.6% 10%;             /* slate-900-ish card */
+    --surface-2: 217.2 32.6% 13%;
+    --foreground: 210 40% 98%;              /* #F8FAFC */
+
+    --card: 217.2 32.6% 10%;
     --card-foreground: 210 40% 98%;
-    --popover: 222.2 84% 4.9%;
+
+    --popover: 217.2 32.6% 10%;
     --popover-foreground: 210 40% 98%;
+
     --primary: 210 40% 98%;
     --primary-foreground: 222.2 47.4% 11.2%;
+    --primary-soft: 217.2 32.6% 17.5%;
+
     --secondary: 217.2 32.6% 17.5%;
     --secondary-foreground: 210 40% 98%;
+
+    --cta: 210 40% 98%;
+    --cta-foreground: 222.2 47.4% 11.2%;
+
     --muted: 217.2 32.6% 17.5%;
     --muted-foreground: 215 20.2% 65.1%;
+
     --accent: 217.2 32.6% 17.5%;
     --accent-foreground: 210 40% 98%;
-    --destructive: 0 62.8% 30.6%;
+
+    --destructive: 0 72% 51%;
     --destructive-foreground: 210 40% 98%;
+
+    --ok: 142 70% 45%;
+    --ok-foreground: 222.2 47.4% 11.2%;
+    --ok-soft: 142 40% 16%;
+
+    --warn: 38 92% 55%;
+    --warn-foreground: 222.2 47.4% 11.2%;
+    --warn-soft: 38 45% 18%;
+
+    --bad: 0 72% 55%;
+    --bad-foreground: 210 40% 98%;
+    --bad-soft: 0 50% 18%;
+
     --border: 217.2 32.6% 17.5%;
     --input: 217.2 32.6% 17.5%;
     --ring: 212.7 26.8% 83.9%;
@@ -53,8 +106,81 @@
   * {
     @apply border-border;
   }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+  }
+
   body {
-    @apply bg-background text-foreground;
-    font-feature-settings: "rlig" 1, "calt" 1;
+    @apply bg-background text-foreground font-sans antialiased;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11', 'ss01';
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+
+  a, button, [role='button'] {
+    -webkit-tap-highlight-color: transparent;
+  }
+}
+
+@layer components {
+  .label-eyebrow {
+    @apply font-mono text-2xs font-medium uppercase text-muted-foreground;
+    letter-spacing: 0.08em;
+  }
+
+  .tnum {
+    font-variant-numeric: tabular-nums slashed-zero;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 999px;
+    border: 2px solid hsl(var(--background));
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.35);
+  }
+
+  :focus-visible {
+    outline-offset: 2px;
+  }
+
+  input[type='number']::-webkit-inner-spin-button,
+  input[type='number']::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  input[type='number'] {
+    -moz-appearance: textfield;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
   }
 }
