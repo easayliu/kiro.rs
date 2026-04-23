@@ -21,6 +21,7 @@ type AuthMethod = 'social' | 'idc'
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
+  const [email, setEmail] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
   const [authRegion, setAuthRegion] = useState('')
   const [apiRegion, setApiRegion] = useState('')
@@ -36,6 +37,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
   const resetForm = () => {
     setRefreshToken('')
+    setEmail('')
     setAuthMethod('social')
     setAuthRegion('')
     setApiRegion('')
@@ -66,6 +68,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     mutate(
       {
         refreshToken: refreshToken.trim(),
+        email: email.trim() || undefined,
         authMethod,
         authRegion: authRegion.trim() || undefined,
         apiRegion: apiRegion.trim() || undefined,
@@ -112,6 +115,24 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 onChange={(e) => setRefreshToken(e.target.value)}
                 disabled={isPending}
               />
+            </div>
+
+            {/* 邮箱（可选，仅用于前端显示） */}
+            <div className="space-y-2">
+              <label htmlFor="email" className="text-sm font-medium">
+                邮箱
+              </label>
+              <Input
+                id="email"
+                type="email"
+                placeholder="可选，用于卡片标题显示"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                可选，留空时卡片显示"凭据 #ID"
+              </p>
             </div>
 
             {/* 认证方式 */}

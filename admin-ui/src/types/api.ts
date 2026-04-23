@@ -63,6 +63,7 @@ export interface SetPriorityRequest {
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken: string
+  email?: string
   authMethod?: 'social' | 'idc'
   clientId?: string
   clientSecret?: string

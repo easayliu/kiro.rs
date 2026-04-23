@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
 import { RefreshCw, RotateCcw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2, Clock, Globe, Pencil, Check, X } from 'lucide-react'
-import { cn, formatLastUsed } from '@/lib/utils'
+import { cn } from '@/lib/utils'
+import { RelativeTime } from '@/components/relative-time'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -127,7 +128,8 @@ export function CredentialCard({
   }
 
   const hasFailures = credential.failureCount > 0 || credential.refreshFailureCount > 0
-  const remainingPercent = balance ? Math.max(0, Math.min(100, 100 - balance.usagePercentage)) : 0
+  const usedPercent = balance ? Math.max(0, Math.min(100, balance.usagePercentage)) : 0
+  const isOverLimit = !!balance && balance.usagePercentage >= 100
   const usageBarClass = !balance
     ? ''
     : balance.usagePercentage >= 90
@@ -263,19 +265,23 @@ export function CredentialCard({
             </div>
           </div>
 
-          {/* 剩余用量 */}
+          {/* 余额 */}
           <div className="space-y-1.5">
             <div className="flex items-center justify-between text-xs">
-              <span className="text-muted-foreground">剩余用量</span>
+              <span className="text-muted-foreground">余额</span>
               {loadingBalance ? (
                 <span className="text-muted-foreground">
                   <Loader2 className="mr-1 inline h-3 w-3 animate-spin" />加载中
                 </span>
               ) : balance ? (
                 <span className="tabular-nums">
-                  <span className="font-medium">{balance.remaining.toFixed(2)}</span>
+                  <span className={cn('font-medium', isOverLimit && 'text-red-600')}>
+                    {balance.currentUsage.toFixed(2)}
+                  </span>
                   <span className="text-muted-foreground"> / {balance.usageLimit.toFixed(2)}</span>
-                  <span className="ml-2 text-muted-foreground">剩余 {remainingPercent.toFixed(1)}%</span>
+                  <span className={cn('ml-2', isOverLimit ? 'text-red-600' : 'text-muted-foreground')}>
+                    已使用 {balance.usagePercentage.toFixed(1)}%
+                  </span>
                 </span>
               ) : (
                 <span className="text-muted-foreground">未知</span>
@@ -285,7 +291,7 @@ export function CredentialCard({
               {balance && (
                 <div
                   className={cn('h-full transition-[width]', usageBarClass)}
-                  style={{ width: `${remainingPercent}%` }}
+                  style={{ width: `${usedPercent}%` }}
                 />
               )}
             </div>
@@ -295,7 +301,7 @@ export function CredentialCard({
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
             <span className="inline-flex items-center gap-1">
               <Clock className="h-3 w-3" />
-              {formatLastUsed(credential.lastUsedAt)}
+              <RelativeTime value={credential.lastUsedAt} />
             </span>
             {credential.hasProxy && (
               <span className="inline-flex min-w-0 items-center gap-1" title={credential.proxyUrl}>

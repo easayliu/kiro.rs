@@ -31,7 +31,8 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
-import { cn, extractErrorMessage, formatLastUsed } from '@/lib/utils'
+import { cn, extractErrorMessage } from '@/lib/utils'
+import { RelativeTime } from '@/components/relative-time'
 import type { BalanceResponse } from '@/types/api'
 
 interface StatBoxProps {
@@ -818,7 +819,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     )}
                     <span className="inline-flex items-center gap-1 tabular-nums">
                       <Clock className="h-3 w-3" />
-                      {formatLastUsed(activeCredential?.lastUsedAt)}
+                      <RelativeTime value={activeCredential?.lastUsedAt} />
                     </span>
                   </div>
                 </>
