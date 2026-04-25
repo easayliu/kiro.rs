@@ -136,6 +136,7 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移：
     /// - 400 Bad Request: 直接返回错误，不计入凭据失败
+    ///   （例外：INVALID_MODEL_ID 仅 LRU 轮转到下一凭据，不计失败计数）
     /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
     /// - 402 MONTHLY_REQUEST_COUNT / OVERAGE_REQUEST_LIMIT_EXCEEDED: 视为额度用尽，禁用凭据并切换
     /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
@@ -163,6 +164,7 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移：
     /// - 400 Bad Request: 直接返回错误，不计入凭据失败
+    ///   （例外：INVALID_MODEL_ID 仅 LRU 轮转到下一凭据，不计失败计数）
     /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
     /// - 402 MONTHLY_REQUEST_COUNT / OVERAGE_REQUEST_LIMIT_EXCEEDED: 视为额度用尽，禁用凭据并切换
     /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
@@ -309,6 +311,13 @@ impl KiroProvider {
 
             // 400 Bad Request
             if status.as_u16() == 400 {
+                // INVALID_MODEL_ID: 当前凭据无此模型权限，仅 LRU 轮转到下一个凭据，
+                // 不计失败计数（避免误把健康但缺少该模型的凭据打到禁用阈值）
+                if Self::is_invalid_model_id(&body) {
+                    self.token_manager.mark_accessed(ctx.id);
+                    last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                    continue;
+                }
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
@@ -511,8 +520,30 @@ impl KiroProvider {
                 continue;
             }
 
-            // 400 Bad Request - 请求问题，重试/切换凭据无意义
+            // 400 Bad Request
             if status.as_u16() == 400 {
+                // INVALID_MODEL_ID: 当前凭据无此模型权限，仅 LRU 轮转到下一个凭据，
+                // 不计失败计数（避免误把健康但缺少该模型的凭据打到禁用阈值）。
+                // 仅在 balanced 模式下才能稳定轮转，priority 模式可能反复命中同凭据。
+                if Self::is_invalid_model_id(&body) {
+                    tracing::warn!(
+                        "API 请求失败（凭据可能无此模型权限，轮转到下一凭据，尝试 {}/{}）: {} {}",
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+                    self.token_manager.mark_accessed(ctx.id);
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    continue;
+                }
+
+                // 其他 400：请求侧问题，重试/切换凭据无意义
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -656,6 +687,32 @@ impl KiroProvider {
             .is_some_and(matches_reason)
     }
 
+    /// 判断 400 响应是否属于"凭据无此模型权限"场景：
+    /// 不同凭据可能开通的模型集合不同，应允许轮转到其他凭据，但不应计入失败。
+    fn is_invalid_model_id(body: &str) -> bool {
+        const REASON: &str = "INVALID_MODEL_ID";
+
+        if body.contains(REASON) {
+            return true;
+        }
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return false;
+        };
+
+        let matches_reason = |v: &serde_json::Value| {
+            v.get("reason")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s == REASON)
+        };
+
+        if matches_reason(&value) {
+            return true;
+        }
+
+        value.pointer("/error").is_some_and(matches_reason)
+    }
+
     /// 检查响应体是否包含 bearer token 失效的特征消息
     ///
     /// 当上游已使 accessToken 失效但本地 expiresAt 未到期时，
@@ -694,6 +751,24 @@ mod tests {
     fn test_is_quota_exhausted_false() {
         let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
         assert!(!KiroProvider::is_quota_exhausted(body));
+    }
+
+    #[test]
+    fn test_is_invalid_model_id_detects_reason() {
+        let body = r#"{"message":"Invalid model. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}"#;
+        assert!(KiroProvider::is_invalid_model_id(body));
+    }
+
+    #[test]
+    fn test_is_invalid_model_id_nested_reason() {
+        let body = r#"{"error":{"reason":"INVALID_MODEL_ID"}}"#;
+        assert!(KiroProvider::is_invalid_model_id(body));
+    }
+
+    #[test]
+    fn test_is_invalid_model_id_false() {
+        let body = r#"{"message":"bad","reason":"VALIDATION_ERROR"}"#;
+        assert!(!KiroProvider::is_invalid_model_id(body));
     }
 
     #[test]
