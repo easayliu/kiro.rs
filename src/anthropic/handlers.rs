@@ -45,16 +45,16 @@ pub(crate) struct CacheUsageContext {
 
 /// 粘性绑定解析：返回本次请求应优先使用的凭证 id。
 ///
-/// - 未提供 identity_key（没有 metadata.user_id）→ 返回 None，走默认选择
+/// - 未提供 binding_key（没有 metadata.user_id）→ 返回 None，走默认选择
 /// - 无可用凭证 → 返回 None
 /// - 首次见到的用户会在绑定表中创建新绑定
 fn resolve_sticky_preference(
     binding_table: &BindingTable,
     provider: &KiroProvider,
-    identity_key: Option<u64>,
+    binding_key: Option<u64>,
     model: &str,
 ) -> Option<u64> {
-    let identity = identity_key?;
+    let identity = binding_key?;
     let available = provider.available_credential_ids(Some(model));
     binding_table.resolve(identity, &available)
 }
@@ -66,12 +66,12 @@ fn resolve_sticky_preference(
 fn update_binding_after_call(
     binding_table: &BindingTable,
     provider: &KiroProvider,
-    identity_key: Option<u64>,
+    binding_key: Option<u64>,
     preferred: Option<u64>,
     actual: Option<u64>,
     model: &str,
 ) {
-    let (identity, pref) = match (identity_key, preferred) {
+    let (identity, pref) = match (binding_key, preferred) {
         (Some(i), Some(p)) => (i, p),
         _ => return,
     };
@@ -285,13 +285,13 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        let identity_key = super::cache_tracker::extract_identity_key(&payload);
+        let binding_key = super::cache_tracker::extract_binding_key(&payload);
         return websearch::handle_websearch_request(
             provider,
             &payload,
             input_tokens,
             state.binding_table.clone(),
-            identity_key,
+            binding_key,
         )
         .await;
     }
@@ -353,12 +353,12 @@ pub async fn post_messages(
     let cache_profile = cache_tracker.build_profile(&payload, input_tokens);
 
     // 粘性绑定：解析 user_id → preferred 凭证
-    let identity_key = cache_profile.identity_key();
+    let binding_key = cache_profile.binding_key();
     let binding_table = state.binding_table.clone();
     let preferred = resolve_sticky_preference(
         &binding_table,
         provider.as_ref(),
-        identity_key,
+        binding_key,
         &payload.model,
     );
 
@@ -383,7 +383,7 @@ pub async fn post_messages(
             cache_tracker,
             cache_profile,
             binding_table,
-            identity_key,
+            binding_key,
             preferred,
         )
         .await
@@ -400,7 +400,7 @@ pub async fn post_messages(
             cache_tracker,
             cache_profile,
             binding_table,
-            identity_key,
+            binding_key,
             preferred,
         )
         .await
@@ -418,7 +418,7 @@ async fn handle_stream_request(
     cache_tracker: Arc<CacheTracker>,
     cache_profile: CacheProfile,
     binding_table: Arc<BindingTable>,
-    identity_key: Option<u64>,
+    binding_key: Option<u64>,
     preferred: Option<u64>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -428,7 +428,7 @@ async fn handle_stream_request(
             update_binding_after_call(
                 &binding_table,
                 provider.as_ref(),
-                identity_key,
+                binding_key,
                 preferred,
                 None,
                 model,
@@ -439,7 +439,7 @@ async fn handle_stream_request(
     update_binding_after_call(
         &binding_table,
         provider.as_ref(),
-        identity_key,
+        binding_key,
         preferred,
         Some(api_result.credential_id),
         model,
@@ -588,7 +588,7 @@ async fn handle_non_stream_request(
     cache_tracker: Arc<CacheTracker>,
     cache_profile: CacheProfile,
     binding_table: Arc<BindingTable>,
-    identity_key: Option<u64>,
+    binding_key: Option<u64>,
     preferred: Option<u64>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -598,7 +598,7 @@ async fn handle_non_stream_request(
             update_binding_after_call(
                 &binding_table,
                 provider.as_ref(),
-                identity_key,
+                binding_key,
                 preferred,
                 None,
                 model,
@@ -609,7 +609,7 @@ async fn handle_non_stream_request(
     update_binding_after_call(
         &binding_table,
         provider.as_ref(),
-        identity_key,
+        binding_key,
         preferred,
         Some(api_result.credential_id),
         model,
@@ -907,13 +907,13 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        let identity_key = super::cache_tracker::extract_identity_key(&payload);
+        let binding_key = super::cache_tracker::extract_binding_key(&payload);
         return websearch::handle_websearch_request(
             provider,
             &payload,
             input_tokens,
             state.binding_table.clone(),
-            identity_key,
+            binding_key,
         )
         .await;
     }
@@ -975,12 +975,12 @@ pub async fn post_messages_cc(
     let cache_profile = cache_tracker.build_profile(&payload, input_tokens);
 
     // 粘性绑定：解析 user_id → preferred 凭证
-    let identity_key = cache_profile.identity_key();
+    let binding_key = cache_profile.binding_key();
     let binding_table = state.binding_table.clone();
     let preferred = resolve_sticky_preference(
         &binding_table,
         provider.as_ref(),
-        identity_key,
+        binding_key,
         &payload.model,
     );
 
@@ -1005,7 +1005,7 @@ pub async fn post_messages_cc(
             cache_tracker,
             cache_profile,
             binding_table,
-            identity_key,
+            binding_key,
             preferred,
         )
         .await
@@ -1022,7 +1022,7 @@ pub async fn post_messages_cc(
             cache_tracker,
             cache_profile,
             binding_table,
-            identity_key,
+            binding_key,
             preferred,
         )
         .await
@@ -1043,7 +1043,7 @@ async fn handle_stream_request_buffered(
     cache_tracker: Arc<CacheTracker>,
     cache_profile: CacheProfile,
     binding_table: Arc<BindingTable>,
-    identity_key: Option<u64>,
+    binding_key: Option<u64>,
     preferred: Option<u64>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -1053,7 +1053,7 @@ async fn handle_stream_request_buffered(
             update_binding_after_call(
                 &binding_table,
                 provider.as_ref(),
-                identity_key,
+                binding_key,
                 preferred,
                 None,
                 model,
@@ -1064,7 +1064,7 @@ async fn handle_stream_request_buffered(
     update_binding_after_call(
         &binding_table,
         provider.as_ref(),
-        identity_key,
+        binding_key,
         preferred,
         Some(api_result.credential_id),
         model,

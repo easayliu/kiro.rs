@@ -136,8 +136,9 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移：
     /// - 400 Bad Request: 直接返回错误，不计入凭据失败
+    ///   （例外：INVALID_MODEL_ID 视为凭据无此模型权限，计入失败并故障转移）
     /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
-    /// - 402 MONTHLY_REQUEST_COUNT: 视为额度用尽，禁用凭据并切换
+    /// - 402 MONTHLY_REQUEST_COUNT / OVERAGE_REQUEST_LIMIT_EXCEEDED: 视为额度用尽，禁用凭据并切换
     /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
     ///
     /// # Arguments
@@ -163,8 +164,9 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移：
     /// - 400 Bad Request: 直接返回错误，不计入凭据失败
+    ///   （例外：INVALID_MODEL_ID 视为凭据无此模型权限，计入失败并故障转移）
     /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
-    /// - 402 MONTHLY_REQUEST_COUNT: 视为额度用尽，禁用凭据并切换
+    /// - 402 MONTHLY_REQUEST_COUNT / OVERAGE_REQUEST_LIMIT_EXCEEDED: 视为额度用尽，禁用凭据并切换
     /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
     ///
     /// # Arguments
@@ -298,7 +300,7 @@ impl KiroProvider {
             let body = response.text().await.unwrap_or_default();
 
             // 402 额度用尽
-            if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
+            if status.as_u16() == 402 && Self::is_quota_exhausted(&body) {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
@@ -309,6 +311,15 @@ impl KiroProvider {
 
             // 400 Bad Request
             if status.as_u16() == 400 {
+                // INVALID_MODEL_ID: 当前凭据可能无此模型权限，计入失败并故障转移
+                if Self::is_invalid_model_id(&body) {
+                    let has_available = self.token_manager.report_failure(ctx.id);
+                    if !has_available {
+                        anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    }
+                    last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                    continue;
+                }
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
@@ -483,7 +494,7 @@ impl KiroProvider {
             let body = response.text().await.unwrap_or_default();
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
-            if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
+            if status.as_u16() == 402 && Self::is_quota_exhausted(&body) {
                 tracing::warn!(
                     "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -511,8 +522,38 @@ impl KiroProvider {
                 continue;
             }
 
-            // 400 Bad Request - 请求问题，重试/切换凭据无意义
+            // 400 Bad Request
             if status.as_u16() == 400 {
+                // INVALID_MODEL_ID: 当前凭据可能无此模型权限，计入失败并故障转移
+                if Self::is_invalid_model_id(&body) {
+                    tracing::warn!(
+                        "API 请求失败（凭据可能无此模型权限，尝试 {}/{}）: {} {}",
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
+
+                    let has_available = self.token_manager.report_failure(ctx.id);
+                    if !has_available {
+                        anyhow::bail!(
+                            "{} API 请求失败（所有凭据已用尽）: {} {}",
+                            api_type,
+                            status,
+                            body
+                        );
+                    }
+
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    continue;
+                }
+
+                // 其他 400：请求侧问题，重试/切换凭据无意义
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -627,8 +668,13 @@ impl KiroProvider {
         Duration::from_millis(backoff.saturating_add(jitter))
     }
 
-    fn is_monthly_request_limit(body: &str) -> bool {
-        if body.contains("MONTHLY_REQUEST_COUNT") {
+    /// 判断 402 响应是否属于"额度用尽"场景，需要禁用凭据并故障转移：
+    /// - `MONTHLY_REQUEST_COUNT`：月度免费额度用尽
+    /// - `OVERAGE_REQUEST_LIMIT_EXCEEDED`：超额配额也用尽
+    fn is_quota_exhausted(body: &str) -> bool {
+        const REASONS: &[&str] = &["MONTHLY_REQUEST_COUNT", "OVERAGE_REQUEST_LIMIT_EXCEEDED"];
+
+        if REASONS.iter().any(|r| body.contains(r)) {
             return true;
         }
 
@@ -636,18 +682,45 @@ impl KiroProvider {
             return false;
         };
 
-        if value
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
-        {
+        let matches_reason = |v: &serde_json::Value| {
+            v.get("reason")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| REASONS.contains(&s))
+        };
+
+        if matches_reason(&value) {
             return true;
         }
 
         value
-            .pointer("/error/reason")
-            .and_then(|v| v.as_str())
-            .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
+            .pointer("/error")
+            .is_some_and(matches_reason)
+    }
+
+    /// 判断 400 响应是否属于"凭据无此模型权限"场景：
+    /// 不同凭据可能开通的模型集合不同，应允许故障转移到其他凭据。
+    fn is_invalid_model_id(body: &str) -> bool {
+        const REASON: &str = "INVALID_MODEL_ID";
+
+        if body.contains(REASON) {
+            return true;
+        }
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return false;
+        };
+
+        let matches_reason = |v: &serde_json::Value| {
+            v.get("reason")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s == REASON)
+        };
+
+        if matches_reason(&value) {
+            return true;
+        }
+
+        value.pointer("/error").is_some_and(matches_reason)
     }
 
     /// 检查响应体是否包含 bearer token 失效的特征消息
@@ -664,21 +737,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_monthly_request_limit_detects_reason() {
+    fn test_is_quota_exhausted_monthly_reason() {
         let body = r#"{"message":"You have reached the limit.","reason":"MONTHLY_REQUEST_COUNT"}"#;
-        assert!(KiroProvider::is_monthly_request_limit(body));
+        assert!(KiroProvider::is_quota_exhausted(body));
     }
 
     #[test]
-    fn test_is_monthly_request_limit_nested_reason() {
+    fn test_is_quota_exhausted_overage_reason() {
+        let body = r#"{"message":"You have reached the limit for overages.","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#;
+        assert!(KiroProvider::is_quota_exhausted(body));
+    }
+
+    #[test]
+    fn test_is_quota_exhausted_nested_reason() {
         let body = r#"{"error":{"reason":"MONTHLY_REQUEST_COUNT"}}"#;
-        assert!(KiroProvider::is_monthly_request_limit(body));
+        assert!(KiroProvider::is_quota_exhausted(body));
+
+        let body = r#"{"error":{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}}"#;
+        assert!(KiroProvider::is_quota_exhausted(body));
     }
 
     #[test]
-    fn test_is_monthly_request_limit_false() {
+    fn test_is_quota_exhausted_false() {
         let body = r#"{"message":"nope","reason":"DAILY_REQUEST_COUNT"}"#;
-        assert!(!KiroProvider::is_monthly_request_limit(body));
+        assert!(!KiroProvider::is_quota_exhausted(body));
+    }
+
+    #[test]
+    fn test_is_invalid_model_id_detects_reason() {
+        let body = r#"{"message":"Invalid model. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}"#;
+        assert!(KiroProvider::is_invalid_model_id(body));
+    }
+
+    #[test]
+    fn test_is_invalid_model_id_nested_reason() {
+        let body = r#"{"error":{"reason":"INVALID_MODEL_ID"}}"#;
+        assert!(KiroProvider::is_invalid_model_id(body));
+    }
+
+    #[test]
+    fn test_is_invalid_model_id_false() {
+        let body = r#"{"message":"bad","reason":"VALIDATION_ERROR"}"#;
+        assert!(!KiroProvider::is_invalid_model_id(body));
     }
 
     #[test]

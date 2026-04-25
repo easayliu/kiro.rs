@@ -58,15 +58,20 @@ pub struct CacheProfile {
     /// 从 metadata.user_id 提取的用户身份 hash（device_id + account_uuid + session_id），
     /// 用作缓存分桶的 bucket key，对齐 Anthropic 官方 per-workspace 隔离。
     identity_key: Option<u64>,
+    /// 粘性绑定用的 hash（device_id + account_uuid，不含 session_id）。
+    /// 同设备同账号跨 session 走同一凭证，避免 session 切换把系统 prompt/tools
+    /// 这段稳定公共前缀在新凭证上反复预热。
+    binding_key: Option<u64>,
 }
 
 impl CacheProfile {
-    /// 从 metadata.user_id 提取的用户身份 hash，供上游粘性绑定表使用。
+    /// 粘性绑定使用的用户身份 hash。
     ///
-    /// 与 cache_tracker 分桶使用的是同一把 hash，保证"绑定命中"与"缓存命中"
-    /// 的统计口径对齐，不会出现绑定视角和缓存视角错位的情况。
-    pub fn identity_key(&self) -> Option<u64> {
-        self.identity_key
+    /// 粒度比 `identity_key` 粗一档：只含 device_id + account_uuid，刻意不含
+    /// session_id。目的是让同设备同账号跨 session 的请求继续落在同一凭证，
+    /// 复用该凭证上已预热的公共前缀缓存。
+    pub fn binding_key(&self) -> Option<u64> {
+        self.binding_key
     }
 }
 
@@ -312,6 +317,7 @@ impl CacheTracker {
         }
 
         let identity_key = extract_identity_key(payload);
+        let binding_key = extract_binding_key(payload);
 
         CacheProfile {
             total_input_tokens: total_input_tokens.max(0),
@@ -319,6 +325,7 @@ impl CacheTracker {
             blocks,
             breakpoints,
             identity_key,
+            binding_key,
         }
     }
 
@@ -793,27 +800,59 @@ fn compute_segment_extras_hash(payload: &MessagesRequest, segment: BlockSegment)
 /// 2. 字符串: `user_xxx_account__session_UUID`（fallback 整串 hash）
 ///
 /// 用 device_id + account_uuid + session_id 拼接后 SHA256 取前 8 字节。
-/// 这三个字段在同一会话内稳定，不像 billing header 的 cch 每次请求都变。
+/// 给缓存分桶用，需要最细粒度（不同 session 的会话内容通常不同，
+/// 不应共享 cache bucket）。
 pub fn extract_identity_key(payload: &MessagesRequest) -> Option<u64> {
+    build_identity_str(payload, /* include_session = */ true).map(hash_to_u64)
+}
+
+/// 提取粘性绑定用的 bucket key。
+///
+/// 与 `extract_identity_key` 的区别：**不含 session_id**。
+/// - JSON 分支：只取 device_id + account_uuid
+/// - 字符串 fallback：按 `__session_` 切分，取 session 前的稳定前缀；
+///   无此分隔符则整串 hash
+///
+/// 这样同一设备同一账号跨 session 的请求会映射到同一个 binding_key，
+/// 继续落到原凭证，公共前缀（system prompt / tools / machine_id）
+/// 的上游 prompt cache 不用重新预热。
+pub fn extract_binding_key(payload: &MessagesRequest) -> Option<u64> {
+    build_identity_str(payload, /* include_session = */ false).map(hash_to_u64)
+}
+
+fn build_identity_str(payload: &MessagesRequest, include_session: bool) -> Option<String> {
     let user_id = payload.metadata.as_ref()?.user_id.as_ref()?;
     let user_id = user_id.trim();
     if user_id.is_empty() {
         return None;
     }
 
-    let identity_str = if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
+    let s = if let Ok(json) = serde_json::from_str::<serde_json::Value>(user_id) {
         let device_id = json.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
         let account_uuid = json.get("account_uuid").and_then(|v| v.as_str()).unwrap_or("");
-        let session_id = json.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-        format!("{device_id}\x00{account_uuid}\x00{session_id}")
-    } else {
+        if include_session {
+            let session_id = json.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+            format!("{device_id}\x00{account_uuid}\x00{session_id}")
+        } else {
+            format!("{device_id}\x00{account_uuid}")
+        }
+    } else if include_session {
         user_id.to_string()
+    } else {
+        // fallback 字符串形如 `user_xxx_account__session_UUID`，切掉 session 段
+        match user_id.split_once("__session_") {
+            Some((prefix, _)) => prefix.to_string(),
+            None => user_id.to_string(),
+        }
     };
+    Some(s)
+}
 
-    let hash: [u8; 32] = Sha256::digest(identity_str.as_bytes()).into();
-    Some(u64::from_be_bytes([
+fn hash_to_u64(s: String) -> u64 {
+    let hash: [u8; 32] = Sha256::digest(s.as_bytes()).into();
+    u64::from_be_bytes([
         hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
-    ]))
+    ])
 }
 
 fn mix_fingerprint(content: &[u8; 32], extras: &[u8; 32]) -> [u8; 32] {

@@ -3,8 +3,11 @@
 //! 用途：跨凭证场景下，让同一用户的请求持续落在同一个上游凭证，
 //! 避免上游 prompt cache 在每个凭证上反复预热造成成本放大。
 //!
-//! key 使用 `identity_key`（cache_tracker 从 metadata.user_id 提取的 SHA256[0..8]），
-//! value 为 credential_id。绑定状态仅在内存中维护，进程重启后全部清空。
+//! key 使用 `binding_key`（cache_tracker 从 metadata.user_id 的 device_id +
+//! account_uuid 提取的 SHA256[0..8]，刻意不含 session_id），value 为
+//! credential_id。粒度比 cache 分桶的 `identity_key` 粗一档，同一设备同账号
+//! 跨 session 的请求会继续绑到原凭证，复用稳定公共前缀（system prompt /
+//! tools / machine_id）的上游缓存。绑定状态仅在内存中维护，进程重启后全部清空。
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};

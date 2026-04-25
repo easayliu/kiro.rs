@@ -479,7 +479,7 @@ pub async fn handle_websearch_request(
     payload: &MessagesRequest,
     input_tokens: i32,
     binding_table: Arc<BindingTable>,
-    identity_key: Option<u64>,
+    binding_key: Option<u64>,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -502,7 +502,7 @@ pub async fn handle_websearch_request(
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
     // 3. 粘性绑定：解析 preferred 凭证（MCP 不按模型过滤，传 None）
-    let preferred = identity_key
+    let preferred = binding_key
         .map(|id| (id, provider.available_credential_ids(None)))
         .and_then(|(id, available)| binding_table.resolve(id, &available));
 
@@ -520,7 +520,7 @@ pub async fn handle_websearch_request(
     maintain_binding(
         &binding_table,
         &provider,
-        identity_key,
+        binding_key,
         preferred,
         actual_credential,
     );
@@ -572,11 +572,11 @@ async fn call_mcp_api(
 fn maintain_binding(
     binding_table: &BindingTable,
     provider: &crate::kiro::provider::KiroProvider,
-    identity_key: Option<u64>,
+    binding_key: Option<u64>,
     preferred: Option<u64>,
     actual: Option<u64>,
 ) {
-    let (identity, pref) = match (identity_key, preferred) {
+    let (identity, pref) = match (binding_key, preferred) {
         (Some(i), Some(p)) => (i, p),
         _ => return,
     };
