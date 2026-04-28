@@ -322,6 +322,14 @@ impl KiroProvider {
                 // INVALID_MODEL_ID: 当前凭据无此模型权限，仅 LRU 轮转到下一个凭据，
                 // 不计失败计数（避免误把健康但缺少该模型的凭据打到禁用阈值）
                 if Self::is_invalid_model_id(&body) {
+                    tracing::warn!(
+                        "MCP 请求 INVALID_MODEL_ID 轮转（cred #{}, 尝试 {}/{}）: {} {}",
+                        ctx.id,
+                        attempt + 1,
+                        max_retries,
+                        status,
+                        body
+                    );
                     self.token_manager.mark_accessed(ctx.id);
                     last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                     continue;
@@ -528,7 +536,8 @@ impl KiroProvider {
                 // 仅在 balanced 模式下才能稳定轮转，priority 模式可能反复命中同凭据。
                 if Self::is_invalid_model_id(&body) {
                     tracing::warn!(
-                        "API 请求失败（凭据可能无此模型权限，轮转到下一凭据，尝试 {}/{}）: {} {}",
+                        "API 请求 INVALID_MODEL_ID 轮转（cred #{}, 尝试 {}/{}）: {} {}",
+                        ctx.id,
                         attempt + 1,
                         max_retries,
                         status,
