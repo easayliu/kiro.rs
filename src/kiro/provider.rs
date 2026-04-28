@@ -15,7 +15,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
-use crate::model::config::TlsBackend;
+use crate::model::config::{ClientMode, TlsBackend};
 use parking_lot::Mutex;
 
 /// 每个凭据的最大重试次数
@@ -134,17 +134,48 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
-    /// 将凭据的 profile_arn 注入到请求体 JSON 中
-    fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> String {
+    /// 按凭据重写请求体：注入 `profileArn`、覆盖 `userInputMessage.origin`、
+    /// 按模式增/删 `userInputMessageContext.envState`。一次 JSON 解析完成所有改写。
+    ///
+    /// `origin` 与 `envState` 的最终来源是凭据级 `effective_client_mode`，
+    /// 用以修正 handlers 阶段以全局 `client_mode` 拼出的 body 与凭据级 headers 不一致的问题。
+    fn apply_credential_overrides(
+        request_body: &str,
+        profile_arn: &Option<String>,
+        mode: ClientMode,
+    ) -> String {
+        let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) else {
+            return request_body.to_string();
+        };
+
         if let Some(arn) = profile_arn {
-            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
-                json["profileArn"] = serde_json::Value::String(arn.clone());
-                if let Ok(body) = serde_json::to_string(&json) {
-                    return body;
+            json["profileArn"] = serde_json::Value::String(arn.clone());
+        }
+
+        if let Some(user_input) =
+            json.pointer_mut("/conversationState/currentMessage/userInputMessage")
+        {
+            user_input["origin"] = serde_json::Value::String(mode.origin().to_string());
+
+            if let Some(ctx) = user_input
+                .get_mut("userInputMessageContext")
+                .and_then(|v| v.as_object_mut())
+            {
+                if mode.is_cli() {
+                    ctx.insert(
+                        "envState".to_string(),
+                        serde_json::json!({
+                            "operatingSystem": "linux",
+                            "currentWorkingDirectory": "/home/user",
+                        }),
+                    );
+                } else {
+                    ctx.remove("envState");
                 }
             }
         }
-        request_body.to_string()
+
+        serde_json::to_string(&json).unwrap_or_else(|_| request_body.to_string())
     }
 
     /// 发送非流式 API 请求
@@ -441,8 +472,9 @@ impl KiroProvider {
             let x_amz_user_agent = config.streaming_x_amz_user_agent(&machine_id, mode);
             let user_agent = config.streaming_user_agent(&machine_id, mode);
 
-            // 注入实际凭据的 profile_arn 到请求体
-            let body = Self::inject_profile_arn(request_body, &ctx.credentials.profile_arn);
+            // 按实际凭据重写 body：profileArn / origin / envState 均按凭据级 mode 决定
+            let body =
+                Self::apply_credential_overrides(request_body, &ctx.credentials.profile_arn, mode);
 
             // 发送请求
             let mut request = self
@@ -781,45 +813,98 @@ mod tests {
         assert!(!KiroProvider::is_invalid_model_id(body));
     }
 
+    fn body_with_user_input(origin: &str, with_env_state: bool) -> String {
+        let env_state = if with_env_state {
+            r#","envState":{"operatingSystem":"darwin","currentWorkingDirectory":"/tmp"}"#
+        } else {
+            ""
+        };
+        format!(
+            r#"{{"conversationState":{{"conversationId":"c1","currentMessage":{{"userInputMessage":{{"content":"hi","modelId":"m","origin":"{origin}","userInputMessageContext":{{"tools":[]{env_state}}}}}}}}}}}"#,
+        )
+    }
+
     #[test]
-    fn test_inject_profile_arn_with_some() {
-        let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
+    fn test_apply_credential_overrides_injects_arn_and_ide_origin() {
+        let body = body_with_user_input("AI_EDITOR", false);
         let arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string());
-        let result = KiroProvider::inject_profile_arn(body, &arn);
+        let result = KiroProvider::apply_credential_overrides(&body, &arn, ClientMode::KiroIde);
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(
             json["profileArn"],
             "arn:aws:codewhisperer:us-east-1:123:profile/ABC"
         );
-        // 原有字段保留
-        assert_eq!(json["conversationState"]["conversationId"], "c1");
+        let user_input = &json["conversationState"]["currentMessage"]["userInputMessage"];
+        assert_eq!(user_input["origin"], "AI_EDITOR");
+        // KiroIde 模式不携带 envState
+        assert!(user_input["userInputMessageContext"]
+            .get("envState")
+            .is_none());
     }
 
     #[test]
-    fn test_inject_profile_arn_with_none() {
-        let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
-        let result = KiroProvider::inject_profile_arn(body, &None);
-        // 不注入 profileArn，原样返回
+    fn test_apply_credential_overrides_cli_mode_rewrites_origin_and_injects_env_state() {
+        // Body 由全局 ide 模式拼出，凭据是 cli：origin/envState 都需重写
+        let body = body_with_user_input("AI_EDITOR", false);
+        let result = KiroProvider::apply_credential_overrides(&body, &None, ClientMode::KiroCli);
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let user_input = &json["conversationState"]["currentMessage"]["userInputMessage"];
+        assert_eq!(user_input["origin"], "KIRO_CLI");
+        assert_eq!(
+            user_input["userInputMessageContext"]["envState"]["operatingSystem"],
+            "linux"
+        );
+        assert_eq!(
+            user_input["userInputMessageContext"]["envState"]["currentWorkingDirectory"],
+            "/home/user"
+        );
+        // profileArn 缺省时不注入
         assert!(json.get("profileArn").is_none());
-        assert_eq!(json["conversationState"]["conversationId"], "c1");
     }
 
     #[test]
-    fn test_inject_profile_arn_overwrites_existing() {
-        let body = r#"{"conversationState":{},"profileArn":"old-arn"}"#;
+    fn test_apply_credential_overrides_ide_mode_strips_env_state() {
+        // Body 由全局 cli 模式拼出，凭据是 ide：要把已注入的 envState 去掉，origin 改回 AI_EDITOR
+        let body = body_with_user_input("KIRO_CLI", true);
+        let result = KiroProvider::apply_credential_overrides(&body, &None, ClientMode::KiroIde);
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let user_input = &json["conversationState"]["currentMessage"]["userInputMessage"];
+        assert_eq!(user_input["origin"], "AI_EDITOR");
+        assert!(user_input["userInputMessageContext"]
+            .get("envState")
+            .is_none());
+    }
+
+    #[test]
+    fn test_apply_credential_overrides_overwrites_existing_arn() {
+        let body = format!(
+            r#"{{"profileArn":"old-arn","conversationState":{{"currentMessage":{{"userInputMessage":{{"content":"x","modelId":"m","origin":"AI_EDITOR","userInputMessageContext":{{}}}}}}}}}}"#
+        );
         let arn = Some("new-arn".to_string());
-        let result = KiroProvider::inject_profile_arn(body, &arn);
+        let result = KiroProvider::apply_credential_overrides(&body, &arn, ClientMode::KiroIde);
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["profileArn"], "new-arn");
     }
 
     #[test]
-    fn test_inject_profile_arn_invalid_json() {
+    fn test_apply_credential_overrides_invalid_json_returns_input() {
         let body = "not-valid-json";
-        let arn = Some("arn:test".to_string());
-        let result = KiroProvider::inject_profile_arn(body, &arn);
-        // 解析失败时原样返回
+        let result = KiroProvider::apply_credential_overrides(
+            body,
+            &Some("arn:test".to_string()),
+            ClientMode::KiroCli,
+        );
         assert_eq!(result, "not-valid-json");
+    }
+
+    #[test]
+    fn test_apply_credential_overrides_missing_user_input_keeps_arn_only() {
+        // 没有 currentMessage 的 body 不应崩溃，仅注入 profileArn
+        let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
+        let arn = Some("arn-x".to_string());
+        let result = KiroProvider::apply_credential_overrides(body, &arn, ClientMode::KiroCli);
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["profileArn"], "arn-x");
+        assert_eq!(json["conversationState"]["conversationId"], "c1");
     }
 }
