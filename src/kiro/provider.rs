@@ -49,11 +49,6 @@ pub struct KiroProvider {
 }
 
 impl KiroProvider {
-    /// 创建新的 KiroProvider 实例
-    pub fn new(token_manager: Arc<MultiTokenManager>) -> Self {
-        Self::with_proxy(token_manager, None)
-    }
-
     /// 获取客户端模式的 origin 值
     pub fn origin(&self) -> &'static str {
         self.token_manager.config().client_mode.origin()
