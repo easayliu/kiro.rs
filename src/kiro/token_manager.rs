@@ -407,6 +407,10 @@ struct CredentialEntry {
     success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 上游 API 429 限流冷却到期时间（None=未限流，进程内状态不持久化）
+    throttled_until: Option<DateTime<Utc>>,
+    /// 连续 429 次数，用于指数退避；成功一次即清零
+    throttle_count: u32,
 }
 
 /// 禁用原因
@@ -518,6 +522,9 @@ pub struct MultiTokenManager {
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// 上游 API 429 限流冷却时长表（秒）：第 N 次 429 取第 N-1 个元素，
+/// 超过表长后取最后一个（封顶）。
+const THROTTLE_BACKOFF_SECS: &[i64] = &[10, 20, 30, 60];
 
 /// API 调用上下文
 ///
@@ -589,6 +596,8 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     last_used_at: None,
+                    throttled_until: None,
+                    throttle_count: 0,
                 }
             })
             .collect();
@@ -711,6 +720,7 @@ impl MultiTokenManager {
             .unwrap_or(false);
 
         // 过滤可用凭据的索引
+        let now = Utc::now();
         let available_indices: Vec<usize> = entries
             .iter()
             .enumerate()
@@ -720,6 +730,13 @@ impl MultiTokenManager {
                 }
                 if is_opus && !e.credentials.supports_opus() {
                     return false;
+                }
+                // 处于 429 冷却期内的凭据视作不可用，让 balanced 模式
+                // 自然降级到下一档；冷却到期后重新进入轮转
+                if let Some(until) = e.throttled_until {
+                    if until > now {
+                        return false;
+                    }
                 }
                 true
             })
@@ -1179,6 +1196,8 @@ impl MultiTokenManager {
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
+                entry.throttled_until = None;
+                entry.throttle_count = 0;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 tracing::debug!(
@@ -1189,6 +1208,29 @@ impl MultiTokenManager {
             }
         }
         self.save_stats_debounced();
+    }
+
+    /// 报告凭据被上游 API 限流（429），按 THROTTLE_BACKOFF_SECS 表标记冷却到期时间
+    ///
+    /// 冷却期间该凭据从可用集合中剔除，balanced 模式会自然降级到下一档。
+    /// 冷却时长：第 N 次 429 取 THROTTLE_BACKOFF_SECS[N-1]，超出表长后封顶为表末值。
+    /// 一次成功调用（report_success）会清零计数与冷却。
+    pub fn report_throttled(&self, id: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.throttle_count = entry.throttle_count.saturating_add(1);
+            let idx = (entry.throttle_count as usize - 1).min(THROTTLE_BACKOFF_SECS.len() - 1);
+            let delay_secs = THROTTLE_BACKOFF_SECS[idx];
+            let now = Utc::now();
+            entry.throttled_until = Some(now + Duration::seconds(delay_secs));
+            entry.last_used_at = Some(now.to_rfc3339());
+            tracing::warn!(
+                "凭据 #{} 被上游限流，冷却 {}s（连续第 {} 次）",
+                id,
+                delay_secs,
+                entry.throttle_count
+            );
+        }
     }
 
     /// 标记凭据最近被访问过（用于 LRU 轮转，但不视为成功）
@@ -1815,6 +1857,8 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 last_used_at: None,
+                throttled_until: None,
+                throttle_count: 0,
             });
         }
 
@@ -2531,6 +2575,87 @@ mod tests {
         let (next_id, _) = manager.select_next_credential(None).expect("应选出第二个");
         assert_ne!(next_id, 3, "低优先级凭据仍不应被选");
         assert_ne!(next_id, first, "同档内 LRU 应轮到另一个");
+    }
+
+    #[test]
+    fn test_report_throttled_excludes_credential_until_cooldown_expires() {
+        // 单档内多个凭据：被 throttle 的凭据冷却期内不再被选中，
+        // 同档其他凭据继续承担流量。
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut a = KiroCredentials::default();
+        a.priority = 0;
+        a.refresh_token = Some("a".to_string());
+        let mut b = KiroCredentials::default();
+        b.priority = 0;
+        b.refresh_token = Some("b".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![a, b], None, None, false).unwrap();
+
+        // 限流凭据 1
+        manager.report_throttled(1);
+        let snap = manager.snapshot();
+        let entry1 = snap.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(entry1.success_count == 0, "throttle 不应增加 success_count");
+
+        // 连续多次选择都应落到凭据 2
+        for _ in 0..5 {
+            let (id, _) = manager.select_next_credential(None).expect("凭据 2 应可用");
+            assert_eq!(id, 2, "凭据 1 处于冷却期，应只选凭据 2");
+        }
+
+        // 一次成功后应清零冷却
+        manager.report_success(1);
+        // 现在两者都可用：last_used_at 让 LRU 又能选到凭据 1
+        let mut got_one = false;
+        for _ in 0..4 {
+            let (id, _) = manager.select_next_credential(None).unwrap();
+            if id == 1 {
+                got_one = true;
+                break;
+            }
+        }
+        assert!(got_one, "report_success 后凭据 1 应重新参与轮转");
+    }
+
+    #[test]
+    fn test_report_throttled_backoff_schedule() {
+        // 连续多次 429 的冷却时长按 THROTTLE_BACKOFF_SECS 表 [10, 20, 30, 60] 取值，
+        // 超过表长后封顶为 60s。
+        let config = Config::default();
+        let cred = KiroCredentials::default();
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+
+        let read_remaining = || -> i64 {
+            let entries = manager.entries.lock();
+            let until = entries.iter().find(|e| e.id == 1).unwrap().throttled_until.unwrap();
+            (until - Utc::now()).num_seconds()
+        };
+
+        let expected: &[i64] = &[10, 20, 30, 60];
+        for (i, want) in expected.iter().enumerate() {
+            manager.report_throttled(1);
+            let got = read_remaining();
+            assert!(
+                (got - want).abs() <= 2,
+                "第 {} 次 cooldown 期望 ~{}s，实际 {}s",
+                i + 1,
+                want,
+                got
+            );
+        }
+
+        // 继续追加几次，应稳定封顶在 60s
+        for _ in 0..3 {
+            manager.report_throttled(1);
+            let got = read_remaining();
+            assert!(
+                (got - 60).abs() <= 2,
+                "封顶后 cooldown 期望 ~60s，实际 {}s",
+                got
+            );
+        }
     }
 
     #[test]

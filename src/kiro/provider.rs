@@ -650,9 +650,10 @@ impl KiroProvider {
                     status,
                     body
                 );
-                // 429 被限流时刷新 last_used_at，让 balanced (LRU) 立即轮转到其他凭据
+                // 429 被限流时打 throttle 冷却（指数退避），冷却期间该凭据
+                // 不参与 balanced 轮转；最高优先级档全部冷却时自然降级到下一档
                 if status.as_u16() == 429 {
-                    self.token_manager.mark_accessed(ctx.id);
+                    self.token_manager.report_throttled(ctx.id);
                 }
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
