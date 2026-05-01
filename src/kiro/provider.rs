@@ -12,6 +12,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::errors::UpstreamHttpError;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -546,20 +547,19 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+                    tracing::error!("所有凭据均已用尽额度");
+                    anyhow::bail!(UpstreamHttpError {
+                        status: status.as_u16(),
+                        body,
+                        api_type: api_type.to_string(),
+                    });
                 }
 
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error = Some(anyhow::Error::new(UpstreamHttpError {
+                    status: status.as_u16(),
+                    body,
+                    api_type: api_type.to_string(),
+                }));
                 continue;
             }
 
@@ -578,12 +578,11 @@ impl KiroProvider {
                         body
                     );
                     self.token_manager.mark_accessed(ctx.id);
-                    last_error = Some(anyhow::anyhow!(
-                        "{} API 请求失败: {} {}",
-                        api_type,
-                        status,
-                        body
-                    ));
+                    last_error = Some(anyhow::Error::new(UpstreamHttpError {
+                        status: status.as_u16(),
+                        body,
+                        api_type: api_type.to_string(),
+                    }));
                     continue;
                 }
 
@@ -597,7 +596,11 @@ impl KiroProvider {
                     request_body = %outbound_body,
                     "API 400 Bad Request - dump 上游请求/响应"
                 );
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                anyhow::bail!(UpstreamHttpError {
+                    status: status.as_u16(),
+                    body,
+                    api_type: api_type.to_string(),
+                });
             }
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
@@ -623,20 +626,19 @@ impl KiroProvider {
 
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
-                    anyhow::bail!(
-                        "{} API 请求失败（所有凭据已用尽）: {} {}",
-                        api_type,
-                        status,
-                        body
-                    );
+                    tracing::error!("所有凭据均已禁用（401/403 累计达上限）");
+                    anyhow::bail!(UpstreamHttpError {
+                        status: status.as_u16(),
+                        body,
+                        api_type: api_type.to_string(),
+                    });
                 }
 
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error = Some(anyhow::Error::new(UpstreamHttpError {
+                    status: status.as_u16(),
+                    body,
+                    api_type: api_type.to_string(),
+                }));
                 continue;
             }
 
@@ -655,12 +657,11 @@ impl KiroProvider {
                 if status.as_u16() == 429 {
                     self.token_manager.report_throttled(ctx.id);
                 }
-                last_error = Some(anyhow::anyhow!(
-                    "{} API 请求失败: {} {}",
-                    api_type,
-                    status,
-                    body
-                ));
+                last_error = Some(anyhow::Error::new(UpstreamHttpError {
+                    status: status.as_u16(),
+                    body,
+                    api_type: api_type.to_string(),
+                }));
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -669,7 +670,11 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
-                anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
+                anyhow::bail!(UpstreamHttpError {
+                    status: status.as_u16(),
+                    body,
+                    api_type: api_type.to_string(),
+                });
             }
 
             // 兜底：当作可重试的瞬态错误处理（不切换凭据）
@@ -680,12 +685,11 @@ impl KiroProvider {
                 status,
                 body
             );
-            last_error = Some(anyhow::anyhow!(
-                "{} API 请求失败: {} {}",
-                api_type,
-                status,
-                body
-            ));
+            last_error = Some(anyhow::Error::new(UpstreamHttpError {
+                status: status.as_u16(),
+                body,
+                api_type: api_type.to_string(),
+            }));
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }

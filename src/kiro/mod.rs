@@ -1,6 +1,7 @@
 //! Kiro API 客户端模块
 
 pub mod binding;
+pub mod errors;
 pub mod machine_id;
 pub mod model;
 pub mod parser;

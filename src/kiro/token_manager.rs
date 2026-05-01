@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
+use crate::kiro::errors::NoAvailableCredentialsError;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -719,9 +720,8 @@ impl MultiTokenManager {
             .map(|m| m.to_lowercase().contains("opus"))
             .unwrap_or(false);
 
-        // 过滤可用凭据的索引
-        let now = Utc::now();
-        let available_indices: Vec<usize> = entries
+        // 基础可用集合：仅排除 disabled / 不支持目标模型
+        let base_indices: Vec<usize> = entries
             .iter()
             .enumerate()
             .filter(|(_, e)| {
@@ -731,44 +731,61 @@ impl MultiTokenManager {
                 if is_opus && !e.credentials.supports_opus() {
                     return false;
                 }
-                // 处于 429 冷却期内的凭据视作不可用，让 balanced 模式
-                // 自然降级到下一档；冷却到期后重新进入轮转
-                if let Some(until) = e.throttled_until {
-                    if until > now {
-                        return false;
-                    }
-                }
                 true
             })
             .map(|(i, _)| i)
             .collect();
 
-        if available_indices.is_empty() {
+        if base_indices.is_empty() {
             return None;
         }
+
+        // 进一步剔除处于 429 冷却期的凭据，得到"鲜活"集合
+        let now = Utc::now();
+        let fresh_indices: Vec<usize> = base_indices
+            .iter()
+            .copied()
+            .filter(|&i| {
+                entries[i]
+                    .throttled_until
+                    .is_none_or(|until| until <= now)
+            })
+            .collect();
+
+        // 优先在鲜活集合里挑；全员冷却时退回 base_indices（避免无意义 bail），
+        // LRU 会选 last_used_at 最早者——即最先被限流、冷却最早结束的那个。
+        let candidates: Vec<usize> = if fresh_indices.is_empty() {
+            tracing::warn!(
+                "所有可用凭据（共 {} 个）均处于 429 冷却期，回退选择 LRU 最早者",
+                base_indices.len()
+            );
+            base_indices
+        } else {
+            fresh_indices
+        };
 
         let mode = self.load_balancing_mode.lock().clone();
         let mode = mode.as_str();
 
         let selected_index = match mode {
             "balanced" => {
-                // 分档 LRU：先在可用集合内取最小 priority（最高优先级一档），
+                // 分档 LRU：先在 candidates 内取最小 priority（最高优先级一档），
                 // 再仅在该档内按 last_used_at 选最久未使用者。
                 // 高优先级档全部不可用时，min_priority 自然变为下一档的值，实现降级。
-                let min_priority = available_indices
+                let min_priority = candidates
                     .iter()
                     .map(|&i| entries[i].credentials.priority)
                     .min()?;
                 // RFC3339 时间字符串的字典序与时间序一致，可直接比较；
                 // None（从未使用）排在最前，优先分配给新加入的凭据。
-                *available_indices
+                *candidates
                     .iter()
                     .filter(|&&i| entries[i].credentials.priority == min_priority)
                     .min_by_key(|&&i| entries[i].last_used_at.clone())?
             }
             _ => {
                 // priority 模式（默认）：选择优先级最高的
-                *available_indices
+                *candidates
                     .iter()
                     .min_by_key(|&&i| entries[i].credentials.priority)?
             }
@@ -888,7 +905,10 @@ impl MultiTokenManager {
                         // 因为 available_count() 会尝试获取 entries 锁，
                         // 而此时我们已经持有该锁，会导致死锁
                         let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        anyhow::bail!(NoAvailableCredentialsError {
+                            available,
+                            total,
+                        });
                     }
                 }
                 }
@@ -911,7 +931,10 @@ impl MultiTokenManager {
                         };
                     attempt_count += 1;
                     if !has_available {
-                        anyhow::bail!("所有凭据均已禁用（0/{}）", total);
+                        anyhow::bail!(NoAvailableCredentialsError {
+                            available: 0,
+                            total,
+                        });
                     }
                 }
             }
@@ -2617,6 +2640,35 @@ mod tests {
             }
         }
         assert!(got_one, "report_success 后凭据 1 应重新参与轮转");
+    }
+
+    #[test]
+    fn test_select_falls_back_to_throttled_when_all_available_throttled() {
+        // 当所有非 disabled 凭据都处于 429 冷却期时，select_next_credential
+        // 不应返回 None；而应回退到 LRU 选最早被限流者（last_used_at 最早），
+        // 让上层不会误报"所有凭据均已禁用"。
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut a = KiroCredentials::default();
+        a.priority = 0;
+        a.refresh_token = Some("a".to_string());
+        let mut b = KiroCredentials::default();
+        b.priority = 0;
+        b.refresh_token = Some("b".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![a, b], None, None, false).unwrap();
+
+        // 先限流 1（更早），再限流 2
+        manager.report_throttled(1);
+        std::thread::sleep(StdDuration::from_millis(20));
+        manager.report_throttled(2);
+
+        // 全员冷却中，select 不应 None；按 last_used_at 最早应选凭据 1
+        let (id, _) = manager
+            .select_next_credential(None)
+            .expect("全员冷却时应回退选择，而不是返回 None");
+        assert_eq!(id, 1, "应选到最早被限流的凭据 1（其 last_used_at 最早）");
     }
 
     #[test]

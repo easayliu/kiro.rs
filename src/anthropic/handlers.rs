@@ -3,6 +3,7 @@
 use std::convert::Infallible;
 
 use anyhow::Error;
+use crate::kiro::errors::{NoAvailableCredentialsError, UpstreamHttpError};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -97,33 +98,76 @@ fn update_binding_after_call(
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
-    let err_str = err.to_string();
-
-    // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
-    if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
-        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
+    // 内部"无可用凭据"：请求未发到上游，503 服务不可用更准确
+    if let Some(no_creds) = err.downcast_ref::<NoAvailableCredentialsError>() {
+        tracing::warn!(error = %err, "服务暂时不可用：所有凭据均已禁用");
         return (
-            StatusCode::BAD_REQUEST,
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
+                "service_unavailable",
+                format!(
+                    "服务暂时不可用：所有凭据均已禁用（{}/{}）",
+                    no_creds.available, no_creds.total
+                ),
             )),
         )
             .into_response();
     }
 
-    // 单次输入太长（请求体本身超出上游限制）
-    if err_str.contains("Input is too long") {
-        tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
+    // 上游 HTTP 错误：按 status 透传（429 → 429、5xx → 502、其他 4xx → 502）
+    if let Some(upstream) = err.downcast_ref::<UpstreamHttpError>() {
+        // 上下文窗口满 / 输入过长：保留原 400 + invalid_request_error 映射
+        if upstream.body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+            tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    "Context window is full. Reduce conversation history, system prompt, or tools.",
+                )),
+            )
+                .into_response();
+        }
+        if upstream.body.contains("Input is too long") {
+            tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    "Input is too long. Reduce the size of your messages.",
+                )),
+            )
+                .into_response();
+        }
+
+        let (mapped_status, err_type) = match upstream.status {
+            429 => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
+            // 上游 5xx 仍归类为 502 Bad Gateway，避免把上游 502 直接转成下游 502
+            // 之外的歧义（如 504 Gateway Timeout 客户端可能误判为我们超时）
+            s if (500..=599).contains(&s) => (StatusCode::BAD_GATEWAY, "api_error"),
+            // 其他 4xx：维持当前 502 映射
+            _ => (StatusCode::BAD_GATEWAY, "api_error"),
+        };
+        tracing::error!(
+            upstream_status = upstream.status,
+            mapped_status = mapped_status.as_u16(),
+            "Kiro API 调用失败: {}",
+            err
+        );
         return (
-            StatusCode::BAD_REQUEST,
+            mapped_status,
             Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Input is too long. Reduce the size of your messages.",
+                err_type,
+                format!(
+                    "上游 API {}: {}",
+                    upstream.status, upstream.body
+                ),
             )),
         )
             .into_response();
     }
+
+    // 兜底（无类型信息的旧错误 / 未知内部错误）
     tracing::error!("Kiro API 调用失败: {}", err);
     (
         StatusCode::BAD_GATEWAY,
