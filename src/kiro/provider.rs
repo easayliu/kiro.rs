@@ -360,6 +360,13 @@ impl KiroProvider {
                     last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                     continue;
                 }
+                tracing::error!(
+                    cred_id = ctx.id,
+                    status = %status,
+                    response_body = %body,
+                    request_body = %request_body,
+                    "MCP 400 Bad Request - dump 上游请求/响应"
+                );
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
@@ -468,14 +475,14 @@ impl KiroProvider {
             let user_agent = config.streaming_user_agent(&machine_id, mode);
 
             // 按实际凭据重写 body：profileArn / origin / envState 均按凭据级 mode 决定
-            let body =
+            let outbound_body =
                 Self::apply_credential_overrides(request_body, &ctx.credentials.profile_arn, mode);
 
-            // 发送请求
+            // 发送请求；clone 一份留给 400 等请求侧错误时回溯实际发往上游的 payload
             let mut request = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
-                .body(body)
+                .body(outbound_body.clone())
                 .header("content-type", "application/json")
                 .header("x-amzn-codewhisperer-optout", "false")
                 .header("x-amzn-kiro-agent-mode", "vibe")
@@ -580,7 +587,16 @@ impl KiroProvider {
                     continue;
                 }
 
-                // 其他 400：请求侧问题，重试/切换凭据无意义
+                // 其他 400（如 "Improperly formed request"）：请求侧问题，
+                // 重试/切换凭据无意义。dump 出实际发往上游的 payload + 响应体，便于离线复现。
+                tracing::error!(
+                    cred_id = ctx.id,
+                    status = %status,
+                    api_type = api_type,
+                    response_body = %body,
+                    request_body = %outbound_body,
+                    "API 400 Bad Request - dump 上游请求/响应"
+                );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 

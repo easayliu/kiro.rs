@@ -697,7 +697,8 @@ impl MultiTokenManager {
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：LRU 均衡（选择最久未使用的凭据）
+    /// - balanced 模式：先按优先级分档，仅在最高优先级一档（priority 最小者）内
+    ///   做 LRU 均衡。该档凭据全部 disabled / 不支持目标模型时，自然降级到下一档。
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
@@ -734,13 +735,19 @@ impl MultiTokenManager {
 
         let selected_index = match mode {
             "balanced" => {
-                // LRU 策略：选择最久未使用的凭据（last_used_at 最早者）
+                // 分档 LRU：先在可用集合内取最小 priority（最高优先级一档），
+                // 再仅在该档内按 last_used_at 选最久未使用者。
+                // 高优先级档全部不可用时，min_priority 自然变为下一档的值，实现降级。
+                let min_priority = available_indices
+                    .iter()
+                    .map(|&i| entries[i].credentials.priority)
+                    .min()?;
+                // RFC3339 时间字符串的字典序与时间序一致，可直接比较；
                 // None（从未使用）排在最前，优先分配给新加入的凭据。
-                // RFC3339 时间字符串的字典序与时间序一致，可直接比较。
-                // 平局时按优先级排序（数字越小优先级越高）。
-                *available_indices.iter().min_by_key(|&&i| {
-                    (entries[i].last_used_at.clone(), entries[i].credentials.priority)
-                })?
+                *available_indices
+                    .iter()
+                    .filter(|&&i| entries[i].credentials.priority == min_priority)
+                    .min_by_key(|&&i| entries[i].last_used_at.clone())?
             }
             _ => {
                 // priority 模式（默认）：选择优先级最高的
@@ -2481,6 +2488,74 @@ mod tests {
         let ctx = manager.acquire_context(None, None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
+    }
+
+    #[test]
+    fn test_balanced_select_filters_by_priority_tier_then_lru() {
+        // balanced 模式下应仅在最高优先级一档内做 LRU；低优先级凭据
+        // 即使更"久未使用"也不应被选中。
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut high_a = KiroCredentials::default();
+        high_a.priority = 0;
+        high_a.refresh_token = Some("ha".to_string());
+        let mut high_b = KiroCredentials::default();
+        high_b.priority = 0;
+        high_b.refresh_token = Some("hb".to_string());
+        let mut low = KiroCredentials::default();
+        low.priority = 5;
+        low.refresh_token = Some("low".to_string());
+
+        let manager =
+            MultiTokenManager::new(config, vec![high_a, high_b, low], None, None, false).unwrap();
+
+        // 给低优先级凭据一个非常早的 last_used_at（"看起来最久未用"），
+        // 验证它不会因此抢占高优先级档。
+        manager.mark_accessed(3);
+        // 立刻覆写为很早的时间戳，绕过自然时间差
+        {
+            let mut entries = manager.entries.lock();
+            let low_entry = entries.iter_mut().find(|e| e.id == 3).unwrap();
+            low_entry.last_used_at = Some("2000-01-01T00:00:00Z".to_string());
+        }
+
+        // 高优先级档两个凭据都从未使用过，按 LRU 应选 id=1（None 排最前，
+        // 同样为 None 时按出现顺序选第一个）
+        let (id, _) = manager.select_next_credential(None).expect("应选出一个凭据");
+        assert!(id == 1 || id == 2, "必须从高优先级档（priority=0）内选取，得到 {}", id);
+        assert_ne!(id, 3, "低优先级凭据不应抢占高优先级档");
+
+        // 再选一次，high_a 已经被打上 last_used_at，high_b 仍是 None，应轮到 high_b
+        let first = id;
+        let (next_id, _) = manager.select_next_credential(None).expect("应选出第二个");
+        assert_ne!(next_id, 3, "低优先级凭据仍不应被选");
+        assert_ne!(next_id, first, "同档内 LRU 应轮到另一个");
+    }
+
+    #[test]
+    fn test_balanced_select_falls_back_when_high_priority_tier_disabled() {
+        // 高优先级档全部 disabled 时，balanced 模式应自然降级到下一档。
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut high = KiroCredentials::default();
+        high.priority = 0;
+        high.refresh_token = Some("h".to_string());
+        let mut low = KiroCredentials::default();
+        low.priority = 5;
+        low.refresh_token = Some("l".to_string());
+
+        let manager =
+            MultiTokenManager::new(config, vec![high, low], None, None, false).unwrap();
+
+        // 禁用唯一的高优先级凭据
+        for _ in 0..MAX_FAILURES_PER_CREDENTIAL {
+            manager.report_failure(1);
+        }
+
+        let (id, _) = manager.select_next_credential(None).expect("应降级到低优先级档");
+        assert_eq!(id, 2, "高优先级全部 disabled 后应降级到低优先级凭据");
     }
 
     #[tokio::test]
