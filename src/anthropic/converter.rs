@@ -431,8 +431,8 @@ fn get_image_format(media_type: &str) -> Option<String> {
 
 /// 把 Anthropic `document` block 抽成纯文本 inline 进 prompt。
 /// Kiro 上游协议没有文档槽位，只能在我方提取后拼到文本里。
-/// 支持 PDF（base64 → 抽文本）和 text/* 类型。失败时返回提示占位，
-/// 避免下游模型在不知情下作答"没看到 PDF"。
+/// 支持 PDF（base64 → 调 `pdftotext` 抽文本）和 text/* 类型。失败时返回提示
+/// 占位，避免下游模型在不知情下作答"没看到 PDF"。
 fn extract_document_text(source: &super::types::ImageSource) -> Option<String> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -441,7 +441,7 @@ fn extract_document_text(source: &super::types::ImageSource) -> Option<String> {
 
     match source.media_type.as_str() {
         "application/pdf" => match STANDARD.decode(source.data.as_bytes()) {
-            Ok(bytes) => match pdf_extract::extract_text_from_mem(&bytes) {
+            Ok(bytes) => match run_pdftotext(&bytes) {
                 Ok(text) if !text.trim().is_empty() => Some(wrap(text)),
                 Ok(_) => {
                     tracing::warn!("PDF 解析成功但无可见文本（可能是扫描件）");
@@ -475,6 +475,38 @@ fn extract_document_text(source: &super::types::ImageSource) -> Option<String> {
             Some(wrap(format!("[不支持的附件类型: {}]", other)))
         }
     }
+}
+
+/// 通过 `pdftotext`（poppler-utils）抽取 PDF 文本：
+/// 把字节流 pipe 到 stdin，从 stdout 读取纯文本。
+/// 容器镜像里需要 `apk add poppler-utils`，本地 dev 需要 `brew install poppler`。
+fn run_pdftotext(bytes: &[u8]) -> Result<String, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("pdftotext")
+        .args(["-q", "-", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("启动 pdftotext 失败（poppler-utils 未安装？）: {}", e))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        // 子进程可能因 PDF 损坏提前关闭 stdin，写入失败不致命，交给 wait 处理
+        let _ = stdin.write_all(bytes);
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("等待 pdftotext 失败: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("pdftotext 失败: {}", stderr.trim()));
+    }
+
+    String::from_utf8(output.stdout).map_err(|e| format!("pdftotext 输出非 UTF-8: {}", e))
 }
 
 /// 提取工具结果内容
