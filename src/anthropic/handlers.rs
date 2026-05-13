@@ -856,6 +856,13 @@ async fn handle_non_stream_request(
         }
     });
 
+    tracing::debug!(
+        model = %model,
+        text_len = text_content.len(),
+        response_text = %text_content,
+        "Kiro 响应文本（非流式）"
+    );
+
     (StatusCode::OK, Json(response_body)).into_response()
 }
 

@@ -578,6 +578,8 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 累计的助手响应文本（用于 debug 日志，包含 thinking 段）
+    response_text: String,
 }
 
 impl StreamContext {
@@ -605,6 +607,7 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            response_text: String::new(),
         }
     }
 
@@ -735,6 +738,9 @@ impl StreamContext {
         if content.is_empty() {
             return Vec::new();
         }
+
+        // 累计响应文本（debug 日志使用，含 thinking 段）
+        self.response_text.push_str(content);
 
         // 估算 tokens
         self.output_tokens += estimate_tokens(content);
@@ -1180,6 +1186,14 @@ impl StreamContext {
             self.cache_usage.uncached_input_tokens.max(1),
             self.output_tokens,
         ));
+
+        tracing::debug!(
+            model = %self.model,
+            text_len = self.response_text.len(),
+            response_text = %self.response_text,
+            "Kiro 响应文本（流式）"
+        );
+
         events
     }
 }
