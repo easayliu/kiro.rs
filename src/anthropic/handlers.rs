@@ -813,7 +813,8 @@ async fn handle_non_stream_request(
         if let Some(thinking_text) = thinking {
             content.push(json!({
                 "type": "thinking",
-                "thinking": thinking_text
+                "thinking": thinking_text,
+                "signature": super::stream::generate_synthetic_thinking_signature(),
             }));
         }
 
