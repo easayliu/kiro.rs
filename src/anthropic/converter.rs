@@ -381,6 +381,13 @@ fn process_message_content(
                                 }
                             }
                         }
+                        "document" => {
+                            if let Some(source) = block.source {
+                                if let Some(text) = extract_document_text(&source) {
+                                    text_parts.push(text);
+                                }
+                            }
+                        }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
                                 let result_content = extract_tool_result_content(&block.content);
@@ -419,6 +426,54 @@ fn get_image_format(media_type: &str) -> Option<String> {
         "image/gif" => Some("gif".to_string()),
         "image/webp" => Some("webp".to_string()),
         _ => None,
+    }
+}
+
+/// 把 Anthropic `document` block 抽成纯文本 inline 进 prompt。
+/// Kiro 上游协议没有文档槽位，只能在我方提取后拼到文本里。
+/// 支持 PDF（base64 → 抽文本）和 text/* 类型。失败时返回提示占位，
+/// 避免下游模型在不知情下作答"没看到 PDF"。
+fn extract_document_text(source: &super::types::ImageSource) -> Option<String> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    let wrap = |body: String| format!("<document>\n{}\n</document>", body);
+
+    match source.media_type.as_str() {
+        "application/pdf" => match STANDARD.decode(source.data.as_bytes()) {
+            Ok(bytes) => match pdf_extract::extract_text_from_mem(&bytes) {
+                Ok(text) if !text.trim().is_empty() => Some(wrap(text)),
+                Ok(_) => {
+                    tracing::warn!("PDF 解析成功但无可见文本（可能是扫描件）");
+                    Some(wrap("[PDF 附件无可提取文本，可能是扫描图片]".to_string()))
+                }
+                Err(e) => {
+                    tracing::warn!("PDF 解析失败: {}", e);
+                    Some(wrap(format!("[PDF 解析失败: {}]", e)))
+                }
+            },
+            Err(e) => {
+                tracing::warn!("PDF base64 解码失败: {}", e);
+                Some(wrap(format!("[PDF 附件 base64 解码失败: {}]", e)))
+            }
+        },
+        mt if mt.starts_with("text/") => match STANDARD.decode(source.data.as_bytes()) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => Some(wrap(text)),
+                Err(e) => {
+                    tracing::warn!("文本附件 UTF-8 解码失败: {}", e);
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!("文本附件 base64 解码失败: {}", e);
+                None
+            }
+        },
+        other => {
+            tracing::warn!("不支持的 document media_type: {}", other);
+            Some(wrap(format!("[不支持的附件类型: {}]", other)))
+        }
     }
 }
 
