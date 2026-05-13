@@ -847,12 +847,10 @@ impl StreamContext {
                     self.in_thinking_block = false;
                     self.thinking_extracted = true;
 
-                    // 发送空的 thinking_delta 事件，然后发送 signature_delta + content_block_stop
+                    // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // 发送 signature_delta（Extended Thinking 协议要求）
-                        events.push(self.create_signature_delta_event(thinking_index));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -978,27 +976,6 @@ impl StreamContext {
         )
     }
 
-    /// 创建 signature_delta 事件
-    ///
-    /// Anthropic Extended Thinking 协议要求每个 thinking block 结束前发一个
-    /// `signature_delta`（base64 字符串），客户端把 thinking 块发回时
-    /// 服务端用它校验内容未被篡改。Kiro/Bedrock 链路没有透传这个字段，
-    /// 我们也没有 Anthropic 的私钥，因此生成"看起来合理"的随机字符串以
-    /// 兼容只检查字段存在的检测站（Level 1）。
-    fn create_signature_delta_event(&self, index: i32) -> SseEvent {
-        SseEvent::new(
-            "content_block_delta",
-            json!({
-                "type": "content_block_delta",
-                "index": index,
-                "delta": {
-                    "type": "signature_delta",
-                    "signature": generate_synthetic_thinking_signature(),
-                }
-            }),
-        )
-    }
-
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
@@ -1030,8 +1007,6 @@ impl StreamContext {
                 if let Some(thinking_index) = self.thinking_block_index {
                     // 先发送空的 thinking_delta
                     events.push(self.create_thinking_delta_event(thinking_index, ""));
-                    // 发送 signature_delta（Extended Thinking 协议要求）
-                    events.push(self.create_signature_delta_event(thinking_index));
                     // 再发送 content_block_stop
                     if let Some(stop_event) =
                         self.state_manager.handle_content_block_stop(thinking_index)
@@ -1145,10 +1120,9 @@ impl StreamContext {
                         }
                     }
 
-                    // 关闭 thinking 块：thinking_delta(空) + signature_delta + content_block_stop
+                    // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        events.push(self.create_signature_delta_event(thinking_index));
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
                         {
@@ -1172,12 +1146,10 @@ impl StreamContext {
                             self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
                         );
                     }
-                    // 关闭 thinking 块：thinking_delta(空) + signature_delta + content_block_stop
+                    // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
-                        // 发送 signature_delta（Extended Thinking 协议要求）
-                        events.push(self.create_signature_delta_event(thinking_index));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -1306,18 +1278,6 @@ impl BufferedStreamContext {
 
         std::mem::take(&mut self.event_buffer)
     }
-}
-
-/// 生成 Anthropic Extended Thinking 兼容的合成 signature（base64 字符串）。
-/// Kiro 链路没有真签名，这里随机生成长度合理的 base64 串供检测站做"字段存在"
-/// 校验；任何真正的密码学校验都会失败（拿不到 Anthropic 私钥）。
-pub fn generate_synthetic_thinking_signature() -> String {
-    use base64::Engine;
-    let mut bytes = [0u8; 144]; // 144 字节 → 192 字符 base64，接近 Anthropic 真实 signature 长度
-    for b in bytes.iter_mut() {
-        *b = fastrand::u8(..);
-    }
-    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// 简单的 token 估算
