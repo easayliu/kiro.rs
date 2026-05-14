@@ -1,8 +1,8 @@
 FROM node:22-alpine AS frontend-builder
 
 WORKDIR /app/admin-ui
-COPY admin-ui/package.json admin-ui/pnpm-lock.yaml ./
-RUN npm install -g pnpm@10 && pnpm install --frozen-lockfile
+COPY admin-ui/package.json ./
+RUN npm install -g pnpm && pnpm install
 COPY admin-ui ./
 RUN pnpm build
 
@@ -19,7 +19,7 @@ RUN cargo build --release
 
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates poppler-utils
+RUN apk add --no-cache ca-certificates
 
 WORKDIR /app
 COPY --from=builder /app/target/release/kiro-rs /app/kiro-rs

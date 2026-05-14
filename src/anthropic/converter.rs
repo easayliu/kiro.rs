@@ -80,7 +80,6 @@ Complete all chunked operations without commentary.";
 /// 按照用户要求：
 /// - sonnet 4.6/4-6 → claude-sonnet-4.6
 /// - 其他 sonnet → claude-sonnet-4.5
-/// - opus 4.7/4-7 → claude-opus-4.7
 /// - opus 4.5/4-5 → claude-opus-4.5
 /// - 其他 opus → claude-opus-4.6
 /// - 所有 haiku → claude-haiku-4.5
@@ -94,9 +93,7 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-sonnet-4.5".to_string())
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("4-7") || model_lower.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
+        if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
         } else {
             Some("claude-opus-4.6".to_string())
@@ -111,16 +108,10 @@ pub fn map_model(model: &str) -> Option<String> {
 /// 根据模型名称返回对应的上下文窗口大小
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文，Opus 4.7 同样支持 1M。
+/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
 pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
-        Some(mapped)
-            if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7" =>
-        {
-            1_000_000
-        }
+        Some(mapped) if mapped == "claude-sonnet-4.6" || mapped == "claude-opus-4.6" => 1_000_000,
         _ => 200_000,
     }
 }
@@ -381,13 +372,6 @@ fn process_message_content(
                                 }
                             }
                         }
-                        "document" => {
-                            if let Some(source) = block.source {
-                                if let Some(text) = extract_document_text(&source) {
-                                    text_parts.push(text);
-                                }
-                            }
-                        }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
                                 let result_content = extract_tool_result_content(&block.content);
@@ -427,86 +411,6 @@ fn get_image_format(media_type: &str) -> Option<String> {
         "image/webp" => Some("webp".to_string()),
         _ => None,
     }
-}
-
-/// 把 Anthropic `document` block 抽成纯文本 inline 进 prompt。
-/// Kiro 上游协议没有文档槽位，只能在我方提取后拼到文本里。
-/// 支持 PDF（base64 → 调 `pdftotext` 抽文本）和 text/* 类型。失败时返回提示
-/// 占位，避免下游模型在不知情下作答"没看到 PDF"。
-fn extract_document_text(source: &super::types::ImageSource) -> Option<String> {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD;
-
-    let wrap = |body: String| format!("<document>\n{}\n</document>", body);
-
-    match source.media_type.as_str() {
-        "application/pdf" => match STANDARD.decode(source.data.as_bytes()) {
-            Ok(bytes) => match run_pdftotext(&bytes) {
-                Ok(text) if !text.trim().is_empty() => Some(wrap(text)),
-                Ok(_) => {
-                    tracing::warn!("PDF 解析成功但无可见文本（可能是扫描件）");
-                    Some(wrap("[PDF 附件无可提取文本，可能是扫描图片]".to_string()))
-                }
-                Err(e) => {
-                    tracing::warn!("PDF 解析失败: {}", e);
-                    Some(wrap(format!("[PDF 解析失败: {}]", e)))
-                }
-            },
-            Err(e) => {
-                tracing::warn!("PDF base64 解码失败: {}", e);
-                Some(wrap(format!("[PDF 附件 base64 解码失败: {}]", e)))
-            }
-        },
-        mt if mt.starts_with("text/") => match STANDARD.decode(source.data.as_bytes()) {
-            Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(text) => Some(wrap(text)),
-                Err(e) => {
-                    tracing::warn!("文本附件 UTF-8 解码失败: {}", e);
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!("文本附件 base64 解码失败: {}", e);
-                None
-            }
-        },
-        other => {
-            tracing::warn!("不支持的 document media_type: {}", other);
-            Some(wrap(format!("[不支持的附件类型: {}]", other)))
-        }
-    }
-}
-
-/// 通过 `pdftotext`（poppler-utils）抽取 PDF 文本：
-/// 把字节流 pipe 到 stdin，从 stdout 读取纯文本。
-/// 容器镜像里需要 `apk add poppler-utils`，本地 dev 需要 `brew install poppler`。
-fn run_pdftotext(bytes: &[u8]) -> Result<String, String> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
-    let mut child = Command::new("pdftotext")
-        .args(["-q", "-", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("启动 pdftotext 失败（poppler-utils 未安装？）: {}", e))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        // 子进程可能因 PDF 损坏提前关闭 stdin，写入失败不致命，交给 wait 处理
-        let _ = stdin.write_all(bytes);
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("等待 pdftotext 失败: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("pdftotext 失败: {}", stderr.trim()));
-    }
-
-    String::from_utf8(output.stdout).map_err(|e| format!("pdftotext 输出非 UTF-8: {}", e))
 }
 
 /// 提取工具结果内容
@@ -1053,18 +957,6 @@ mod tests {
         // thinking 后缀不应影响 opus 4.6 模型映射
         let result = map_model("claude-opus-4-6-thinking");
         assert_eq!(result, Some("claude-opus-4.6".to_string()));
-    }
-
-    #[test]
-    fn test_map_model_opus_4_7() {
-        assert_eq!(
-            map_model("claude-opus-4-7"),
-            Some("claude-opus-4.7".to_string())
-        );
-        assert_eq!(
-            map_model("claude-opus-4-7-thinking"),
-            Some("claude-opus-4.7".to_string())
-        );
     }
 
     #[test]
