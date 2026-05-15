@@ -8,6 +8,9 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  ProxyGroupsResponse,
+  UpsertProxyGroupRequest,
+  BatchSetCredentialGroupResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -141,5 +144,52 @@ export async function getCacheSkipRate(): Promise<{ rate: number | null }> {
 // 设置缓存查找跳过率（0.0-1.0，传 null 关闭）
 export async function setCacheSkipRate(rate: number | null): Promise<{ rate: number | null }> {
   const { data } = await api.put<{ rate: number | null }>('/config/cache-skip-rate', { rate })
+  return data
+}
+
+// ============ 代理分组管理 ============
+
+export async function listProxyGroups(): Promise<ProxyGroupsResponse> {
+  const { data } = await api.get<ProxyGroupsResponse>('/config/proxy-groups')
+  return data
+}
+
+export async function upsertProxyGroup(
+  name: string,
+  req: UpsertProxyGroupRequest
+): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>(
+    `/config/proxy-groups/${encodeURIComponent(name)}`,
+    req
+  )
+  return data
+}
+
+export async function deleteProxyGroup(name: string): Promise<SuccessResponse> {
+  const { data } = await api.delete<SuccessResponse>(
+    `/config/proxy-groups/${encodeURIComponent(name)}`
+  )
+  return data
+}
+
+export async function setCredentialGroup(
+  id: number,
+  group: string | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/group`,
+    { group }
+  )
+  return data
+}
+
+export async function batchSetCredentialGroup(
+  credentialIds: number[],
+  group: string | null,
+): Promise<BatchSetCredentialGroupResponse> {
+  const { data } = await api.post<BatchSetCredentialGroupResponse>(
+    '/credentials/group/batch',
+    { credentialIds, group },
+  )
   return data
 }

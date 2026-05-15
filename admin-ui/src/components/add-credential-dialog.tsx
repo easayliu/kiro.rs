@@ -9,7 +9,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { useAddCredential } from '@/hooks/use-credentials'
+import { useAddCredential, useProxyGroups } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
 
 interface AddCredentialDialogProps {
@@ -32,8 +32,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
+  const [group, setGroup] = useState('')
 
   const { mutate, isPending } = useAddCredential()
+  const { data: proxyGroups } = useProxyGroups()
 
   const resetForm = () => {
     setRefreshToken('')
@@ -48,6 +50,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setProxyUrl('')
     setProxyUsername('')
     setProxyPassword('')
+    setGroup('')
   }
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -79,6 +82,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
         proxyPassword: proxyPassword.trim() || undefined,
+        group: group.trim() || undefined,
       },
       {
         onSuccess: (data) => {
@@ -247,12 +251,34 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </p>
             </div>
 
+            {/* 代理分组（可选） */}
+            <div className="space-y-2">
+              <label htmlFor="group" className="text-sm font-medium">
+                代理分组
+              </label>
+              <select
+                id="group"
+                value={group}
+                onChange={(e) => setGroup(e.target.value)}
+                disabled={isPending}
+                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <option value="">不绑定分组</option>
+                {(proxyGroups?.groups || []).map(g => (
+                  <option key={g.name} value={g.name}>{g.name} — {g.proxyUrl}</option>
+                ))}
+              </select>
+              <p className="text-xs text-muted-foreground">
+                选择已有代理分组以复用其代理配置；分组优先级低于下方"独立代理"
+              </p>
+            </div>
+
             {/* 代理配置 */}
             <div className="space-y-2">
-              <label className="text-sm font-medium">代理配置</label>
+              <label className="text-sm font-medium">独立代理（覆盖分组）</label>
               <Input
                 id="proxyUrl"
-                placeholder='代理 URL（留空使用全局配置，"direct" 不使用代理）'
+                placeholder='代理 URL（留空使用分组/全局，"direct" 显式不走代理）'
                 value={proxyUrl}
                 onChange={(e) => setProxyUrl(e.target.value)}
                 disabled={isPending}
@@ -275,7 +301,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 />
               </div>
               <p className="text-xs text-muted-foreground">
-                留空使用全局代理。输入 "direct" 可显式不使用代理
+                解析顺序：独立代理 &gt; 分组代理 &gt; 全局代理。输入 "direct" 表示显式不走代理
               </p>
             </div>
           </div>

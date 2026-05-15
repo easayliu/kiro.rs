@@ -9,8 +9,9 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetCacheSkipRateRequest, SetDisabledRequest, SetGlobalCacheRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
+        AddCredentialRequest, BatchSetCredentialGroupRequest, SetCacheSkipRateRequest,
+        SetCredentialGroupRequest, SetDisabledRequest, SetGlobalCacheRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse, UpsertProxyGroupRequest,
     },
 };
 
@@ -193,6 +194,75 @@ pub async fn set_cache_skip_rate(
     Json(payload): Json<SetCacheSkipRateRequest>,
 ) -> impl IntoResponse {
     match state.service.set_cache_skip_rate(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/proxy-groups
+/// 列出所有代理分组
+pub async fn list_proxy_groups(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.list_proxy_groups())
+}
+
+/// PUT /api/admin/config/proxy-groups/:name
+/// 新增或更新指定代理分组
+pub async fn upsert_proxy_group(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    Json(payload): Json<UpsertProxyGroupRequest>,
+) -> impl IntoResponse {
+    match state.service.upsert_proxy_group(name.clone(), payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("代理分组 '{}' 已保存", name)))
+            .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// DELETE /api/admin/config/proxy-groups/:name
+/// 删除指定代理分组（引用该分组的凭据回退到全局代理）
+pub async fn delete_proxy_group(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match state.service.delete_proxy_group(&name) {
+        Ok(_) => Json(SuccessResponse::new(format!("代理分组 '{}' 已删除", name)))
+            .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/group
+/// 设置凭据所属代理分组（传 null/空表示清空）
+pub async fn set_credential_group(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialGroupRequest>,
+) -> impl IntoResponse {
+    let group_label = payload
+        .group
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(String::from);
+    match state.service.set_credential_group(id, payload) {
+        Ok(_) => {
+            let msg = match group_label {
+                Some(g) => format!("凭据 #{} 已绑定到代理分组 '{}'", id, g),
+                None => format!("凭据 #{} 已清空代理分组绑定", id),
+            };
+            Json(SuccessResponse::new(msg)).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/group/batch
+/// 批量设置凭据所属代理分组（传 null/空 group 表示清空）
+pub async fn batch_set_credential_group(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchSetCredentialGroupRequest>,
+) -> impl IntoResponse {
+    match state.service.batch_set_credential_group(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

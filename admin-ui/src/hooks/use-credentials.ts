@@ -16,8 +16,13 @@ import {
   setCacheScope,
   getCacheSkipRate,
   setCacheSkipRate,
+  listProxyGroups,
+  upsertProxyGroup,
+  deleteProxyGroup,
+  setCredentialGroup,
+  batchSetCredentialGroup,
 } from '@/api/credentials'
-import type { AddCredentialRequest } from '@/types/api'
+import type { AddCredentialRequest, UpsertProxyGroupRequest } from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -180,6 +185,60 @@ export function useSetCacheSkipRate() {
     mutationFn: setCacheSkipRate,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['cacheSkipRate'] })
+    },
+  })
+}
+
+// ============ 代理分组 ============
+
+export function useProxyGroups() {
+  return useQuery({
+    queryKey: ['proxyGroups'],
+    queryFn: listProxyGroups,
+  })
+}
+
+export function useUpsertProxyGroup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ name, req }: { name: string; req: UpsertProxyGroupRequest }) =>
+      upsertProxyGroup(name, req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxyGroups'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+export function useDeleteProxyGroup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (name: string) => deleteProxyGroup(name),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['proxyGroups'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+export function useSetCredentialGroup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, group }: { id: number; group: string | null }) =>
+      setCredentialGroup(id, group),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+export function useBatchSetCredentialGroup() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ credentialIds, group }: { credentialIds: number[]; group: string | null }) =>
+      batchSetCredentialGroup(credentialIds, group),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
 }

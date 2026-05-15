@@ -16,7 +16,8 @@ use crate::kiro::errors::UpstreamHttpError;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
-use crate::model::config::{ClientMode, TlsBackend};
+use crate::model::config::{ClientMode, ProxyGroupConfig, TlsBackend};
+use std::collections::BTreeMap;
 use parking_lot::Mutex;
 
 /// 每个凭据的最大重试次数
@@ -79,11 +80,31 @@ impl KiroProvider {
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let groups = self.token_manager.proxy_groups_snapshot();
+        let effective = credentials.effective_proxy(self.global_proxy.as_ref(), &groups);
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
         }
+
+        // cache miss：首次为该代理组合构建 client，记一条 INFO 日志
+        let source = resolve_proxy_source(credentials, &groups, self.global_proxy.is_some());
+        match &effective {
+            Some(p) => tracing::info!(
+                "代理路由建立: credential #{} ({}) → {} [来源: {}]",
+                credentials.id.unwrap_or(0),
+                credentials.email.as_deref().unwrap_or("-"),
+                p.url,
+                source,
+            ),
+            None => tracing::info!(
+                "代理路由建立: credential #{} ({}) → 直连 [来源: {}]",
+                credentials.id.unwrap_or(0),
+                credentials.email.as_deref().unwrap_or("-"),
+                source,
+            ),
+        }
+
         let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
@@ -777,6 +798,35 @@ impl KiroProvider {
     /// API 会返回 401/403 并携带此特征消息。
     fn is_bearer_token_invalid(body: &str) -> bool {
         body.contains("The bearer token included in the request is invalid")
+    }
+}
+
+/// 解析当前 credential 的有效代理来自哪个配置层级（用于日志可读性）
+fn resolve_proxy_source(
+    credentials: &KiroCredentials,
+    groups: &BTreeMap<String, ProxyGroupConfig>,
+    has_global_proxy: bool,
+) -> String {
+    if let Some(url) = credentials.proxy_url.as_deref() {
+        if url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) {
+            return "凭据自身 (direct)".to_string();
+        }
+        return "凭据自身".to_string();
+    }
+    if let Some(group_name) = credentials.group.as_deref() {
+        if let Some(group) = groups.get(group_name) {
+            if group.proxy_url.eq_ignore_ascii_case(KiroCredentials::PROXY_DIRECT) {
+                return format!("分组 {} (direct)", group_name);
+            }
+            return format!("分组 {}", group_name);
+        }
+        // group 找不到 —— effective_proxy 已经 warn，这里回退到全局
+        return format!("全局 (分组 {} 未定义)", group_name);
+    }
+    if has_global_proxy {
+        "全局".to_string()
+    } else {
+        "无代理".to_string()
     }
 }
 

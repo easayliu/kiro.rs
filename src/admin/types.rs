@@ -1,8 +1,10 @@
 //! Admin API 类型定义
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
-use crate::model::config::ClientMode;
+use crate::model::config::{ClientMode, ProxyGroupConfig};
 
 // ============ 凭据状态 ============
 
@@ -53,6 +55,9 @@ pub struct CredentialStatusItem {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 凭据所属代理分组名（用于前端展示）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 禁用原因
@@ -124,6 +129,9 @@ pub struct AddCredentialRequest {
 
     /// 凭据级代理认证密码（可选）
     pub proxy_password: Option<String>,
+
+    /// 凭据所属代理分组名称（可选）
+    pub group: Option<String>,
 
     /// Kiro API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -238,6 +246,115 @@ pub struct CacheSkipRateResponse {
 pub struct SetCacheSkipRateRequest {
     /// 目标跳过率（0.0-1.0）；传 null 表示关闭
     pub rate: Option<f32>,
+}
+
+// ============ 代理分组管理 ============
+
+/// 单个代理分组（带 name，列表展示用）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyGroupItem {
+    /// 分组名称（key）
+    pub name: String,
+    /// 代理 URL（支持 socks5/http/https，"direct" 表示显式不走代理）
+    pub proxy_url: String,
+    /// 代理认证用户名
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+    /// 代理认证密码（注意：明文返回，前端需要避免直接显示）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
+    /// 分组说明
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl ProxyGroupItem {
+    pub fn from_config(name: String, group: ProxyGroupConfig) -> Self {
+        Self {
+            name,
+            proxy_url: group.proxy_url,
+            proxy_username: group.proxy_username,
+            proxy_password: group.proxy_password,
+            description: group.description,
+        }
+    }
+}
+
+/// 代理分组列表响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyGroupsResponse {
+    pub groups: Vec<ProxyGroupItem>,
+}
+
+impl ProxyGroupsResponse {
+    pub fn from_map(map: BTreeMap<String, ProxyGroupConfig>) -> Self {
+        let groups = map
+            .into_iter()
+            .map(|(name, group)| ProxyGroupItem::from_config(name, group))
+            .collect();
+        Self { groups }
+    }
+}
+
+/// 新增/更新代理分组请求体（PUT 路径中携带 name）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpsertProxyGroupRequest {
+    pub proxy_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl UpsertProxyGroupRequest {
+    pub fn into_config(self) -> ProxyGroupConfig {
+        ProxyGroupConfig {
+            proxy_url: self.proxy_url,
+            proxy_username: self.proxy_username,
+            proxy_password: self.proxy_password,
+            description: self.description,
+        }
+    }
+}
+
+/// 设置凭据所属代理分组请求体
+///
+/// 传 `null` 或空字符串表示清空分组绑定
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialGroupRequest {
+    pub group: Option<String>,
+}
+
+/// 批量设置凭据所属代理分组请求体
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetCredentialGroupRequest {
+    pub credential_ids: Vec<u64>,
+    /// `null` 或空字符串表示清空分组绑定
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+/// 批量设置凭据所属代理分组响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetCredentialGroupResponse {
+    pub total: usize,
+    pub succeeded: Vec<u64>,
+    pub failed: Vec<BatchSetCredentialGroupFailure>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetCredentialGroupFailure {
+    pub id: u64,
+    pub error: String,
 }
 
 // ============ 通用响应 ============

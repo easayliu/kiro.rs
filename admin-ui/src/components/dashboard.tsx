@@ -19,6 +19,7 @@ import {
   Search,
   MoreHorizontal,
   Settings2,
+  Network,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -29,6 +30,7 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { ProxyGroupsDialog } from '@/components/proxy-groups-dialog'
 import {
   useCredentials,
   useDeleteCredential,
@@ -91,6 +93,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<FilterKey>('all')
   const [policiesOpen, setPoliciesOpen] = useState(false)
+  const [proxyGroupsOpen, setProxyGroupsOpen] = useState(false)
   const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const
   const [itemsPerPage, setItemsPerPage] = useState<number>(() => {
     if (typeof window === 'undefined') return 12
@@ -161,7 +164,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
       return (
         (c.email || '').toLowerCase().includes(q) ||
         String(c.id).includes(q) ||
-        (c.proxyUrl || '').toLowerCase().includes(q)
+        (c.proxyUrl || '').toLowerCase().includes(q) ||
+        (c.group || '').toLowerCase().includes(q)
       )
     })
 
@@ -602,7 +606,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <input
                     type="search"
                     inputMode="search"
-                    placeholder="搜索邮箱 / ID / 代理"
+                    placeholder="搜索邮箱 / ID / 代理 / 分组"
                     value={search}
                     onChange={e => setSearch(e.target.value)}
                     className="h-9 w-full rounded-lg border border-input bg-background pl-9 pr-9 text-sm transition-colors placeholder:text-muted-foreground/70 focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20"
@@ -660,6 +664,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     <DropdownMenuSeparator />
                     <DropdownMenuItem onClick={() => setPoliciesOpen(true)}>
                       <Settings2 /> 运行时策略
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => setProxyGroupsOpen(true)}>
+                      <Network /> 代理分组
                     </DropdownMenuItem>
                     <DropdownMenuSeparator />
                     <DropdownMenuItem
@@ -923,6 +930,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
         results={verifyResults}
         onCancel={handleCancelVerify}
       />
+      <ProxyGroupsDialog open={proxyGroupsOpen} onOpenChange={setProxyGroupsOpen} />
 
       <Dialog open={policiesOpen} onOpenChange={setPoliciesOpen}>
         <DialogContent className="sm:max-w-md">

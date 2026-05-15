@@ -5,12 +5,12 @@
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +24,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
-use crate::model::config::Config;
+use crate::model::config::{Config, ProxyGroupConfig};
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -473,6 +473,9 @@ pub struct CredentialEntrySnapshot {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 凭据所属代理分组（用于前端展示）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 禁用原因
@@ -494,6 +497,33 @@ pub struct ManagerSnapshot {
     pub available: usize,
 }
 
+/// 批量设置代理分组 - 单条失败信息
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetGroupFailure {
+    pub id: u64,
+    pub error: String,
+}
+
+/// 批量设置代理分组结果
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetGroupResult {
+    pub succeeded: Vec<u64>,
+    pub failed: Vec<BatchSetGroupFailure>,
+}
+
+fn normalize_group_name(group: Option<String>) -> Option<String> {
+    group.and_then(|g| {
+        let trimmed = g.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
 /// 多凭据 Token 管理器
 ///
 /// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
@@ -513,6 +543,8 @@ pub struct MultiTokenManager {
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// 代理分组（运行时可修改，与 config.json 中 proxyGroups 同步）
+    proxy_groups: RwLock<BTreeMap<String, ProxyGroupConfig>>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -644,6 +676,7 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let proxy_groups = config.proxy_groups.clone();
         let manager = Self {
             config,
             proxy,
@@ -653,6 +686,7 @@ impl MultiTokenManager {
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            proxy_groups: RwLock::new(proxy_groups),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -675,6 +709,93 @@ impl MultiTokenManager {
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// 获取当前生效的代理分组配置（克隆快照）
+    pub fn proxy_groups_snapshot(&self) -> BTreeMap<String, ProxyGroupConfig> {
+        self.proxy_groups.read().clone()
+    }
+
+    /// 列出当前所有代理分组（Admin API）
+    pub fn list_proxy_groups(&self) -> BTreeMap<String, ProxyGroupConfig> {
+        self.proxy_groups_snapshot()
+    }
+
+    /// 新增或更新代理分组（Admin API）
+    pub fn upsert_proxy_group(
+        &self,
+        name: String,
+        group: ProxyGroupConfig,
+    ) -> anyhow::Result<()> {
+        let trimmed = name.trim().to_string();
+        if trimmed.is_empty() {
+            anyhow::bail!("代理分组名称不能为空");
+        }
+        if group.proxy_url.trim().is_empty() {
+            anyhow::bail!("代理分组 '{}' 的 proxyUrl 不能为空", trimmed);
+        }
+
+        let previous = {
+            let mut groups = self.proxy_groups.write();
+            let prev = groups.insert(trimmed.clone(), group.clone());
+            prev
+        };
+
+        if let Err(err) = self.persist_proxy_groups() {
+            // 持久化失败时回滚
+            let mut groups = self.proxy_groups.write();
+            match previous {
+                Some(p) => {
+                    groups.insert(trimmed, p);
+                }
+                None => {
+                    groups.remove(&trimmed);
+                }
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// 删除代理分组（Admin API）
+    ///
+    /// 引用该分组的凭据会回退到全局代理
+    pub fn delete_proxy_group(&self, name: &str) -> anyhow::Result<()> {
+        let previous = {
+            let mut groups = self.proxy_groups.write();
+            groups.remove(name)
+        };
+        if previous.is_none() {
+            anyhow::bail!("代理分组不存在: {}", name);
+        }
+        if let Err(err) = self.persist_proxy_groups() {
+            // 回滚
+            if let Some(p) = previous {
+                self.proxy_groups.write().insert(name.to_string(), p);
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn persist_proxy_groups(&self) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，代理分组变更仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.proxy_groups = self.proxy_groups.read().clone();
+        config
+            .save()
+            .with_context(|| format!("持久化代理分组失败: {}", config_path.display()))?;
+        Ok(())
     }
 
     /// 获取凭据总数
@@ -1010,7 +1131,7 @@ impl MultiTokenManager {
 
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
-                let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref(), &self.proxy_groups.read());
                 let new_creds =
                     refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
 
@@ -1568,6 +1689,7 @@ impl MultiTokenManager {
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
+                    group: e.credentials.group.clone(),
                     refresh_failure_count: e.refresh_failure_count,
                     disabled_reason: e.disabled_reason.map(|r| match r {
                         DisabledReason::Manual => "Manual",
@@ -1628,6 +1750,83 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 设置凭据所属代理分组（Admin API）
+    ///
+    /// 传 None 或空字符串表示清空分组绑定（回退到全局代理）
+    pub fn set_group(&self, id: u64, group: Option<String>) -> anyhow::Result<()> {
+        let normalized = normalize_group_name(group);
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.group = normalized;
+        }
+        // 持久化更改
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 批量设置凭据所属代理分组（Admin API）
+    ///
+    /// 每个 id 单独处理：找不到的记为失败，其他正常修改；最后只 persist 一次。
+    /// persist 本身失败时回滚所有内存改动。
+    pub fn set_group_batch(
+        &self,
+        ids: &[u64],
+        group: Option<String>,
+    ) -> BatchSetGroupResult {
+        let normalized = normalize_group_name(group);
+        let mut succeeded = Vec::new();
+        let mut failed: Vec<BatchSetGroupFailure> = Vec::new();
+        let mut previous: Vec<(u64, Option<String>)> = Vec::new();
+
+        {
+            let mut entries = self.entries.lock();
+            for id in ids {
+                match entries.iter_mut().find(|e| e.id == *id) {
+                    Some(entry) => {
+                        previous.push((*id, entry.credentials.group.clone()));
+                        entry.credentials.group = normalized.clone();
+                        succeeded.push(*id);
+                    }
+                    None => failed.push(BatchSetGroupFailure {
+                        id: *id,
+                        error: format!("凭据不存在: {}", id),
+                    }),
+                }
+            }
+        }
+
+        if !succeeded.is_empty() {
+            if let Err(err) = self.persist_credentials() {
+                let msg = err.to_string();
+                // 回滚已修改的内存条目
+                let mut entries = self.entries.lock();
+                for (id, prev) in &previous {
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == *id) {
+                        entry.credentials.group = prev.clone();
+                    }
+                }
+                // 全部转为失败
+                for id in &succeeded {
+                    failed.push(BatchSetGroupFailure {
+                        id: *id,
+                        error: format!("持久化失败: {}", msg),
+                    });
+                }
+                return BatchSetGroupResult {
+                    succeeded: vec![],
+                    failed,
+                };
+            }
+        }
+
+        BatchSetGroupResult { succeeded, failed }
+    }
+
     /// 重置凭据失败计数并重新启用（Admin API）
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
         {
@@ -1686,7 +1885,7 @@ impl MultiTokenManager {
                 };
 
                 if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                    let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+                    let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref(), &self.proxy_groups.read());
                     let new_creds =
                         refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
                             .await?;
@@ -1724,7 +1923,7 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref(), &self.proxy_groups.read());
         let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
@@ -1837,7 +2036,7 @@ impl MultiTokenManager {
         let mut validated_cred = if new_cred.is_api_key_credential() {
             new_cred.clone()
         } else {
-            let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
+            let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref(), &self.proxy_groups.read());
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
         };
 
@@ -1867,6 +2066,7 @@ impl MultiTokenManager {
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
+        validated_cred.group = new_cred.group;
         validated_cred.kiro_api_key = new_cred.kiro_api_key;
 
         {
@@ -1976,7 +2176,7 @@ impl MultiTokenManager {
         let _guard = self.refresh_lock.lock().await;
 
         // 无条件调用 refresh_token
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref(), &self.proxy_groups.read());
         let new_creds =
             refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
 

@@ -11,6 +11,7 @@ import {
   MoreHorizontal,
   ChevronUp,
   ChevronDown,
+  Network,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { RelativeTime } from '@/components/relative-time'
@@ -22,6 +23,9 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import {
@@ -39,6 +43,8 @@ import {
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
+  useProxyGroups,
+  useSetCredentialGroup,
 } from '@/hooks/use-credentials'
 
 interface CredentialCardProps {
@@ -67,6 +73,8 @@ export function CredentialCard({
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+  const setCredentialGroup = useSetCredentialGroup()
+  const { data: proxyGroupsData } = useProxyGroups()
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -116,6 +124,17 @@ export function CredentialCard({
       onSuccess: res => toast.success(res.message),
       onError: err => toast.error('刷新失败: ' + (err as Error).message),
     })
+  }
+
+  const handleSetGroup = (group: string | null) => {
+    if ((credential.group || null) === group) return
+    setCredentialGroup.mutate(
+      { id: credential.id, group },
+      {
+        onSuccess: res => toast.success(res.message),
+        onError: err => toast.error('操作失败: ' + (err as Error).message),
+      },
+    )
   }
 
   const handleDelete = () => {
@@ -218,6 +237,18 @@ export function CredentialCard({
                 <>
                   <span className="text-border">·</span>
                   <span>ARN</span>
+                </>
+              )}
+              {credential.group && (
+                <>
+                  <span className="text-border">·</span>
+                  <span
+                    className="inline-flex items-center gap-0.5 text-foreground"
+                    title={`代理分组: ${credential.group}`}
+                  >
+                    <Network className="h-2.5 w-2.5" />
+                    {credential.group}
+                  </span>
                 </>
               )}
             </div>
@@ -365,6 +396,36 @@ export function CredentialCard({
               >
                 <ChevronDown /> 降低优先级
               </DropdownMenuItem>
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>
+                  <Network /> 代理分组
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent className="w-48">
+                  <DropdownMenuItem
+                    onClick={() => handleSetGroup(null)}
+                    disabled={setCredentialGroup.isPending || !credential.group}
+                  >
+                    {!credential.group && <Check />}
+                    无分组
+                  </DropdownMenuItem>
+                  {(proxyGroupsData?.groups || []).length > 0 && <DropdownMenuSeparator />}
+                  {(proxyGroupsData?.groups || []).map(g => (
+                    <DropdownMenuItem
+                      key={g.name}
+                      onClick={() => handleSetGroup(g.name)}
+                      disabled={setCredentialGroup.isPending}
+                    >
+                      {credential.group === g.name && <Check />}
+                      <span className="truncate">{g.name}</span>
+                    </DropdownMenuItem>
+                  ))}
+                  {(proxyGroupsData?.groups || []).length === 0 && (
+                    <div className="px-2 py-1.5 text-2xs text-muted-foreground">
+                      暂无分组，请先在"代理分组"中创建
+                    </div>
+                  )}
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
               <DropdownMenuSeparator />
               <DropdownMenuItem
                 onClick={() => setShowDeleteDialog(true)}

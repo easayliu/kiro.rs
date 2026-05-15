@@ -8,7 +8,8 @@ use std::fs;
 use std::path::Path;
 
 use crate::http_client::ProxyConfig;
-use crate::model::config::{ClientMode, Config};
+use crate::model::config::{ClientMode, Config, ProxyGroupConfig};
+use std::collections::BTreeMap;
 
 /// Kiro OAuth 凭证
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -80,8 +81,8 @@ pub struct KiroCredentials {
 
     /// 凭据级代理 URL（可选）
     /// 支持 http/https/socks5 协议
-    /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
-    /// 未配置时回退到全局代理配置
+    /// 特殊值 "direct" 表示显式不使用代理（即使全局/分组配置了代理）
+    /// 未配置时按 group → 全局 顺序回退
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
 
@@ -92,6 +93,11 @@ pub struct KiroCredentials {
     /// 凭据级代理认证密码（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
+
+    /// 凭据所属代理分组名称（可选）
+    /// 凭据未单独配置 proxyUrl 时，回退到 config.json 中 `proxyGroups[group]` 的配置
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 
     /// 凭据级客户端模拟模式（可选）
     /// 未配置时回退到 config.json 的 clientMode
@@ -220,22 +226,51 @@ impl KiroCredentials {
     }
 
     /// 获取有效的代理配置
-    /// 优先级：凭据代理 > 全局代理 > 无代理
-    /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
-    pub fn effective_proxy(&self, global_proxy: Option<&ProxyConfig>) -> Option<ProxyConfig> {
-        match self.proxy_url.as_deref() {
-            Some(url) if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) => None,
-            Some(url) => {
-                let mut proxy = ProxyConfig::new(url);
+    /// 优先级：凭据自身代理 > 凭据所属分组代理 > 全局代理 > 无代理
+    /// 特殊值 "direct" 在任何一层都会短路为不使用代理
+    pub fn effective_proxy(
+        &self,
+        global_proxy: Option<&ProxyConfig>,
+        groups: &BTreeMap<String, ProxyGroupConfig>,
+    ) -> Option<ProxyConfig> {
+        // 1. 凭据自身代理（最高优先级）
+        if let Some(url) = self.proxy_url.as_deref() {
+            if url.eq_ignore_ascii_case(Self::PROXY_DIRECT) {
+                return None;
+            }
+            let mut proxy = ProxyConfig::new(url);
+            if let (Some(username), Some(password)) =
+                (&self.proxy_username, &self.proxy_password)
+            {
+                proxy = proxy.with_auth(username, password);
+            }
+            return Some(proxy);
+        }
+
+        // 2. 凭据所属分组代理
+        if let Some(group_name) = self.group.as_deref() {
+            if let Some(group) = groups.get(group_name) {
+                if group.proxy_url.eq_ignore_ascii_case(Self::PROXY_DIRECT) {
+                    return None;
+                }
+                let mut proxy = ProxyConfig::new(&group.proxy_url);
                 if let (Some(username), Some(password)) =
-                    (&self.proxy_username, &self.proxy_password)
+                    (&group.proxy_username, &group.proxy_password)
                 {
                     proxy = proxy.with_auth(username, password);
                 }
-                Some(proxy)
+                return Some(proxy);
             }
-            None => global_proxy.cloned(),
+            // 命名了分组但分组不存在：记录警告，回退到全局
+            tracing::warn!(
+                "凭据 #{} 引用了未定义的代理分组 '{}'，回退到全局代理",
+                self.id.unwrap_or(0),
+                group_name
+            );
         }
+
+        // 3. 全局代理
+        global_proxy.cloned()
     }
 
     pub fn canonicalize_auth_method(&mut self) {
@@ -344,6 +379,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            group: None,
             client_mode: None,
             disabled: false,
             kiro_api_key: None,
@@ -462,6 +498,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            group: None,
             client_mode: None,
             disabled: false,
             kiro_api_key: None,
@@ -493,6 +530,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            group: None,
             client_mode: None,
             disabled: false,
             kiro_api_key: None,
@@ -607,6 +645,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            group: None,
             client_mode: None,
             disabled: false,
             kiro_api_key: None,
@@ -816,13 +855,17 @@ mod tests {
 
     // ============ 凭据级代理优先级测试 ============
 
+    fn empty_groups() -> BTreeMap<String, ProxyGroupConfig> {
+        BTreeMap::new()
+    }
+
     #[test]
     fn test_effective_proxy_credential_overrides_global() {
         let global = ProxyConfig::new("http://global:8080");
         let mut creds = KiroCredentials::default();
         creds.proxy_url = Some("socks5://cred:1080".to_string());
 
-        let result = creds.effective_proxy(Some(&global));
+        let result = creds.effective_proxy(Some(&global), &empty_groups());
         assert_eq!(result, Some(ProxyConfig::new("socks5://cred:1080")));
     }
 
@@ -834,7 +877,7 @@ mod tests {
         creds.proxy_username = Some("user".to_string());
         creds.proxy_password = Some("pass".to_string());
 
-        let result = creds.effective_proxy(Some(&global));
+        let result = creds.effective_proxy(Some(&global), &empty_groups());
         let expected = ProxyConfig::new("http://proxy:3128").with_auth("user", "pass");
         assert_eq!(result, Some(expected));
     }
@@ -845,7 +888,7 @@ mod tests {
         let mut creds = KiroCredentials::default();
         creds.proxy_url = Some("direct".to_string());
 
-        let result = creds.effective_proxy(Some(&global));
+        let result = creds.effective_proxy(Some(&global), &empty_groups());
         assert_eq!(result, None);
     }
 
@@ -855,7 +898,7 @@ mod tests {
         let mut creds = KiroCredentials::default();
         creds.proxy_url = Some("DIRECT".to_string());
 
-        let result = creds.effective_proxy(Some(&global));
+        let result = creds.effective_proxy(Some(&global), &empty_groups());
         assert_eq!(result, None);
     }
 
@@ -864,14 +907,109 @@ mod tests {
         let global = ProxyConfig::new("http://global:8080");
         let creds = KiroCredentials::default();
 
-        let result = creds.effective_proxy(Some(&global));
+        let result = creds.effective_proxy(Some(&global), &empty_groups());
         assert_eq!(result, Some(ProxyConfig::new("http://global:8080")));
     }
 
     #[test]
     fn test_effective_proxy_none_when_no_proxy() {
         let creds = KiroCredentials::default();
-        let result = creds.effective_proxy(None);
+        let result = creds.effective_proxy(None, &empty_groups());
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_effective_proxy_group_overrides_global() {
+        let global = ProxyConfig::new("http://global:8080");
+        let mut groups = BTreeMap::new();
+        groups.insert(
+            "us-pool".to_string(),
+            ProxyGroupConfig {
+                proxy_url: "socks5://us:1080".to_string(),
+                proxy_username: None,
+                proxy_password: None,
+                description: None,
+            },
+        );
+
+        let mut creds = KiroCredentials::default();
+        creds.group = Some("us-pool".to_string());
+
+        let result = creds.effective_proxy(Some(&global), &groups);
+        assert_eq!(result, Some(ProxyConfig::new("socks5://us:1080")));
+    }
+
+    #[test]
+    fn test_effective_proxy_credential_overrides_group() {
+        let global = ProxyConfig::new("http://global:8080");
+        let mut groups = BTreeMap::new();
+        groups.insert(
+            "us-pool".to_string(),
+            ProxyGroupConfig {
+                proxy_url: "socks5://us:1080".to_string(),
+                proxy_username: None,
+                proxy_password: None,
+                description: None,
+            },
+        );
+
+        let mut creds = KiroCredentials::default();
+        creds.group = Some("us-pool".to_string());
+        creds.proxy_url = Some("socks5://cred:9999".to_string());
+
+        let result = creds.effective_proxy(Some(&global), &groups);
+        assert_eq!(result, Some(ProxyConfig::new("socks5://cred:9999")));
+    }
+
+    #[test]
+    fn test_effective_proxy_group_with_auth() {
+        let mut groups = BTreeMap::new();
+        groups.insert(
+            "us-pool".to_string(),
+            ProxyGroupConfig {
+                proxy_url: "http://gp:3128".to_string(),
+                proxy_username: Some("gu".to_string()),
+                proxy_password: Some("gp".to_string()),
+                description: None,
+            },
+        );
+
+        let mut creds = KiroCredentials::default();
+        creds.group = Some("us-pool".to_string());
+
+        let result = creds.effective_proxy(None, &groups);
+        let expected = ProxyConfig::new("http://gp:3128").with_auth("gu", "gp");
+        assert_eq!(result, Some(expected));
+    }
+
+    #[test]
+    fn test_effective_proxy_group_direct_bypasses_global() {
+        let global = ProxyConfig::new("http://global:8080");
+        let mut groups = BTreeMap::new();
+        groups.insert(
+            "no-proxy".to_string(),
+            ProxyGroupConfig {
+                proxy_url: "direct".to_string(),
+                proxy_username: None,
+                proxy_password: None,
+                description: None,
+            },
+        );
+
+        let mut creds = KiroCredentials::default();
+        creds.group = Some("no-proxy".to_string());
+
+        let result = creds.effective_proxy(Some(&global), &groups);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_effective_proxy_missing_group_falls_back_to_global() {
+        let global = ProxyConfig::new("http://global:8080");
+        let mut creds = KiroCredentials::default();
+        creds.group = Some("undefined-group".to_string());
+
+        let result = creds.effective_proxy(Some(&global), &empty_groups());
+        assert_eq!(result, Some(ProxyConfig::new("http://global:8080")));
     }
 }

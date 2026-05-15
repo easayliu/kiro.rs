@@ -6,5 +6,20 @@
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
   "clientMode": "kiro-ide",
-  "kiroCliVersion": "1.29.3"
+  "kiroCliVersion": "1.29.3",
+  "proxyGroups": {
+    "us-pool": {
+      "proxyUrl": "socks5://127.0.0.1:1080",
+      "description": "美国节点（凭据通过 group=\"us-pool\" 引用）"
+    },
+    "eu-pool": {
+      "proxyUrl": "socks5://user:pass@proxy.eu.example.com:1080",
+      "proxyUsername": "user",
+      "proxyPassword": "pass"
+    },
+    "no-proxy": {
+      "proxyUrl": "direct",
+      "description": "显式不走代理（覆盖全局 proxyUrl）"
+    }
+  }
 }

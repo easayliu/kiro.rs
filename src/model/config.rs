@@ -1,5 +1,6 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -40,6 +41,27 @@ impl ClientMode {
     pub fn is_cli(&self) -> bool {
         matches!(self, ClientMode::KiroCli)
     }
+}
+
+/// 代理分组配置（共享给一组凭据使用）
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyGroupConfig {
+    /// 代理 URL，支持 http/https/socks5
+    /// 特殊值 "direct" 表示显式不使用代理（覆盖全局代理）
+    pub proxy_url: String,
+
+    /// 代理认证用户名（可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_username: Option<String>,
+
+    /// 代理认证密码（可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
+
+    /// 分组说明（可选，仅用于前端展示）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// KNA 应用配置
@@ -107,6 +129,12 @@ pub struct Config {
     /// 代理认证密码（可选）
     #[serde(default)]
     pub proxy_password: Option<String>,
+
+    /// 代理分组（可选）
+    /// 凭据通过 `group` 字段引用对应分组的代理配置
+    /// 解析优先级：凭据自身代理 > 凭据所属分组代理 > 全局代理 > 无
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub proxy_groups: BTreeMap<String, ProxyGroupConfig>,
 
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
@@ -227,6 +255,7 @@ impl Default for Config {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_groups: BTreeMap::new(),
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),

@@ -14,10 +14,12 @@ use crate::kiro::token_manager::MultiTokenManager;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CacheSkipRateResponse,
-    CredentialStatusItem, CredentialsStatusResponse, GlobalCacheResponse,
-    LoadBalancingModeResponse, SetCacheSkipRateRequest, SetGlobalCacheRequest,
-    SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse,
+    BatchSetCredentialGroupFailure, BatchSetCredentialGroupRequest,
+    BatchSetCredentialGroupResponse, CacheSkipRateResponse, CredentialStatusItem,
+    CredentialsStatusResponse, GlobalCacheResponse, LoadBalancingModeResponse,
+    ProxyGroupsResponse, SetCacheSkipRateRequest, SetCredentialGroupRequest,
+    SetGlobalCacheRequest, SetLoadBalancingModeRequest, UpsertProxyGroupRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -80,6 +82,7 @@ impl AdminService {
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
+                group: entry.group,
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
             })
@@ -214,6 +217,7 @@ impl AdminService {
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
+            group: req.group,
             client_mode: req.client_mode,
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
@@ -404,6 +408,81 @@ impl AdminService {
             .force_refresh_token_for(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))
+    }
+
+    // ============ 代理分组管理 ============
+
+    /// 列出所有代理分组
+    pub fn list_proxy_groups(&self) -> ProxyGroupsResponse {
+        ProxyGroupsResponse::from_map(self.token_manager.list_proxy_groups())
+    }
+
+    /// 新增/更新代理分组
+    pub fn upsert_proxy_group(
+        &self,
+        name: String,
+        req: UpsertProxyGroupRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .upsert_proxy_group(name, req.into_config())
+            .map_err(|e| self.classify_proxy_group_error(e))
+    }
+
+    /// 删除代理分组
+    pub fn delete_proxy_group(&self, name: &str) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .delete_proxy_group(name)
+            .map_err(|e| self.classify_proxy_group_error(e))
+    }
+
+    /// 设置凭据所属代理分组
+    pub fn set_credential_group(
+        &self,
+        id: u64,
+        req: SetCredentialGroupRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_group(id, req.group)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 批量设置凭据所属代理分组
+    pub fn batch_set_credential_group(
+        &self,
+        req: BatchSetCredentialGroupRequest,
+    ) -> Result<BatchSetCredentialGroupResponse, AdminServiceError> {
+        if req.credential_ids.is_empty() {
+            return Err(AdminServiceError::InvalidParameter(
+                "credentialIds 不能为空".to_string(),
+            ));
+        }
+        let total = req.credential_ids.len();
+        let result = self
+            .token_manager
+            .set_group_batch(&req.credential_ids, req.group);
+        Ok(BatchSetCredentialGroupResponse {
+            total,
+            succeeded: result.succeeded,
+            failed: result
+                .failed
+                .into_iter()
+                .map(|f| BatchSetCredentialGroupFailure {
+                    id: f.id,
+                    error: f.error,
+                })
+                .collect(),
+        })
+    }
+
+    fn classify_proxy_group_error(&self, e: anyhow::Error) -> AdminServiceError {
+        let msg = e.to_string();
+        if msg.contains("不存在") {
+            AdminServiceError::InvalidParameter(msg)
+        } else if msg.contains("不能为空") {
+            AdminServiceError::InvalidParameter(msg)
+        } else {
+            AdminServiceError::InternalError(msg)
+        }
     }
 
     // ============ 余额缓存持久化 ============

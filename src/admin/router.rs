@@ -2,15 +2,17 @@
 
 use axum::{
     Router, middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 
 use super::{
     handlers::{
-        add_credential, delete_credential, force_refresh_token, get_all_credentials,
-        get_cache_scope, get_cache_skip_rate, get_credential_balance, get_global_cache,
-        get_load_balancing_mode, reset_failure_count, set_cache_scope, set_cache_skip_rate,
-        set_credential_disabled, set_credential_priority, set_global_cache, set_load_balancing_mode,
+        add_credential, batch_set_credential_group, delete_credential, delete_proxy_group,
+        force_refresh_token, get_all_credentials, get_cache_scope, get_cache_skip_rate,
+        get_credential_balance, get_global_cache, get_load_balancing_mode, list_proxy_groups,
+        reset_failure_count, set_cache_scope, set_cache_skip_rate, set_credential_disabled,
+        set_credential_group, set_credential_priority, set_global_cache, set_load_balancing_mode,
+        upsert_proxy_group,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -30,6 +32,11 @@ use super::{
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
 /// - `GET /config/global-cache` - 获取全局缓存模式
 /// - `PUT /config/global-cache` - 设置全局缓存模式
+/// - `GET /config/proxy-groups` - 列出所有代理分组
+/// - `PUT /config/proxy-groups/:name` - 新增/更新代理分组
+/// - `DELETE /config/proxy-groups/:name` - 删除代理分组
+/// - `POST /credentials/:id/group` - 设置凭据所属代理分组
+/// - `POST /credentials/group/batch` - 批量设置凭据所属代理分组
 ///
 /// # 认证
 /// 需要 Admin API Key 认证，支持：
@@ -47,6 +54,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/refresh", post(force_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
+        .route("/credentials/{id}/group", post(set_credential_group))
+        .route("/credentials/group/batch", post(batch_set_credential_group))
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
@@ -62,6 +71,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/cache-skip-rate",
             get(get_cache_skip_rate).put(set_cache_skip_rate),
+        )
+        .route("/config/proxy-groups", get(list_proxy_groups))
+        .route(
+            "/config/proxy-groups/{name}",
+            put(upsert_proxy_group).delete(delete_proxy_group),
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),

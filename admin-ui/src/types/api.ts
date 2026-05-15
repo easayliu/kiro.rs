@@ -22,6 +22,8 @@ export interface CredentialStatusItem {
   lastUsedAt: string | null
   hasProxy: boolean
   proxyUrl?: string
+  /** 凭据所属代理分组名称 */
+  group?: string
   refreshFailureCount: number
   disabledReason?: string
 }
@@ -74,6 +76,8 @@ export interface AddCredentialRequest {
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
+  /** 凭据所属代理分组名称（可选） */
+  group?: string
 }
 
 // 添加凭据响应
@@ -82,4 +86,46 @@ export interface AddCredentialResponse {
   message: string
   credentialId: number
   email?: string
+}
+
+// ============ 代理分组管理 ============
+
+export interface ProxyGroupItem {
+  name: string
+  proxyUrl: string
+  proxyUsername?: string
+  proxyPassword?: string
+  description?: string
+}
+
+export interface ProxyGroupsResponse {
+  groups: ProxyGroupItem[]
+}
+
+export interface UpsertProxyGroupRequest {
+  proxyUrl: string
+  proxyUsername?: string
+  proxyPassword?: string
+  description?: string
+}
+
+export interface SetCredentialGroupRequest {
+  group: string | null
+}
+
+export interface BatchSetCredentialGroupRequest {
+  credentialIds: number[]
+  /** null/空字符串表示清空分组绑定 */
+  group: string | null
+}
+
+export interface BatchSetCredentialGroupFailure {
+  id: number
+  error: string
+}
+
+export interface BatchSetCredentialGroupResponse {
+  total: number
+  succeeded: number[]
+  failed: BatchSetCredentialGroupFailure[]
 }

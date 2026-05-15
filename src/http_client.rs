@@ -20,9 +20,21 @@ pub struct ProxyConfig {
 
 impl ProxyConfig {
     /// 从 url 创建代理配置
+    ///
+    /// 自动识别 `scheme://user:pass@host:port` 形式的内联认证：
+    /// userinfo 会被抽取到 `username`/`password` 字段，URL 字段仅保留
+    /// `scheme://host:port[/path...]`。`with_auth()` 显式调用仍可覆盖。
     pub fn new(url: impl Into<String>) -> Self {
+        let url = url.into();
+        if let Some((clean_url, username, password)) = extract_inline_userinfo(&url) {
+            return Self {
+                url: clean_url,
+                username: Some(username),
+                password: Some(password),
+            };
+        }
         Self {
-            url: url.into(),
+            url,
             username: None,
             password: None,
         }
@@ -34,6 +46,41 @@ impl ProxyConfig {
         self.password = Some(password.into());
         self
     }
+}
+
+/// 解析 URL 中的内联 userinfo（`scheme://user:pass@host[...]` → 去除 userinfo 后的 URL + user + pass）
+///
+/// 行为说明：
+/// - 仅当 userinfo 同时包含 `user` 和 `pass`（以 `:` 分隔）时才抽取，单个 user 不处理
+/// - 当密码中含 `@` 时按 **最后一个** `@` 分隔（兼容用户输入未编码的密码）
+/// - 未识别到内联 userinfo 时返回 `None`
+fn extract_inline_userinfo(url: &str) -> Option<(String, String, String)> {
+    let scheme_end = url.find("://")?;
+    let after_scheme = &url[scheme_end + 3..];
+
+    // authority 部分到第一个 '/', '?', '#' 截止
+    let authority_end = after_scheme
+        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+
+    // 在 authority 中按"最后一个 @"分隔，容忍密码中含 '@'
+    let at_pos = authority.rfind('@')?;
+    let userinfo = &authority[..at_pos];
+
+    // userinfo 必须形如 `user:pass`，单 user 不处理
+    let colon_pos = userinfo.find(':')?;
+    let user = &userinfo[..colon_pos];
+    let pass = &userinfo[colon_pos + 1..];
+    if user.is_empty() {
+        return None;
+    }
+
+    // 重组无 userinfo 的 URL
+    let rest = &after_scheme[at_pos + 1..]; // host[:port][/path...]
+    let clean_url = format!("{}://{}", &url[..scheme_end], rest);
+
+    Some((clean_url, user.to_string(), pass.to_string()))
 }
 
 /// 构建 HTTP Client
@@ -101,5 +148,79 @@ mod tests {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    // ============ 内联 userinfo 解析测试 ============
+
+    #[test]
+    fn test_inline_userinfo_socks5() {
+        // 用户提供的真实样例
+        let config = ProxyConfig::new(
+            "socks5://sub2:sfijenwpaongpiuhsfdjwDFOSwe@98.115.241.78:40031",
+        );
+        assert_eq!(config.url, "socks5://98.115.241.78:40031");
+        assert_eq!(config.username, Some("sub2".to_string()));
+        assert_eq!(config.password, Some("sfijenwpaongpiuhsfdjwDFOSwe".to_string()));
+    }
+
+    #[test]
+    fn test_inline_userinfo_http() {
+        let config = ProxyConfig::new("http://user:pass@proxy.example.com:3128");
+        assert_eq!(config.url, "http://proxy.example.com:3128");
+        assert_eq!(config.username, Some("user".to_string()));
+        assert_eq!(config.password, Some("pass".to_string()));
+    }
+
+    #[test]
+    fn test_inline_userinfo_with_path() {
+        let config = ProxyConfig::new("http://user:pass@host:8080/path?q=1");
+        assert_eq!(config.url, "http://host:8080/path?q=1");
+        assert_eq!(config.username, Some("user".to_string()));
+        assert_eq!(config.password, Some("pass".to_string()));
+    }
+
+    #[test]
+    fn test_inline_userinfo_password_with_at() {
+        // 密码里含 '@'：按最后一个 '@' 分隔
+        let config = ProxyConfig::new("socks5://u:p@ss@host:1080");
+        assert_eq!(config.url, "socks5://host:1080");
+        assert_eq!(config.username, Some("u".to_string()));
+        assert_eq!(config.password, Some("p@ss".to_string()));
+    }
+
+    #[test]
+    fn test_no_inline_userinfo_when_absent() {
+        let config = ProxyConfig::new("socks5://127.0.0.1:1080");
+        assert_eq!(config.url, "socks5://127.0.0.1:1080");
+        assert!(config.username.is_none());
+        assert!(config.password.is_none());
+    }
+
+    #[test]
+    fn test_no_inline_userinfo_when_user_only() {
+        // 只有用户名没有密码：不抽取，保留原样让 reqwest 处理
+        let config = ProxyConfig::new("http://user@host:8080");
+        assert_eq!(config.url, "http://user@host:8080");
+        assert!(config.username.is_none());
+        assert!(config.password.is_none());
+    }
+
+    #[test]
+    fn test_with_auth_overrides_inline() {
+        // 显式 with_auth 应该覆盖从 URL 解析出来的认证
+        let config = ProxyConfig::new("http://inlineuser:inlinepass@host:8080")
+            .with_auth("override_user", "override_pass");
+        assert_eq!(config.url, "http://host:8080");
+        assert_eq!(config.username, Some("override_user".to_string()));
+        assert_eq!(config.password, Some("override_pass".to_string()));
+    }
+
+    #[test]
+    fn test_inline_userinfo_does_not_eat_at_in_path() {
+        // path 中的 '@' 不应被当作 userinfo 分隔符
+        let config = ProxyConfig::new("http://host:8080/p@th");
+        assert_eq!(config.url, "http://host:8080/p@th");
+        assert!(config.username.is_none());
+        assert!(config.password.is_none());
     }
 }
