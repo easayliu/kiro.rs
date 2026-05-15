@@ -356,13 +356,19 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
     if !tools.is_empty() {
         context = context.with_tools(tools);
     }
-    if !validated_tool_results.is_empty() {
+    let has_tool_results = !validated_tool_results.is_empty();
+    if has_tool_results {
         context = context.with_tool_results(validated_tool_results);
     }
 
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
-    let content = text_content;
+    // kiro API 不接受空 content（Smithy @length(min:1)），仅有 tool_results 时用占位符兜底
+    let content = if text_content.is_empty() && has_tool_results {
+        " ".to_string()
+    } else {
+        text_content
+    };
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -834,6 +840,12 @@ fn merge_user_messages(
 
     let content = content_parts.join("\n");
     // 保留文本内容，即使有工具结果也不丢弃用户文本
+    // kiro API 不接受空 content（Smithy @length(min:1)），仅有 tool_results 时用占位符兜底
+    let content = if content.is_empty() && !all_tool_results.is_empty() {
+        " ".to_string()
+    } else {
+        content
+    };
     let mut user_msg = UserMessage::new(&content, model_id);
 
     if !all_images.is_empty() {
