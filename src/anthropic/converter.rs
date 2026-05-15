@@ -437,13 +437,14 @@ fn process_message_content(
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
+                                let mapped_id = map_tool_use_id(&tool_use_id);
                                 let result_content = extract_tool_result_content(&block.content);
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
-                                    ToolResult::error(&tool_use_id, result_content)
+                                    ToolResult::error(&mapped_id, result_content)
                                 } else {
-                                    ToolResult::success(&tool_use_id, result_content)
+                                    ToolResult::success(&mapped_id, result_content)
                                 };
                                 result.status =
                                     Some(if is_error { "error" } else { "success" }.to_string());
@@ -617,6 +618,9 @@ fn remove_orphaned_tool_uses(
 /// Kiro API 工具名称最大长度限制
 const TOOL_NAME_MAX_LEN: usize = 63;
 
+/// Kiro API tool_use_id 最大长度限制（Bedrock 标准约 64，超长会触发 400 Improperly formed request）
+const TOOL_USE_ID_MAX_LEN: usize = 64;
+
 /// 生成确定性短名称：截断前缀 + "_" + 8 位 SHA256 hex
 fn shorten_tool_name(name: &str) -> String {
     let mut hasher = Sha256::new();
@@ -640,6 +644,20 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
     let short = shorten_tool_name(name);
     tool_name_map.insert(short.clone(), name.to_string());
     short
+}
+
+/// 缩短超长 tool_use_id（确定性 hash，保证 tool_use 和 tool_result 端映射一致）
+///
+/// 短于上限的原样返回；否则用 SHA256 前缀生成 `toolu_h` + 24 位 hex（共 31 字符），
+/// 形态与 Anthropic 原生 `toolu_xxx` 兼容，避免上游 Smithy 长度校验失败。
+fn map_tool_use_id(id: &str) -> String {
+    if id.len() <= TOOL_USE_ID_MAX_LEN {
+        return id.to_string();
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(id.as_bytes());
+    let hash_hex = format!("{:x}", hasher.finalize());
+    format!("toolu_h{}", &hash_hex[..24])
 }
 
 /// 转换工具定义
@@ -894,7 +912,8 @@ fn convert_assistant_message(
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 let mapped_name = map_tool_name(&name, tool_name_map);
-                                tool_uses.push(ToolUseEntry::new(id, mapped_name).with_input(input));
+                                let mapped_id = map_tool_use_id(&id);
+                                tool_uses.push(ToolUseEntry::new(mapped_id, mapped_name).with_input(input));
                             }
                         }
                         _ => {}
