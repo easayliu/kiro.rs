@@ -344,20 +344,25 @@ pub async fn post_messages(
     let conversion_result = match convert_request(&payload, provider.origin(), provider.is_cli_mode()) {
         Ok(result) => result,
         Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
+            let (status, error_type, message) = match &e {
+                ConversionError::UnsupportedModel(model) => (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!("模型不支持: {}", model),
+                ),
+                ConversionError::EmptyMessages => (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "消息列表为空".to_string(),
+                ),
+                ConversionError::ImageTooLarge { .. } => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request_too_large",
+                    e.to_string(),
+                ),
             };
             tracing::warn!("请求转换失败: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
+            return (status, Json(ErrorResponse::new(error_type, message))).into_response();
         }
     };
 
@@ -986,20 +991,25 @@ pub async fn post_messages_cc(
     let conversion_result = match convert_request(&payload, provider.origin(), provider.is_cli_mode()) {
         Ok(result) => result,
         Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
+            let (status, error_type, message) = match &e {
+                ConversionError::UnsupportedModel(model) => (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!("模型不支持: {}", model),
+                ),
+                ConversionError::EmptyMessages => (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "消息列表为空".to_string(),
+                ),
+                ConversionError::ImageTooLarge { .. } => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request_too_large",
+                    e.to_string(),
+                ),
             };
             tracing::warn!("请求转换失败: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
+            return (status, Json(ErrorResponse::new(error_type, message))).into_response();
         }
     };
 

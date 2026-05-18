@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use base64::Engine;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -187,6 +188,12 @@ pub struct ConversionResult {
 pub enum ConversionError {
     UnsupportedModel(String),
     EmptyMessages,
+    /// 当前消息图片维度超出上游限制
+    ImageTooLarge {
+        width: u32,
+        height: u32,
+        max_side: u32,
+    },
 }
 
 impl std::fmt::Display for ConversionError {
@@ -194,6 +201,15 @@ impl std::fmt::Display for ConversionError {
         match self {
             ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
+            ConversionError::ImageTooLarge {
+                width,
+                height,
+                max_side,
+            } => write!(
+                f,
+                "图片 {}×{} 像素超过上游限制（长边 ≤ {}），请缩放（推荐长边 ≤ 1568）",
+                width, height, max_side
+            ),
         }
     }
 }
@@ -313,6 +329,20 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
     // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
     let last_message = messages.last().unwrap();
     let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
+
+    // 5.5. 当前消息图片维度预校验：上游对单图长边有硬上限（8000），超过会以
+    // "Improperly formed request" 拒绝。提前拦截给出可读错误。
+    for img in &images {
+        if let Some((w, h)) = image_dimensions(&img.source.bytes, &img.format) {
+            if w > KIRO_MAX_IMAGE_SIDE || h > KIRO_MAX_IMAGE_SIDE {
+                return Err(ConversionError::ImageTooLarge {
+                    width: w,
+                    height: h,
+                    max_side: KIRO_MAX_IMAGE_SIDE,
+                });
+            }
+        }
+    }
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
@@ -624,6 +654,67 @@ const TOOL_USE_ID_MAX_LEN: usize = 64;
 /// Kiro 上游请求体上限（AWS CodeWhisperer Smithy 层约 4MB，超过会以 "Improperly
 /// formed request" 形式 400）。这里留 256KB 缓冲给请求外壳/profileArn 等元数据。
 pub const KIRO_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024 - 256 * 1024;
+
+/// 单图长边像素上限（AWS Bedrock Claude 文档绝对上限 8000×8000；超过会 400
+/// "Improperly formed request"）。Anthropic 官方推荐长边 ≤ 1568 像素以达到最佳效果，
+/// 这里只在硬上限处拦截，把"推荐值"放在错误提示里告知用户。
+pub const KIRO_MAX_IMAGE_SIDE: u32 = 8000;
+
+/// 解析 base64 图片头部，返回 (width, height)
+///
+/// PNG：解码前 24 字节，IHDR 在 byte 16-23（大端宽 + 大端高）。
+/// JPEG：解码前 ~64 字节扫 SOFn 标记。
+/// 其它格式或解析失败返回 None，调用方按"通过"处理（避免误杀）。
+pub fn image_dimensions(b64_data: &str, format: &str) -> Option<(u32, u32)> {
+    let head_chars: String = b64_data.chars().take(96).collect();
+    let head = base64::engine::general_purpose::STANDARD
+        .decode(head_chars)
+        .ok()?;
+
+    match format {
+        "png" => {
+            // PNG: 8-byte signature + IHDR (4 length + 4 type + 4 width + 4 height + ...)
+            if head.len() < 24 {
+                return None;
+            }
+            const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+            if head[..8] != PNG_SIG {
+                return None;
+            }
+            let w = u32::from_be_bytes(head[16..20].try_into().ok()?);
+            let h = u32::from_be_bytes(head[20..24].try_into().ok()?);
+            Some((w, h))
+        }
+        "jpeg" => {
+            // JPEG 起始 FFD8FF，逐段跳过到首个 SOFn (FFC0..FFCF, 排除 C4/C8/CC)
+            if head.len() < 4 || head[0] != 0xff || head[1] != 0xd8 {
+                return None;
+            }
+            let mut i = 2;
+            while i + 9 < head.len() {
+                if head[i] != 0xff {
+                    return None;
+                }
+                let marker = head[i + 1];
+                // SOFn: C0..CF 排除 C4/C8/CC
+                if (0xc0..=0xcf).contains(&marker) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
+                    // FF Cn LL LL PP HH HH WW WW
+                    if i + 9 >= head.len() {
+                        return None;
+                    }
+                    let h = u16::from_be_bytes([head[i + 5], head[i + 6]]) as u32;
+                    let w = u16::from_be_bytes([head[i + 7], head[i + 8]]) as u32;
+                    return Some((w, h));
+                }
+                // segment length 在 marker 之后 2 字节（含自身）
+                let seg_len = u16::from_be_bytes([head[i + 2], head[i + 3]]) as usize;
+                i += 2 + seg_len;
+            }
+            None
+        }
+        _ => None,
+    }
+}
 
 /// 生成确定性短名称：截断前缀 + "_" + 8 位 SHA256 hex
 fn shorten_tool_name(name: &str) -> String {
@@ -1478,6 +1569,78 @@ mod tests {
         );
         // 原始文字也得保留
         assert!(first.user_input_message.content.contains("look at these"));
+    }
+
+    #[test]
+    fn test_image_dimensions_png_parses_width_height() {
+        // 手工构造 PNG 头：sig + IHDR(13) + "IHDR" + width(BE) + height(BE) + 5 dummy
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+        bytes.extend_from_slice(&[0, 0, 0, 13]); // IHDR length
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&8619u32.to_be_bytes()); // width
+        bytes.extend_from_slice(&5315u32.to_be_bytes()); // height
+        bytes.extend_from_slice(&[0, 0, 0, 0, 0]); // depth/color/etc
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let dims = image_dimensions(&b64, "png");
+        assert_eq!(dims, Some((8619, 5315)));
+    }
+
+    #[test]
+    fn test_image_dimensions_non_png_returns_none() {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"not a png");
+        assert_eq!(image_dimensions(&b64, "png"), None);
+        assert_eq!(image_dimensions(&b64, "webp"), None);
+    }
+
+    #[test]
+    fn test_convert_request_rejects_oversize_current_image() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 构造 8619×5315 的 PNG 头（复刻日志里的图）
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+        bytes.extend_from_slice(&[0, 0, 0, 13]);
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&8619u32.to_be_bytes());
+        bytes.extend_from_slice(&5315u32.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 16,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "look"},
+                    {"type": "image", "source": {"type":"base64","media_type":"image/png","data": b64}}
+                ]),
+            }],
+            system: None,
+            stream: false,
+            tools: None,
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let err = convert_request(&req, "AI_EDITOR", false).unwrap_err();
+        match err {
+            ConversionError::ImageTooLarge { width, height, max_side } => {
+                assert_eq!(width, 8619);
+                assert_eq!(height, 5315);
+                assert_eq!(max_side, KIRO_MAX_IMAGE_SIDE);
+            }
+            other => panic!("expected ImageTooLarge, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_kiro_max_image_side_within_aws_documented_limit() {
+        assert!(KIRO_MAX_IMAGE_SIDE <= 8000);
+        assert!(KIRO_MAX_IMAGE_SIDE >= 1568);
     }
 
     #[test]
