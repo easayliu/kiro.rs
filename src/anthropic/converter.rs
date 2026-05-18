@@ -621,6 +621,10 @@ const TOOL_NAME_MAX_LEN: usize = 63;
 /// Kiro API tool_use_id 最大长度限制（Bedrock 标准约 64，超长会触发 400 Improperly formed request）
 const TOOL_USE_ID_MAX_LEN: usize = 64;
 
+/// Kiro 上游请求体上限（AWS CodeWhisperer Smithy 层约 4MB，超过会以 "Improperly
+/// formed request" 形式 400）。这里留 256KB 缓冲给请求外壳/profileArn 等元数据。
+pub const KIRO_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024 - 256 * 1024;
+
 /// 生成确定性短名称：截断前缀 + "_" + 8 位 SHA256 hex
 fn shorten_tool_name(name: &str) -> String {
     let mut hasher = Sha256::new();
@@ -666,8 +670,21 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
         return Vec::new();
     };
 
-    tools
+    // 过滤掉 name 为空的工具：客户端无法调用空名工具，且上游 Kiro 对工具名做
+    // Smithy @length(min:1) 校验，整条请求会被 400 拒绝。
+    let (valid, invalid): (Vec<_>, Vec<_>) = tools
         .iter()
+        .partition(|t| !t.name.trim().is_empty());
+    if !invalid.is_empty() {
+        tracing::warn!(
+            dropped = invalid.len(),
+            total = tools.len(),
+            "过滤掉 name 为空的工具定义，避免上游 400 Improperly formed request"
+        );
+    }
+
+    valid
+        .into_iter()
         .map(|t| {
             let mut description = t.description.clone();
 
@@ -839,12 +856,17 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 }
 
 /// 合并多个 user 消息
+///
+/// 历史轮次的图片不再透传到上游：上游对单次请求体有体量上限
+/// （AWS CodeWhisperer ~4MB Smithy 校验，超过会以 "Improperly formed
+/// request" 形式 400），多轮带图很容易撑爆。模型对历史图的注意力本来就低，
+/// 这里只保留一句占位文本告知图片存在，节省 payload。
 fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
-    let mut all_images = Vec::new();
+    let mut omitted_images = 0usize;
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
@@ -852,8 +874,15 @@ fn merge_user_messages(
         if !text.is_empty() {
             content_parts.push(text);
         }
-        all_images.extend(images);
+        omitted_images += images.len();
         all_tool_results.extend(tool_results);
+    }
+
+    if omitted_images > 0 {
+        content_parts.insert(
+            0,
+            format!("[{} image(s) omitted from history]", omitted_images),
+        );
     }
 
     let content = content_parts.join("\n");
@@ -864,17 +893,15 @@ fn merge_user_messages(
     } else {
         content
     };
-    let mut user_msg = UserMessage::new(&content, model_id);
+    let user_msg = UserMessage::new(&content, model_id);
 
-    if !all_images.is_empty() {
-        user_msg = user_msg.with_images(all_images);
-    }
-
-    if !all_tool_results.is_empty() {
+    let user_msg = if !all_tool_results.is_empty() {
         let mut ctx = UserInputMessageContext::new();
         ctx = ctx.with_tool_results(all_tool_results);
-        user_msg = user_msg.with_context(ctx);
-    }
+        user_msg.with_context(ctx)
+    } else {
+        user_msg
+    };
 
     Ok(HistoryUserMessage {
         user_input_message: user_msg,
@@ -1329,6 +1356,135 @@ mod tests {
             tools.iter().any(|t| t.tool_specification.name == "read"),
             "tools 列表应包含 'read' 工具的占位符定义"
         );
+    }
+
+    #[test]
+    fn test_convert_tools_filters_empty_name() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert("properties".to_string(), serde_json::json!({}));
+
+        // 模拟 OpenClaw 客户端发来的脏数据：16 个空 name 工具混在 1 个正常工具中
+        let mut tools: Vec<AnthropicTool> = (0..16)
+            .map(|_| AnthropicTool {
+                name: String::new(),
+                description: String::new(),
+                input_schema: schema.clone(),
+                tool_type: None,
+                max_uses: None,
+                cache_control: None,
+            })
+            .collect();
+        tools.push(AnthropicTool {
+            name: "valid_tool".to_string(),
+            description: "ok".to_string(),
+            input_schema: schema.clone(),
+            tool_type: None,
+            max_uses: None,
+            cache_control: None,
+        });
+        // 一个 name 只包含空白字符的也要被过滤
+        tools.push(AnthropicTool {
+            name: "   ".to_string(),
+            description: "blank".to_string(),
+            input_schema: schema.clone(),
+            tool_type: None,
+            max_uses: None,
+            cache_control: None,
+        });
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+            system: None,
+            stream: false,
+            tools: Some(tools),
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req, "AI_EDITOR", false).unwrap();
+        let kiro_tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+
+        assert_eq!(kiro_tools.len(), 1, "只保留 1 个 name 非空的工具");
+        assert_eq!(kiro_tools[0].tool_specification.name, "valid_tool");
+    }
+
+    #[test]
+    fn test_history_images_dropped_with_placeholder() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 历史里一条 user 消息带 2 张图 + 一行文字；当前消息是纯文本
+        let tiny_b64 = "iVBORw0KGgo="; // 小占位
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 64,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "look at these"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": tiny_b64}},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": tiny_b64}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("seen"),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("follow up"),
+                },
+            ],
+            system: None,
+            stream: false,
+            tools: None,
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req, "AI_EDITOR", false).unwrap();
+
+        // 历史里第一条 user 应该不含图，但 content 头部应有占位符
+        let history = &result.conversation_state.history;
+        let first = match &history[0] {
+            Message::User(h) => h,
+            _ => panic!("expected User"),
+        };
+        assert!(first.user_input_message.images.is_empty(), "历史图片应被丢弃");
+        assert!(
+            first
+                .user_input_message
+                .content
+                .contains("[2 image(s) omitted from history]"),
+            "应在历史文本里追加占位符，实际: {:?}",
+            first.user_input_message.content
+        );
+        // 原始文字也得保留
+        assert!(first.user_input_message.content.contains("look at these"));
+    }
+
+    #[test]
+    fn test_kiro_max_request_bytes_constant_is_below_aws_limit() {
+        // sanity check: 上限留了缓冲，且明显小于 4MB
+        assert!(KIRO_MAX_REQUEST_BYTES < 4 * 1024 * 1024);
+        assert!(KIRO_MAX_REQUEST_BYTES >= 3 * 1024 * 1024);
     }
 
     #[test]
