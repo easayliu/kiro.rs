@@ -25,6 +25,7 @@ import {
   batchSetCredentialGroup,
   batchSetPriority,
   batchSetRpmLimit,
+  batchSetDisabled,
   getDefaultRpmLimit,
   setDefaultRpmLimit,
 } from '@/api/credentials'
@@ -293,6 +294,17 @@ export function useBatchSetRpmLimit() {
   return useMutation({
     mutationFn: ({ credentialIds, rpmLimit }: { credentialIds: number[]; rpmLimit: number | null }) =>
       batchSetRpmLimit(credentialIds, rpmLimit),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+export function useBatchSetDisabled() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ credentialIds, disabled }: { credentialIds: number[]; disabled: boolean }) =>
+      batchSetDisabled(credentialIds, disabled),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

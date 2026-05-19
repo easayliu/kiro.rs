@@ -1860,6 +1860,82 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 批量设置凭据启用/禁用状态（Admin API）
+    ///
+    /// 合并 IO + 失败回滚；语义与单条 [`Self::set_disabled`] 一致：
+    /// - 启用时清空失败计数与 disabled_reason
+    /// - 禁用时设置 disabled_reason=Manual
+    /// 已处于目标状态的凭据被视为成功（幂等）。
+    pub fn set_disabled_batch(&self, ids: &[u64], disabled: bool) -> BatchSetGroupResult {
+        let mut succeeded = Vec::new();
+        let mut failed: Vec<BatchSetGroupFailure> = Vec::new();
+        let mut previous: Vec<(u64, bool, u32, u32, Option<DisabledReason>)> = Vec::new();
+
+        {
+            let mut entries = self.entries.lock();
+            for id in ids {
+                match entries.iter_mut().find(|e| e.id == *id) {
+                    Some(entry) => {
+                        previous.push((
+                            *id,
+                            entry.disabled,
+                            entry.failure_count,
+                            entry.refresh_failure_count,
+                            entry.disabled_reason,
+                        ));
+                        entry.disabled = disabled;
+                        if disabled {
+                            entry.disabled_reason = Some(DisabledReason::Manual);
+                        } else {
+                            entry.failure_count = 0;
+                            entry.refresh_failure_count = 0;
+                            entry.disabled_reason = None;
+                        }
+                        succeeded.push(*id);
+                    }
+                    None => failed.push(BatchSetGroupFailure {
+                        id: *id,
+                        error: format!("凭据不存在: {}", id),
+                    }),
+                }
+            }
+        }
+
+        if !succeeded.is_empty() {
+            if let Err(err) = self.persist_credentials() {
+                let msg = err.to_string();
+                let mut entries = self.entries.lock();
+                for (id, prev_disabled, prev_fc, prev_rfc, prev_reason) in &previous {
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == *id) {
+                        entry.disabled = *prev_disabled;
+                        entry.failure_count = *prev_fc;
+                        entry.refresh_failure_count = *prev_rfc;
+                        entry.disabled_reason = *prev_reason;
+                    }
+                }
+                for id in &succeeded {
+                    failed.push(BatchSetGroupFailure {
+                        id: *id,
+                        error: format!("持久化失败: {}", msg),
+                    });
+                }
+                return BatchSetGroupResult {
+                    succeeded: vec![],
+                    failed,
+                };
+            }
+            // 禁用了当前活跃凭据时切换到下一个
+            if disabled {
+                let current_id = *self.current_id.lock();
+                if succeeded.contains(&current_id) {
+                    let _ = self.switch_to_next();
+                }
+            }
+        }
+
+        BatchSetGroupResult { succeeded, failed }
+    }
+
     /// 批量设置凭据优先级（Admin API）
     ///
     /// 内存写入和持久化合并为单次磁盘 IO；持久化失败时回滚所有已修改条目，

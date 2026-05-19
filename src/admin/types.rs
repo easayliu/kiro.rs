@@ -407,6 +407,23 @@ pub struct BatchSetPriorityResponse {
     pub failed: Vec<BatchSetCredentialGroupFailure>,
 }
 
+/// 批量设置凭据启用/禁用请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetDisabledRequest {
+    pub credential_ids: Vec<u64>,
+    pub disabled: bool,
+}
+
+/// 批量设置凭据启用/禁用响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetDisabledResponse {
+    pub total: usize,
+    pub succeeded: Vec<u64>,
+    pub failed: Vec<BatchSetCredentialGroupFailure>,
+}
+
 /// 批量设置凭据 RPM 上限请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

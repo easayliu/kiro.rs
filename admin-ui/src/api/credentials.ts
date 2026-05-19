@@ -14,6 +14,7 @@ import type {
   BatchSetCredentialGroupResponse,
   BatchSetPriorityResponse,
   BatchSetRpmLimitResponse,
+  BatchSetDisabledResponse,
   DefaultRpmLimitResponse,
   MeResponse,
 } from '@/types/api'
@@ -235,6 +236,17 @@ export async function batchSetRpmLimit(
   const { data } = await api.post<BatchSetRpmLimitResponse>(
     '/credentials/rpm-limit/batch',
     { credentialIds, rpmLimit },
+  )
+  return data
+}
+
+export async function batchSetDisabled(
+  credentialIds: number[],
+  disabled: boolean,
+): Promise<BatchSetDisabledResponse> {
+  const { data } = await api.post<BatchSetDisabledResponse>(
+    '/credentials/disabled/batch',
+    { credentialIds, disabled },
   )
   return data
 }

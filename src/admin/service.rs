@@ -16,9 +16,10 @@ use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse,
     BatchSetCredentialGroupFailure, BatchSetCredentialGroupRequest,
-    BatchSetCredentialGroupResponse, BatchSetPriorityRequest, BatchSetPriorityResponse,
-    BatchSetRpmLimitRequest, BatchSetRpmLimitResponse, CacheSkipRateResponse,
-    CredentialStatusItem, CredentialsStatusResponse, DefaultRpmLimitResponse, GlobalCacheResponse,
+    BatchSetCredentialGroupResponse, BatchSetDisabledRequest, BatchSetDisabledResponse,
+    BatchSetPriorityRequest, BatchSetPriorityResponse, BatchSetRpmLimitRequest,
+    BatchSetRpmLimitResponse, CacheSkipRateResponse, CredentialStatusItem,
+    CredentialsStatusResponse, DefaultRpmLimitResponse, GlobalCacheResponse,
     LoadBalancingModeResponse, ProxyGroupsResponse, SetCacheSkipRateRequest,
     SetCredentialGroupRequest, SetDefaultRpmLimitRequest, SetGlobalCacheRequest,
     SetLoadBalancingModeRequest, UpsertProxyGroupRequest,
@@ -479,6 +480,34 @@ impl AdminService {
             .token_manager
             .set_priority_batch(&req.credential_ids, req.priority);
         Ok(BatchSetPriorityResponse {
+            total,
+            succeeded: result.succeeded,
+            failed: result
+                .failed
+                .into_iter()
+                .map(|f| BatchSetCredentialGroupFailure {
+                    id: f.id,
+                    error: f.error,
+                })
+                .collect(),
+        })
+    }
+
+    /// 批量启用/禁用凭据
+    pub fn batch_set_disabled(
+        &self,
+        req: BatchSetDisabledRequest,
+    ) -> Result<BatchSetDisabledResponse, AdminServiceError> {
+        if req.credential_ids.is_empty() {
+            return Err(AdminServiceError::InvalidParameter(
+                "credentialIds 不能为空".to_string(),
+            ));
+        }
+        let total = req.credential_ids.len();
+        let result = self
+            .token_manager
+            .set_disabled_batch(&req.credential_ids, req.disabled);
+        Ok(BatchSetDisabledResponse {
             total,
             succeeded: result.succeeded,
             failed: result

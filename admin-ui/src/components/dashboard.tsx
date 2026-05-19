@@ -22,6 +22,7 @@ import {
   Network,
   ArrowUpDown,
   Gauge,
+  Power,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -46,6 +47,7 @@ import {
   useIsReadOnly,
   useBatchSetPriority,
   useBatchSetRpmLimit,
+  useBatchSetDisabled,
   useDefaultRpmLimit,
   useSetDefaultRpmLimit,
 } from '@/hooks/use-credentials'
@@ -106,6 +108,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchRpmValue, setBatchRpmValue] = useState('')
   const [defaultRpmDialogOpen, setDefaultRpmDialogOpen] = useState(false)
   const [defaultRpmValue, setDefaultRpmValue] = useState('')
+  const [batchDisabledDialogOpen, setBatchDisabledDialogOpen] = useState(false)
   const [proxyGroupsOpen, setProxyGroupsOpen] = useState(false)
   const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const
   const [itemsPerPage, setItemsPerPage] = useState<number>(() => {
@@ -154,6 +157,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const batchSetPriorityMutation = useBatchSetPriority()
   const batchSetRpmLimitMutation = useBatchSetRpmLimit()
+  const batchSetDisabledMutation = useBatchSetDisabled()
   const { data: defaultRpmData } = useDefaultRpmLimit()
   const setDefaultRpmMutation = useSetDefaultRpmLimit()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
@@ -240,6 +244,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     const credential = allCreds.find(c => c.id === id)
     return Boolean(credential?.disabled)
   }).length
+  const selectedEnabledCount = selectedIds.size - selectedDisabledCount
 
   useEffect(() => { setCurrentPage(1) }, [filter, search, allCreds.length])
   useEffect(() => { storage.saveBalanceCache(balanceMap) }, [balanceMap])
@@ -443,6 +448,43 @@ export function Dashboard({ onLogout }: DashboardProps) {
         onError: err => toast.error('批量调整失败: ' + (err as Error).message),
       },
     )
+  }
+
+  const runBatchSetDisabled = (disabled: boolean, ids: number[]) => {
+    if (ids.length === 0) {
+      toast.info(disabled ? '选中的凭据均已禁用' : '选中的凭据均已启用')
+      return
+    }
+    batchSetDisabledMutation.mutate(
+      { credentialIds: ids, disabled },
+      {
+        onSuccess: res => {
+          const failed = res.failed.length
+          const verb = disabled ? '禁用' : '启用'
+          if (failed === 0) toast.success(`成功${verb} ${res.succeeded.length} 个凭据`)
+          else toast.warning(`${verb}：成功 ${res.succeeded.length} 个，失败 ${failed} 个`)
+          setBatchDisabledDialogOpen(false)
+          deselectAll()
+        },
+        onError: err => toast.error('操作失败: ' + (err as Error).message),
+      },
+    )
+  }
+
+  const handleBatchToggleDisabled = () => {
+    if (selectedIds.size === 0) { toast.error('请先选择要切换的凭据'); return }
+    const selected = allCreds.filter(c => selectedIds.has(c.id))
+    const enabledIds = selected.filter(c => !c.disabled).map(c => c.id)
+    const disabledIds = selected.filter(c => c.disabled).map(c => c.id)
+    // 统一态：直接执行反向操作
+    if (enabledIds.length === 0) {
+      runBatchSetDisabled(false, disabledIds)
+    } else if (disabledIds.length === 0) {
+      runBatchSetDisabled(true, enabledIds)
+    } else {
+      // 混合态：弹窗让用户选方向
+      setBatchDisabledDialogOpen(true)
+    }
   }
 
   const openBatchRpmDialog = () => {
@@ -1080,6 +1122,22 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   </BarAction>
                   <BarAction onClick={handleBatchResetFailure} icon={<RotateCcw className="h-3.5 w-3.5" />}>恢复</BarAction>
                   <BarAction
+                    onClick={handleBatchToggleDisabled}
+                    disabled={batchSetDisabledMutation.isPending}
+                    icon={<Power className="h-3.5 w-3.5" />}
+                    title={
+                      selectedEnabledCount > 0 && selectedDisabledCount > 0
+                        ? `${selectedEnabledCount} 个启用 / ${selectedDisabledCount} 个禁用`
+                        : undefined
+                    }
+                  >
+                    {selectedEnabledCount === 0
+                      ? '启用'
+                      : selectedDisabledCount === 0
+                        ? '禁用'
+                        : '启用/禁用'}
+                  </BarAction>
+                  <BarAction
                     onClick={openBatchPriorityDialog}
                     disabled={batchSetPriorityMutation.isPending}
                     icon={<ArrowUpDown className="h-3.5 w-3.5" />}
@@ -1216,6 +1274,51 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Button>
             <Button onClick={handleBatchPrioritySubmit} disabled={batchSetPriorityMutation.isPending}>
               {batchSetPriorityMutation.isPending ? '保存中…' : '保存'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={batchDisabledDialogOpen} onOpenChange={setBatchDisabledDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>批量启用/禁用</DialogTitle>
+            <DialogDescription>
+              选中的凭据状态不一致：
+              <span className="font-mono tnum font-semibold text-foreground"> {selectedEnabledCount}</span> 个已启用、
+              <span className="font-mono tnum font-semibold text-foreground"> {selectedDisabledCount}</span> 个已禁用。请选择批量操作方向。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setBatchDisabledDialogOpen(false)}
+              disabled={batchSetDisabledMutation.isPending}
+            >
+              取消
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                const ids = allCreds
+                  .filter(c => selectedIds.has(c.id) && c.disabled)
+                  .map(c => c.id)
+                runBatchSetDisabled(false, ids)
+              }}
+              disabled={batchSetDisabledMutation.isPending || selectedDisabledCount === 0}
+            >
+              全部启用（{selectedDisabledCount}）
+            </Button>
+            <Button
+              onClick={() => {
+                const ids = allCreds
+                  .filter(c => selectedIds.has(c.id) && !c.disabled)
+                  .map(c => c.id)
+                runBatchSetDisabled(true, ids)
+              }}
+              disabled={batchSetDisabledMutation.isPending || selectedEnabledCount === 0}
+            >
+              全部禁用（{selectedEnabledCount}）
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -9,11 +9,11 @@ use axum::{
 use super::{
     middleware::{AdminRole, AdminState},
     types::{
-        AddCredentialRequest, BatchSetCredentialGroupRequest, BatchSetPriorityRequest,
-        BatchSetRpmLimitRequest, MeResponse, SetCacheSkipRateRequest, SetCredentialGroupRequest,
-        SetDefaultRpmLimitRequest, SetDisabledRequest, SetGlobalCacheRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SetRpmLimitRequest, SuccessResponse,
-        UpsertProxyGroupRequest,
+        AddCredentialRequest, BatchSetCredentialGroupRequest, BatchSetDisabledRequest,
+        BatchSetPriorityRequest, BatchSetRpmLimitRequest, MeResponse, SetCacheSkipRateRequest,
+        SetCredentialGroupRequest, SetDefaultRpmLimitRequest, SetDisabledRequest,
+        SetGlobalCacheRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetRpmLimitRequest,
+        SuccessResponse, UpsertProxyGroupRequest,
     },
 };
 
@@ -289,6 +289,18 @@ pub async fn batch_set_priority(
     Json(payload): Json<BatchSetPriorityRequest>,
 ) -> impl IntoResponse {
     match state.service.batch_set_priority(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/disabled/batch
+/// 批量启用/禁用凭据
+pub async fn batch_set_disabled(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchSetDisabledRequest>,
+) -> impl IntoResponse {
+    match state.service.batch_set_disabled(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
