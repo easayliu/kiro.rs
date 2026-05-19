@@ -64,9 +64,9 @@ import { Button } from '@/components/ui/button'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import { RelativeTime } from '@/components/relative-time'
-import type { BalanceResponse } from '@/types/api'
+import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
 
-type FilterKey = 'all' | 'available' | 'faulty' | 'disabled'
+type FilterKey = 'all' | 'available' | 'faulty' | 'throttled' | 'disabled'
 
 interface DashboardProps {
   onLogout: () => void
@@ -150,17 +150,22 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   const allCreds = data?.credentials || []
   const totalCount = data?.total || 0
-  const availableCount = data?.available || 0
+  const isThrottledNow = (c: CredentialStatusItem) =>
+    !!c.throttledUntil && Date.parse(c.throttledUntil) > Date.now()
+  const throttledCredentialCount = allCreds.filter(c => !c.disabled && isThrottledNow(c)).length
+  // server-side "available" 仅排除 disabled；冷却中的凭据虽未真正可用，再从前端二次扣减
+  const availableCount = Math.max(0, (data?.available || 0) - throttledCredentialCount)
   const disabledCredentialCount = allCreds.filter(c => c.disabled).length
-  const faultyCredentialCount = allCreds.filter(c => !c.disabled && (c.failureCount > 0 || c.refreshFailureCount > 0)).length
+  const faultyCredentialCount = allCreds.filter(c => !c.disabled && !isThrottledNow(c) && (c.failureCount > 0 || c.refreshFailureCount > 0)).length
   const activeCredential = data?.currentId ? allCreds.find(c => c.id === data.currentId) : undefined
   const activeBalance = data?.currentId ? balanceMap.get(data.currentId) : undefined
 
   const filteredCreds = useMemo(() => {
     const q = search.trim().toLowerCase()
     const filtered = allCreds.filter(c => {
-      if (filter === 'available' && (c.disabled || c.failureCount > 0 || c.refreshFailureCount > 0)) return false
-      if (filter === 'faulty' && !(c.failureCount > 0 || c.refreshFailureCount > 0)) return false
+      if (filter === 'available' && (c.disabled || isThrottledNow(c) || c.failureCount > 0 || c.refreshFailureCount > 0)) return false
+      if (filter === 'faulty' && (c.disabled || isThrottledNow(c) || !(c.failureCount > 0 || c.refreshFailureCount > 0))) return false
+      if (filter === 'throttled' && (c.disabled || !isThrottledNow(c))) return false
       if (filter === 'disabled' && !c.disabled) return false
       if (!q) return true
       return (
@@ -722,6 +727,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   tone={faultyCredentialCount > 0 ? 'warn' : 'default'}
                 >
                   异常
+                </Chip>
+                <Chip
+                  active={filter === 'throttled'}
+                  onClick={() => setFilter('throttled')}
+                  count={throttledCredentialCount}
+                  tone={throttledCredentialCount > 0 ? 'warn' : 'default'}
+                >
+                  限流冷却
                 </Chip>
                 <Chip
                   active={filter === 'disabled'}
