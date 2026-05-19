@@ -107,11 +107,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
     localStorage.setItem('kiro-page-size', String(size))
   }
 
-  type SortKey = 'default' | 'plan-desc' | 'plan-asc'
+  type SortKey = 'default' | 'plan-desc' | 'plan-asc' | 'group'
   const SORT_OPTIONS: { key: SortKey; label: string }[] = [
     { key: 'default', label: '默认（优先级）' },
     { key: 'plan-desc', label: '订阅等级 · 高→低' },
     { key: 'plan-asc', label: '订阅等级 · 低→高' },
+    { key: 'group', label: '代理分组（聚合）' },
   ]
   const [sortKey, setSortKey] = useState<SortKey>(() => {
     if (typeof window === 'undefined') return 'default'
@@ -177,6 +178,22 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
 
     if (sortKey === 'default') return filtered
+
+    if (sortKey === 'group') {
+      // 按代理分组聚合：先按 group 名升序（无分组的排到末尾），
+      // 组内沿用 priority asc + id asc 的稳定次级序
+      return [...filtered].sort((a, b) => {
+        const ga = a.group || ''
+        const gb = b.group || ''
+        if (ga !== gb) {
+          if (!ga) return 1
+          if (!gb) return -1
+          return ga.localeCompare(gb)
+        }
+        if (a.priority !== b.priority) return a.priority - b.priority
+        return a.id - b.id
+      })
+    }
 
     const tierRank = (title: string | null | undefined): number => {
       if (!title) return 0
@@ -788,7 +805,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
                       >
                         排序{' '}
                         <span className="text-foreground">
-                          {sortKey === 'default' ? '默认' : sortKey === 'plan-desc' ? '等级 ↓' : '等级 ↑'}
+                          {sortKey === 'default'
+                            ? '默认'
+                            : sortKey === 'plan-desc'
+                              ? '等级 ↓'
+                              : sortKey === 'plan-asc'
+                                ? '等级 ↑'
+                                : '分组'}
                         </span>
                         <ChevronDown className="h-3 w-3" />
                       </button>
