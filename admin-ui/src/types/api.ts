@@ -11,6 +11,8 @@ export interface CredentialsStatusResponse {
   available: number
   currentId: number
   credentials: CredentialStatusItem[]
+  /** 全局默认 RPM 上限（不存在时表示未配置） */
+  defaultRpmLimit?: number
 }
 
 // 单个凭据状态
@@ -35,6 +37,10 @@ export interface CredentialStatusItem {
   disabledReason?: string
   /** 上游 429 冷却到期时间（RFC3339）；不存在时表示未在冷却 */
   throttledUntil?: string
+  /** 凭据级 RPM 上限覆盖（不存在=回退全局默认；0=显式不限流） */
+  rpmLimit?: number
+  /** 最近 60s 滑动窗口内的请求数（默认 0） */
+  rpmCurrent?: number
 }
 
 // 余额响应
@@ -69,6 +75,11 @@ export interface SetDisabledRequest {
 
 export interface SetPriorityRequest {
   priority: number
+}
+
+export interface SetRpmLimitRequest {
+  /** null/undefined：清除覆盖回退全局；0：显式不限流；正整数：限制为 n 次/分钟 */
+  rpmLimit: number | null
 }
 
 // 添加凭据请求

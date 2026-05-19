@@ -184,6 +184,14 @@ pub struct Config {
     #[serde(default)]
     pub client_mode: ClientMode,
 
+    /// 全局默认 RPM 上限（每分钟请求数）
+    ///
+    /// 凭据未单独配置 `rpmLimit` 时回退到此值；都未配置则不限流。
+    /// 触发限流的凭据会被本地冷却到当前滑动窗口结束（最多 60s），
+    /// 期间自动切换到其他凭据。设置为 0 表示禁用全局默认。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_rpm_limit: Option<u32>,
+
     /// kiro-cli 版本号（仅 kiro-cli 模式使用）
     #[serde(default = "default_kiro_cli_version")]
     pub kiro_cli_version: String,
@@ -271,6 +279,7 @@ impl Default for Config {
             cache_scope: None,
             cache_skip_rate: None,
             client_mode: ClientMode::default(),
+            default_rpm_limit: None,
             kiro_cli_version: default_kiro_cli_version(),
             config_path: None,
         }

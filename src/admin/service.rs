@@ -86,6 +86,8 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 throttled_until: entry.throttled_until,
+                rpm_limit: entry.rpm_limit,
+                rpm_current: entry.rpm_current,
             })
             .collect();
 
@@ -97,6 +99,7 @@ impl AdminService {
             available: snapshot.available,
             current_id: snapshot.current_id,
             credentials,
+            default_rpm_limit: snapshot.default_rpm_limit,
         }
     }
 
@@ -121,6 +124,17 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据级 RPM 上限
+    pub fn set_rpm_limit(
+        &self,
+        id: u64,
+        rpm_limit: Option<u32>,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_rpm_limit(id, rpm_limit)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -222,6 +236,7 @@ impl AdminService {
             client_mode: req.client_mode,
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
+            rpm_limit: None,
         };
 
         // 调用 token_manager 添加凭据

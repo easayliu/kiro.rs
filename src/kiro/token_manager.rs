@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -412,6 +412,8 @@ struct CredentialEntry {
     throttled_until: Option<DateTime<Utc>>,
     /// 连续 429 次数，用于指数退避；成功一次即清零
     throttle_count: u32,
+    /// RPM 滑动窗口：最近 60s 内的请求时间戳，超过 60s 的会被惰性裁剪
+    rpm_window: VecDeque<DateTime<Utc>>,
 }
 
 /// 禁用原因
@@ -484,6 +486,12 @@ pub struct CredentialEntrySnapshot {
     /// 上游 429 冷却到期时间（RFC3339）；None=未在冷却
     #[serde(skip_serializing_if = "Option::is_none")]
     pub throttled_until: Option<String>,
+    /// 凭据级 RPM 上限（None=未单独配置，回退到全局默认；0=显式不限流）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpm_limit: Option<u32>,
+    /// 最近 60s 滑动窗口内的请求数
+    #[serde(default)]
+    pub rpm_current: u32,
 }
 
 /// 凭据管理器状态快照
@@ -498,6 +506,9 @@ pub struct ManagerSnapshot {
     pub total: usize,
     /// 可用凭据数量
     pub available: usize,
+    /// 全局默认 RPM 上限（None=未配置；0 等价于未配置，仅作显式禁用提示）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_rpm_limit: Option<u32>,
 }
 
 /// 批量设置代理分组 - 单条失败信息
@@ -558,6 +569,36 @@ pub struct MultiTokenManager {
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// RPM 滑动窗口长度（秒）
+const RPM_WINDOW_SECS: i64 = 60;
+
+/// 根据凭据级与全局配置计算生效的 RPM 上限
+///
+/// 优先级：凭据级 > 全局；任意一级显式为 0 视为"不限流"（停用该层级的限制）。
+/// 返回 None 表示无 RPM 限制。
+fn effective_rpm_limit(cred: &KiroCredentials, config: &Config) -> Option<u32> {
+    match cred.rpm_limit {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => match config.default_rpm_limit {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None => None,
+        },
+    }
+}
+
+/// 裁剪窗口里早于 cutoff 的时间戳
+fn prune_rpm_window(window: &mut VecDeque<DateTime<Utc>>, cutoff: DateTime<Utc>) {
+    while let Some(front) = window.front() {
+        if *front < cutoff {
+            window.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
 /// 上游 API 429 限流冷却时长表（秒）：第 N 次 429 取第 N-1 个元素，
 /// 超过表长后取最后一个（封顶）。
 const THROTTLE_BACKOFF_SECS: &[i64] = &[10, 20, 30, 60];
@@ -634,6 +675,7 @@ impl MultiTokenManager {
                     last_used_at: None,
                     throttled_until: None,
                     throttle_count: 0,
+                    rpm_window: VecDeque::new(),
                 }
             })
             .collect();
@@ -864,15 +906,24 @@ impl MultiTokenManager {
             return None;
         }
 
-        // 进一步剔除处于 429 冷却期的凭据，得到"鲜活"集合
+        // 进一步剔除处于 429 冷却期或 RPM 已耗尽的凭据，得到"鲜活"集合
         let now = Utc::now();
+        let rpm_cutoff = now - Duration::seconds(RPM_WINDOW_SECS);
         let fresh_indices: Vec<usize> = base_indices
             .iter()
             .copied()
             .filter(|&i| {
-                entries[i]
-                    .throttled_until
-                    .is_none_or(|until| until <= now)
+                let entry = &mut entries[i];
+                if entry.throttled_until.is_some_and(|until| until > now) {
+                    return false;
+                }
+                if let Some(limit) = effective_rpm_limit(&entry.credentials, &self.config) {
+                    prune_rpm_window(&mut entry.rpm_window, rpm_cutoff);
+                    if entry.rpm_window.len() >= limit as usize {
+                        return false;
+                    }
+                }
+                true
             })
             .collect();
 
@@ -1041,6 +1092,7 @@ impl MultiTokenManager {
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
                 Ok(ctx) => {
+                    self.record_request_for_rpm(ctx.id);
                     return Ok(ctx);
                 }
                 Err(e) => {
@@ -1400,6 +1452,22 @@ impl MultiTokenManager {
         }
     }
 
+    /// 记录一次本地请求计入 RPM 滑动窗口（仅当该凭据生效 RPM 上限非空时）
+    ///
+    /// 在 `acquire_context` 成功获取上下文后调用，统计实际派发到该凭据的请求数。
+    /// 即使本次请求最终失败（401/429/网络等），也已计入——与上游对话单元一致。
+    fn record_request_for_rpm(&self, id: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            if effective_rpm_limit(&entry.credentials, &self.config).is_none() {
+                return;
+            }
+            let now = Utc::now();
+            prune_rpm_window(&mut entry.rpm_window, now - Duration::seconds(RPM_WINDOW_SECS));
+            entry.rpm_window.push_back(now);
+        }
+    }
+
     /// 标记凭据最近被访问过（用于 LRU 轮转，但不视为成功）
     ///
     /// 场景：上游返回 429 / 408 等瞬态限流错误时调用。
@@ -1666,9 +1734,15 @@ impl MultiTokenManager {
 
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
-        let entries = self.entries.lock();
+        let mut entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
+        let now = Utc::now();
+        let rpm_cutoff = now - Duration::seconds(RPM_WINDOW_SECS);
+        // 顺手裁剪一次窗口，让 rpm_current 反映真实"过去 60s"的请求数
+        for e in entries.iter_mut() {
+            prune_rpm_window(&mut e.rpm_window, rpm_cutoff);
+        }
 
         ManagerSnapshot {
             entries: entries
@@ -1724,13 +1798,16 @@ impl MultiTokenManager {
                     }.to_string()),
                     throttled_until: e
                         .throttled_until
-                        .filter(|t| *t > Utc::now())
+                        .filter(|t| *t > now)
                         .map(|t| t.to_rfc3339()),
+                    rpm_limit: e.credentials.rpm_limit,
+                    rpm_current: e.rpm_window.len() as u32,
                 })
                 .collect(),
             current_id,
             total: entries.len(),
             available,
+            default_rpm_limit: self.config.default_rpm_limit,
         }
     }
 
@@ -1773,6 +1850,23 @@ impl MultiTokenManager {
         // 立即按新优先级重新选择当前凭据（无论持久化是否成功）
         self.select_highest_priority();
         // 持久化更改
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 设置凭据级 RPM 上限（Admin API）
+    ///
+    /// 传 None 表示清除凭据级覆盖，回退到全局默认；
+    /// 传 Some(0) 表示显式不限流（即使全局有默认）。
+    pub fn set_rpm_limit(&self, id: u64, rpm_limit: Option<u32>) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.rpm_limit = rpm_limit;
+        }
         self.persist_credentials()?;
         Ok(())
     }
@@ -2109,6 +2203,7 @@ impl MultiTokenManager {
                 last_used_at: None,
                 throttled_until: None,
                 throttle_count: 0,
+                rpm_window: VecDeque::new(),
             });
         }
 

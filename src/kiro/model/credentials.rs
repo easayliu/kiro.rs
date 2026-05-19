@@ -113,6 +113,12 @@ pub struct KiroCredentials {
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kiro_api_key: Option<String>,
+
+    /// 凭据级 RPM 上限（每分钟请求数）
+    /// 未配置时回退到 config.json 的 `defaultRpmLimit`；都未配置则不限流。
+    /// 设置为 0 表示该凭据不限流，即使全局有默认值也强制不限。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpm_limit: Option<u32>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -383,6 +389,7 @@ mod tests {
             client_mode: None,
             disabled: false,
             kiro_api_key: None,
+            rpm_limit: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -502,6 +509,7 @@ mod tests {
             client_mode: None,
             disabled: false,
             kiro_api_key: None,
+            rpm_limit: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -534,6 +542,7 @@ mod tests {
             client_mode: None,
             disabled: false,
             kiro_api_key: None,
+            rpm_limit: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -649,6 +658,7 @@ mod tests {
             client_mode: None,
             disabled: false,
             kiro_api_key: None,
+            rpm_limit: None,
         };
 
         let json = original.to_pretty_json().unwrap();

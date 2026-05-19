@@ -12,6 +12,7 @@ import {
   ChevronUp,
   ChevronDown,
   Network,
+  Gauge,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { RelativeTime } from '@/components/relative-time'
@@ -40,6 +41,7 @@ import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
 import {
   useSetDisabled,
   useSetPriority,
+  useSetRpmLimit,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
@@ -50,11 +52,22 @@ import {
 
 interface CredentialCardProps {
   credential: CredentialStatusItem
+  defaultRpmLimit?: number
   onViewBalance: (id: number) => void
   selected: boolean
   onToggleSelect: () => void
   balance: BalanceResponse | null
   loadingBalance: boolean
+}
+
+// 计算生效的 RPM 上限：凭据级 0 / 正整数覆盖全局；undefined 回退全局；
+// 任意一级显式为 0 视为"不限流"。返回 0 表示不限流，正整数为限制值。
+function resolveEffectiveRpm(credLimit: number | undefined, defaultLimit: number | undefined): number {
+  if (credLimit === 0) return 0
+  if (typeof credLimit === 'number' && credLimit > 0) return credLimit
+  if (defaultLimit === 0) return 0
+  if (typeof defaultLimit === 'number' && defaultLimit > 0) return defaultLimit
+  return 0
 }
 
 // 把剩余毫秒格式化为简短中文（"45s" / "2m" / "1h12m"）
@@ -70,6 +83,7 @@ function formatRemaining(ms: number): string {
 
 export function CredentialCard({
   credential,
+  defaultRpmLimit,
   onViewBalance,
   selected,
   onToggleSelect,
@@ -79,10 +93,13 @@ export function CredentialCard({
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const [showRpmDialog, setShowRpmDialog] = useState(false)
+  const [rpmInputValue, setRpmInputValue] = useState('')
 
   const readOnly = useIsReadOnly()
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
+  const setRpmLimit = useSetRpmLimit()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
@@ -162,6 +179,30 @@ export function CredentialCard({
     })
   }
 
+  const openRpmDialog = () => {
+    setRpmInputValue(typeof credential.rpmLimit === 'number' ? String(credential.rpmLimit) : '')
+    setShowRpmDialog(true)
+  }
+  const handleRpmSave = (rpmLimit: number | null) => {
+    setRpmLimit.mutate({ id: credential.id, rpmLimit }, {
+      onSuccess: res => { toast.success(res.message); setShowRpmDialog(false) },
+      onError: err => toast.error('保存失败: ' + (err as Error).message),
+    })
+  }
+  const handleRpmSubmit = () => {
+    const trimmed = rpmInputValue.trim()
+    if (trimmed === '') {
+      handleRpmSave(null)
+      return
+    }
+    const parsed = Number(trimmed)
+    if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+      toast.error('请输入 ≥ 0 的整数（0 表示不限流，留空表示回退全局默认）')
+      return
+    }
+    handleRpmSave(parsed)
+  }
+
   const hasFailures = credential.failureCount > 0 || credential.refreshFailureCount > 0
   const usedPercent = balance ? Math.max(0, Math.min(100, balance.usagePercentage)) : 0
   const isOverLimit = !!balance && balance.usagePercentage >= 100
@@ -174,6 +215,19 @@ export function CredentialCard({
     ? Math.max(0, Date.parse(credential.throttledUntil) - Date.now())
     : 0
   const isThrottled = throttledRemainingMs > 0
+
+  const effectiveRpm = resolveEffectiveRpm(credential.rpmLimit, defaultRpmLimit)
+  const rpmCurrent = credential.rpmCurrent ?? 0
+  const rpmActive = effectiveRpm > 0
+  const rpmUsageRatio = rpmActive ? Math.min(1, rpmCurrent / effectiveRpm) : 0
+  const rpmIsExhausted = rpmActive && rpmCurrent >= effectiveRpm
+  const rpmColorClass = !rpmActive
+    ? 'text-muted-foreground'
+    : rpmIsExhausted
+      ? 'text-bad'
+      : rpmUsageRatio >= 0.7
+        ? 'text-warn'
+        : 'text-foreground'
 
   const barColor =
     !balance
@@ -377,6 +431,21 @@ export function CredentialCard({
               </span>
             </MetaCell>
           </div>
+
+          {/* RPM 滑动窗口指示器：仅在生效限流时显示，便于运维直观感知 */}
+          {rpmActive && (
+            <div className="flex items-center gap-1.5 text-2xs">
+              <Gauge className={cn('h-3 w-3 shrink-0', rpmColorClass)} />
+              <span className="font-medium text-muted-foreground">RPM</span>
+              <span className={cn('tnum font-mono', rpmColorClass)}>
+                {rpmCurrent}/{effectiveRpm}
+              </span>
+              <span className="text-muted-foreground/60">· 60s 窗口</span>
+              {typeof credential.rpmLimit !== 'number' && (
+                <span className="text-muted-foreground/60">（默认）</span>
+              )}
+            </div>
+          )}
         </dl>
 
         {/* ─── FOOTER: divided action cells ─── */}
@@ -423,6 +492,12 @@ export function CredentialCard({
                 disabled={setPriority.isPending}
               >
                 <ChevronDown /> 降低优先级
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={openRpmDialog}
+                disabled={setRpmLimit.isPending}
+              >
+                <Gauge /> RPM 上限
               </DropdownMenuItem>
               <DropdownMenuSub>
                 <DropdownMenuSubTrigger>
@@ -482,6 +557,51 @@ export function CredentialCard({
             </Button>
             <Button variant="destructive" onClick={handleDelete} disabled={deleteCredential.isPending || !credential.disabled}>
               确认删除
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showRpmDialog} onOpenChange={setShowRpmDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>设置 RPM 上限</DialogTitle>
+            <DialogDescription>
+              凭据 <span className="font-mono tnum">#{String(credential.id).padStart(3, '0')}</span> 每分钟最多发送的请求数。
+              超限后该凭据会被本地冷却到当前 60s 滑动窗口结束，期间自动切换到其他凭据。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 py-2">
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                inputMode="numeric"
+                min="0"
+                value={rpmInputValue}
+                placeholder={typeof defaultRpmLimit === 'number' ? `全局默认 ${defaultRpmLimit}` : '留空使用全局默认'}
+                onChange={e => setRpmInputValue(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') handleRpmSubmit() }}
+                className="tnum font-mono"
+              />
+              <span className="shrink-0 text-xs text-muted-foreground">次/分钟</span>
+            </div>
+            <p className="text-2xs text-muted-foreground">
+              · 留空：清除凭据级覆盖，回退到全局默认
+              {typeof defaultRpmLimit === 'number'
+                ? defaultRpmLimit === 0 ? '（当前全局不限流）' : `（当前全局 ${defaultRpmLimit}）`
+                : '（当前全局未配置）'}
+              <br />
+              · 0：显式不限流（即使全局有默认）
+              <br />
+              · 正整数：限制为 N 次/分钟
+            </p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowRpmDialog(false)} disabled={setRpmLimit.isPending}>
+              取消
+            </Button>
+            <Button onClick={handleRpmSubmit} disabled={setRpmLimit.isPending}>
+              保存
             </Button>
           </DialogFooter>
         </DialogContent>

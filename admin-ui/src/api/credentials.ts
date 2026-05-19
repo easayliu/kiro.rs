@@ -6,6 +6,7 @@ import type {
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
+  SetRpmLimitRequest,
   AddCredentialRequest,
   AddCredentialResponse,
   ProxyGroupsResponse,
@@ -63,6 +64,18 @@ export async function setCredentialPriority(
   const { data } = await api.post<SuccessResponse>(
     `/credentials/${id}/priority`,
     { priority } as SetPriorityRequest
+  )
+  return data
+}
+
+// 设置凭据 RPM 上限（null 表示清除凭据级覆盖回退全局；0 表示显式不限流）
+export async function setCredentialRpmLimit(
+  id: number,
+  rpmLimit: number | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/rpm-limit`,
+    { rpmLimit } as SetRpmLimitRequest
   )
   return data
 }

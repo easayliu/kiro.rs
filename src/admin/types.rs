@@ -30,6 +30,9 @@ pub struct CredentialsStatusResponse {
     pub current_id: u64,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
+    /// 全局默认 RPM 上限（None=未配置）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_rpm_limit: Option<u32>,
 }
 
 /// 单个凭据的状态信息
@@ -76,6 +79,12 @@ pub struct CredentialStatusItem {
     /// 上游 429 冷却到期时间（RFC3339）；None=未在冷却
     #[serde(skip_serializing_if = "Option::is_none")]
     pub throttled_until: Option<String>,
+    /// 凭据级 RPM 上限覆盖（None=未单独配置；0=显式不限流）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpm_limit: Option<u32>,
+    /// 最近 60s 滑动窗口内的请求数（用于前端展示 X/limit）
+    #[serde(default)]
+    pub rpm_current: u32,
 }
 
 // ============ 操作请求 ============
@@ -94,6 +103,17 @@ pub struct SetDisabledRequest {
 pub struct SetPriorityRequest {
     /// 新优先级值
     pub priority: u32,
+}
+
+/// 修改凭据级 RPM 上限请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRpmLimitRequest {
+    /// 新 RPM 上限值
+    /// - None：清除凭据级覆盖，回退到全局默认
+    /// - Some(0)：显式不限流
+    /// - Some(n>0)：限制为 n 次/分钟
+    pub rpm_limit: Option<u32>,
 }
 
 /// 添加凭据请求

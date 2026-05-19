@@ -11,7 +11,8 @@ use super::{
     types::{
         AddCredentialRequest, BatchSetCredentialGroupRequest, MeResponse, SetCacheSkipRateRequest,
         SetCredentialGroupRequest, SetDisabledRequest, SetGlobalCacheRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse, UpsertProxyGroupRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SetRpmLimitRequest, SuccessResponse,
+        UpsertProxyGroupRequest,
     },
 };
 
@@ -56,6 +57,24 @@ pub async fn set_credential_priority(
             "凭据 #{} 优先级已设置为 {}",
             id, payload.priority
         )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/rpm-limit
+/// 设置凭据级 RPM 上限
+pub async fn set_credential_rpm_limit(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetRpmLimitRequest>,
+) -> impl IntoResponse {
+    match state.service.set_rpm_limit(id, payload.rpm_limit) {
+        Ok(_) => Json(SuccessResponse::new(match payload.rpm_limit {
+            None => format!("凭据 #{} RPM 上限已清除（回退到全局默认）", id),
+            Some(0) => format!("凭据 #{} 已显式不限流", id),
+            Some(n) => format!("凭据 #{} RPM 上限已设置为 {} 次/分钟", id, n),
+        }))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

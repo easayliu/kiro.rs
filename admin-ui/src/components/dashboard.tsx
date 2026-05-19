@@ -891,6 +891,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     <CredentialCard
                       key={credential.id}
                       credential={credential}
+                      defaultRpmLimit={data?.defaultRpmLimit}
                       onViewBalance={handleViewBalance}
                       selected={selectedIds.has(credential.id)}
                       onToggleSelect={() => toggleSelect(credential.id)}
