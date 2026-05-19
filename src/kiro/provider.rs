@@ -676,7 +676,13 @@ impl KiroProvider {
                 // 429 被限流时打 throttle 冷却（指数退避），冷却期间该凭据
                 // 不参与 balanced 轮转；最高优先级档全部冷却时自然降级到下一档
                 if status.as_u16() == 429 {
-                    self.token_manager.report_throttled(ctx.id);
+                    // 上游 "suspicious activity" 限流：账号被临时封禁，
+                    // 短间隔重试无意义，直接冷却 1 小时
+                    if body.contains("suspicious activity") {
+                        self.token_manager.report_throttled_for(ctx.id, 3600);
+                    } else {
+                        self.token_manager.report_throttled(ctx.id);
+                    }
                 }
                 last_error = Some(anyhow::Error::new(UpstreamHttpError {
                     status: status.as_u16(),

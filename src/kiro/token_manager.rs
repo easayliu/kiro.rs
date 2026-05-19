@@ -1377,6 +1377,26 @@ impl MultiTokenManager {
         }
     }
 
+    /// 报告凭据被上游 API 长时间限流，按指定秒数标记冷却到期时间
+    ///
+    /// 用于处理上游 "suspicious activity" 等需要长时间退避的特殊 429 场景。
+    /// 行为类似 `report_throttled`，但忽略 throttle_count，直接使用传入的冷却时长。
+    pub fn report_throttled_for(&self, id: u64, secs: i64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.throttle_count = entry.throttle_count.saturating_add(1);
+            let now = Utc::now();
+            entry.throttled_until = Some(now + Duration::seconds(secs));
+            entry.last_used_at = Some(now.to_rfc3339());
+            tracing::warn!(
+                "凭据 #{} 被上游长时间限流，冷却 {}s（连续第 {} 次）",
+                id,
+                secs,
+                entry.throttle_count
+            );
+        }
+    }
+
     /// 标记凭据最近被访问过（用于 LRU 轮转，但不视为成功）
     ///
     /// 场景：上游返回 429 / 408 等瞬态限流错误时调用。
