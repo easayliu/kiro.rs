@@ -177,13 +177,23 @@ async fn main() {
                 token_manager.clone(),
                 app_state.cache_tracker.clone(),
             );
-            let admin_state = admin::AdminState::new(admin_key, admin_service);
+            let guest_keys: Vec<String> = config
+                .guest_api_keys
+                .iter()
+                .filter(|k| !k.trim().is_empty())
+                .cloned()
+                .collect();
+            let guest_count = guest_keys.len();
+            let admin_state = admin::AdminState::new(admin_key, guest_keys, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
             let admin_ui_app = admin_ui::create_admin_ui_router();
 
             tracing::info!("Admin API 已启用");
+            if guest_count > 0 {
+                tracing::info!("已配置 {} 个 Guest API Key（只读权限）", guest_count);
+            }
             tracing::info!("Admin UI 已启用: /admin");
             anthropic_app
                 .nest("/api/admin", admin_app)

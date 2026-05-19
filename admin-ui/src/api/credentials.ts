@@ -11,6 +11,7 @@ import type {
   ProxyGroupsResponse,
   UpsertProxyGroupRequest,
   BatchSetCredentialGroupResponse,
+  MeResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -29,6 +30,12 @@ api.interceptors.request.use((config) => {
   }
   return config
 })
+
+// 获取当前调用方角色
+export async function getMe(): Promise<MeResponse> {
+  const { data } = await api.get<MeResponse>('/me')
+  return data
+}
 
 // 获取所有凭据状态
 export async function getCredentials(): Promise<CredentialsStatusResponse> {

@@ -45,6 +45,7 @@ import {
   useForceRefreshToken,
   useProxyGroups,
   useSetCredentialGroup,
+  useIsReadOnly,
 } from '@/hooks/use-credentials'
 
 interface CredentialCardProps {
@@ -68,6 +69,7 @@ export function CredentialCard({
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
+  const readOnly = useIsReadOnly()
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
@@ -257,8 +259,8 @@ export function CredentialCard({
           <Switch
             checked={!credential.disabled}
             onCheckedChange={handleToggleDisabled}
-            disabled={setDisabled.isPending}
-            title={credential.disabled ? '启用凭据' : '禁用凭据'}
+            disabled={setDisabled.isPending || readOnly}
+            title={readOnly ? '游客身份不可修改启用状态' : credential.disabled ? '启用凭据' : '禁用凭据'}
             className="shrink-0"
           />
         </div>
@@ -299,7 +301,11 @@ export function CredentialCard({
           {/* Meta key-values — definition-list style grid */}
           <div className="grid grid-cols-3 gap-2 text-xs">
             <MetaCell label="优先级">
-              {editingPriority ? (
+              {readOnly ? (
+                <span className="tnum font-mono font-semibold text-foreground">
+                  {credential.priority}
+                </span>
+              ) : editingPriority ? (
                 <div className="flex items-center gap-0.5">
                   <Input
                     type="number"
@@ -354,20 +360,22 @@ export function CredentialCard({
         </dl>
 
         {/* ─── FOOTER: divided action cells ─── */}
-        <div className="mt-auto grid grid-cols-3 divide-x divide-border border-t border-border">
+        <div className={cn('mt-auto grid divide-x divide-border border-t border-border', readOnly ? 'grid-cols-1' : 'grid-cols-3')}>
           <FooterAction
             onClick={() => onViewBalance(credential.id)}
             icon={<Wallet className="h-4 w-4" />}
             label="余额"
           />
-          <FooterAction
-            onClick={handleForceRefresh}
-            disabled={forceRefresh.isPending || credential.disabled}
-            icon={<RefreshCw className={cn('h-4 w-4', forceRefresh.isPending && 'animate-spin')} />}
-            label="Token"
-            title={credential.disabled ? '已禁用的凭据无法刷新 Token' : '强制刷新 Token'}
-          />
-          <DropdownMenu>
+          {!readOnly && (
+            <FooterAction
+              onClick={handleForceRefresh}
+              disabled={forceRefresh.isPending || credential.disabled}
+              icon={<RefreshCw className={cn('h-4 w-4', forceRefresh.isPending && 'animate-spin')} />}
+              label="Token"
+              title={credential.disabled ? '已禁用的凭据无法刷新 Token' : '强制刷新 Token'}
+            />
+          )}
+          {!readOnly && <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button
                 className="group/more flex cursor-pointer items-center justify-center gap-1.5 py-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
@@ -435,7 +443,7 @@ export function CredentialCard({
                 <Trash2 /> 删除凭据
               </DropdownMenuItem>
             </DropdownMenuContent>
-          </DropdownMenu>
+          </DropdownMenu>}
         </div>
       </div>
 

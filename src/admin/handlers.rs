@@ -1,19 +1,25 @@
 //! Admin API HTTP 处理器
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, State},
     response::IntoResponse,
 };
 
 use super::{
-    middleware::AdminState,
+    middleware::{AdminRole, AdminState},
     types::{
-        AddCredentialRequest, BatchSetCredentialGroupRequest, SetCacheSkipRateRequest,
+        AddCredentialRequest, BatchSetCredentialGroupRequest, MeResponse, SetCacheSkipRateRequest,
         SetCredentialGroupRequest, SetDisabledRequest, SetGlobalCacheRequest,
         SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse, UpsertProxyGroupRequest,
     },
 };
+
+/// GET /api/admin/me
+/// 返回当前调用方角色
+pub async fn get_me(Extension(role): Extension<AdminRole>) -> impl IntoResponse {
+    Json(MeResponse { role: role.as_str() })
+}
 
 /// GET /api/admin/credentials
 /// 获取所有凭据状态

@@ -140,6 +140,13 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
+    /// 游客 API 密钥列表（可选，仅授予只读权限）
+    ///
+    /// 命中其中任一 key 时只允许 GET 请求；写操作（POST/PUT/DELETE）一律 403。
+    /// 仅在配置了 `admin_api_key` 时生效——Admin API 整体由 admin key 决定是否启用。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guest_api_keys: Vec<String>,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -257,6 +264,7 @@ impl Default for Config {
             proxy_password: None,
             proxy_groups: BTreeMap::new(),
             admin_api_key: None,
+            guest_api_keys: Vec::new(),
             load_balancing_mode: default_load_balancing_mode(),
             extract_thinking: default_extract_thinking(),
             global_cache: default_global_cache(),

@@ -9,10 +9,10 @@ use super::{
     handlers::{
         add_credential, batch_set_credential_group, delete_credential, delete_proxy_group,
         force_refresh_token, get_all_credentials, get_cache_scope, get_cache_skip_rate,
-        get_credential_balance, get_global_cache, get_load_balancing_mode, list_proxy_groups,
-        reset_failure_count, set_cache_scope, set_cache_skip_rate, set_credential_disabled,
-        set_credential_group, set_credential_priority, set_global_cache, set_load_balancing_mode,
-        upsert_proxy_group,
+        get_credential_balance, get_global_cache, get_load_balancing_mode, get_me,
+        list_proxy_groups, reset_failure_count, set_cache_scope, set_cache_skip_rate,
+        set_credential_disabled, set_credential_group, set_credential_priority, set_global_cache,
+        set_load_balancing_mode, upsert_proxy_group,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -20,6 +20,7 @@ use super::{
 /// 创建 Admin API 路由
 ///
 /// # 端点
+/// - `GET /me` - 返回当前调用方角色（admin / guest）
 /// - `GET /credentials` - 获取所有凭据状态
 /// - `POST /credentials` - 添加新凭据
 /// - `DELETE /credentials/:id` - 删除凭据
@@ -44,6 +45,7 @@ use super::{
 /// - `Authorization: Bearer <token>` header
 pub fn create_admin_router(state: AdminState) -> Router {
     Router::new()
+        .route("/me", get(get_me))
         .route(
             "/credentials",
             get(get_all_credentials).post(add_credential),

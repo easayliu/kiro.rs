@@ -41,6 +41,7 @@ import {
   useSetCacheScope,
   useCacheSkipRate,
   useSetCacheSkipRate,
+  useIsReadOnly,
 } from '@/hooks/use-credentials'
 import type { CacheScope } from '@/api/credentials'
 import {
@@ -134,6 +135,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   })
 
   const queryClient = useQueryClient()
+  const readOnly = useIsReadOnly()
   const { data, isLoading, error, refetch } = useCredentials()
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
@@ -517,6 +519,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <div className="flex items-baseline gap-1.5">
               <span className="text-sm font-semibold tracking-tight">Kiro</span>
               <span className="hidden text-xs text-muted-foreground sm:inline">Admin</span>
+              {readOnly && (
+                <span
+                  title="当前以游客身份登录，仅可只读浏览"
+                  className="ml-1 inline-flex items-center rounded-full border border-warn/40 bg-warn-soft px-1.5 py-0.5 font-mono text-2xs font-semibold uppercase tracking-wider text-warn"
+                >
+                  Guest
+                </span>
+              )}
             </div>
           </div>
           <div className="flex items-center gap-0.5">
@@ -573,9 +583,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
               {/* Policies — pushed right on wide screens */}
               <button
-                onClick={() => setPoliciesOpen(true)}
-                className="flex shrink-0 cursor-pointer items-center gap-1.5 font-mono text-xs text-muted-foreground transition-colors hover:text-foreground sm:ml-auto"
-                title="运行时策略 · 点击调整"
+                onClick={() => !readOnly && setPoliciesOpen(true)}
+                disabled={readOnly}
+                className="flex shrink-0 items-center gap-1.5 font-mono text-xs text-muted-foreground transition-colors hover:text-foreground disabled:cursor-default disabled:hover:text-muted-foreground sm:ml-auto cursor-pointer disabled:cursor-default"
+                title={readOnly ? '游客身份仅可查看策略' : '运行时策略 · 点击调整'}
               >
                 <span className="shrink-0">策略</span>
                 <span className="shrink-0 text-border">·</span>
@@ -635,15 +646,17 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     {queryingInfo ? `${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询'}
                   </span>
                 </button>
-                <button
-                  onClick={() => setKamImportDialogOpen(true)}
-                  title="KAM 导入"
-                  aria-label="KAM 导入"
-                  className="inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-border px-2.5 text-xs font-medium text-foreground transition-colors hover:bg-muted sm:px-3"
-                >
-                  <FileUp className="h-3.5 w-3.5" />
-                  <span className="hidden sm:inline">KAM</span>
-                </button>
+                {!readOnly && (
+                  <button
+                    onClick={() => setKamImportDialogOpen(true)}
+                    title="KAM 导入"
+                    aria-label="KAM 导入"
+                    className="inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-border px-2.5 text-xs font-medium text-foreground transition-colors hover:bg-muted sm:px-3"
+                  >
+                    <FileUp className="h-3.5 w-3.5" />
+                    <span className="hidden sm:inline">KAM</span>
+                  </button>
+                )}
 
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
@@ -655,28 +668,32 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     </button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end" className="w-52">
-                    <DropdownMenuItem onClick={() => setAddDialogOpen(true)}>
-                      <Plus /> 添加凭证
-                    </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => setBatchImportDialogOpen(true)}>
-                      <Upload /> 批量导入
-                    </DropdownMenuItem>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem onClick={() => setPoliciesOpen(true)}>
-                      <Settings2 /> 运行时策略
-                    </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => setProxyGroupsOpen(true)}>
-                      <Network /> 代理分组
-                    </DropdownMenuItem>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem
-                      onClick={handleClearAll}
-                      disabled={disabledCredentialCount === 0}
-                      className="text-bad focus:text-bad"
-                    >
-                      <Trash2 />
-                      清除已禁用 ({disabledCredentialCount})
-                    </DropdownMenuItem>
+                    {!readOnly && (
+                      <>
+                        <DropdownMenuItem onClick={() => setAddDialogOpen(true)}>
+                          <Plus /> 添加凭证
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => setBatchImportDialogOpen(true)}>
+                          <Upload /> 批量导入
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem onClick={() => setPoliciesOpen(true)}>
+                          <Settings2 /> 运行时策略
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => setProxyGroupsOpen(true)}>
+                          <Network /> 代理分组
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          onClick={handleClearAll}
+                          disabled={disabledCredentialCount === 0}
+                          className="text-bad focus:text-bad"
+                        >
+                          <Trash2 />
+                          清除已禁用 ({disabledCredentialCount})
+                        </DropdownMenuItem>
+                      </>
+                    )}
                     <DropdownMenuItem
                       onClick={handleLogout}
                       className="text-bad focus:text-bad lg:hidden"
@@ -895,23 +912,27 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </button>
             <div className="ml-1 flex flex-1 items-center gap-1.5 overflow-x-auto no-scrollbar">
               <BarAction onClick={handleBatchVerify} icon={<CheckCircle2 className="h-3.5 w-3.5" />}>验活</BarAction>
-              <BarAction
-                onClick={handleBatchForceRefresh}
-                disabled={batchRefreshing}
-                icon={<RefreshCw className={cn('h-3.5 w-3.5', batchRefreshing && 'animate-spin')} />}
-              >
-                {batchRefreshing ? `${batchRefreshProgress.current}/${batchRefreshProgress.total}` : '刷 Token'}
-              </BarAction>
-              <BarAction onClick={handleBatchResetFailure} icon={<RotateCcw className="h-3.5 w-3.5" />}>恢复</BarAction>
-              <BarAction
-                onClick={handleBatchDelete}
-                disabled={selectedDisabledCount === 0}
-                tone="bad"
-                icon={<Trash2 className="h-3.5 w-3.5" />}
-                title={selectedDisabledCount === 0 ? '只能删除已禁用凭据' : undefined}
-              >
-                删除
-              </BarAction>
+              {!readOnly && (
+                <>
+                  <BarAction
+                    onClick={handleBatchForceRefresh}
+                    disabled={batchRefreshing}
+                    icon={<RefreshCw className={cn('h-3.5 w-3.5', batchRefreshing && 'animate-spin')} />}
+                  >
+                    {batchRefreshing ? `${batchRefreshProgress.current}/${batchRefreshProgress.total}` : '刷 Token'}
+                  </BarAction>
+                  <BarAction onClick={handleBatchResetFailure} icon={<RotateCcw className="h-3.5 w-3.5" />}>恢复</BarAction>
+                  <BarAction
+                    onClick={handleBatchDelete}
+                    disabled={selectedDisabledCount === 0}
+                    tone="bad"
+                    icon={<Trash2 className="h-3.5 w-3.5" />}
+                    title={selectedDisabledCount === 0 ? '只能删除已禁用凭据' : undefined}
+                  >
+                    删除
+                  </BarAction>
+                </>
+              )}
             </div>
           </div>
         </div>

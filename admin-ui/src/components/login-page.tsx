@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { ArrowRight, Lock } from 'lucide-react'
 import { storage } from '@/lib/storage'
+import { getMe } from '@/api/credentials'
 
 interface LoginPageProps {
   onLogin: (apiKey: string) => void
@@ -9,17 +10,31 @@ interface LoginPageProps {
 export function LoginPage({ onLogin }: LoginPageProps) {
   const [apiKey, setApiKey] = useState('')
   const [show, setShow] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
 
   useEffect(() => {
     const saved = storage.getApiKey()
     if (saved) setApiKey(saved)
   }, [])
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (apiKey.trim()) {
-      storage.setApiKey(apiKey.trim())
-      onLogin(apiKey.trim())
+    const trimmed = apiKey.trim()
+    if (!trimmed) return
+    setSubmitting(true)
+    setError(null)
+    storage.setApiKey(trimmed)
+    try {
+      await getMe()
+      onLogin(trimmed)
+    } catch (err: unknown) {
+      storage.removeApiKey()
+      const status = (err as { response?: { status?: number } })?.response?.status
+      if (status === 401) setError('API Key 无效')
+      else setError('登录失败，请稍后重试')
+    } finally {
+      setSubmitting(false)
     }
   }
 
@@ -76,12 +91,16 @@ export function LoginPage({ onLogin }: LoginPageProps) {
             </div>
           </div>
 
+          {error && (
+            <p className="text-xs text-bad" role="alert">{error}</p>
+          )}
+
           <button
             type="submit"
-            disabled={!apiKey.trim()}
+            disabled={!apiKey.trim() || submitting}
             className="group inline-flex h-11 w-full cursor-pointer items-center justify-center gap-1.5 rounded-lg bg-foreground text-sm font-medium text-background transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
           >
-            <span>进入控制台</span>
+            <span>{submitting ? '验证中…' : '进入控制台'}</span>
             <ArrowRight className="h-4 w-4 transition-transform duration-200 ease-out group-hover:translate-x-0.5" />
           </button>
         </form>

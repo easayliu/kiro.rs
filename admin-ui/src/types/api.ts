@@ -1,3 +1,10 @@
+// 调用方角色
+export type AdminRole = 'admin' | 'guest'
+
+export interface MeResponse {
+  role: AdminRole
+}
+
 // 凭据状态响应
 export interface CredentialsStatusResponse {
   total: number

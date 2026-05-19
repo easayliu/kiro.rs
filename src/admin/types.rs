@@ -6,6 +6,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::config::{ClientMode, ProxyGroupConfig};
 
+// ============ 当前用户 ============
+
+/// 当前调用方信息
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeResponse {
+    /// 角色：`admin` 拥有完整权限，`guest` 仅可只读
+    pub role: &'static str,
+}
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应
@@ -404,6 +414,10 @@ impl AdminErrorResponse {
 
     pub fn authentication_error() -> Self {
         Self::new("authentication_error", "Invalid or missing admin API key")
+    }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::new("forbidden", message)
     }
 
     pub fn not_found(message: impl Into<String>) -> Self {

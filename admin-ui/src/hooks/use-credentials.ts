@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
+  getMe,
   getCredentials,
   setCredentialDisabled,
   setCredentialPriority,
@@ -23,6 +24,22 @@ import {
   batchSetCredentialGroup,
 } from '@/api/credentials'
 import type { AddCredentialRequest, UpsertProxyGroupRequest } from '@/types/api'
+
+// 查询当前调用方角色
+export function useMe() {
+  return useQuery({
+    queryKey: ['me'],
+    queryFn: getMe,
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  })
+}
+
+// 是否为只读用户（guest）
+export function useIsReadOnly(): boolean {
+  const { data } = useMe()
+  return data?.role === 'guest'
+}
 
 // 查询凭据列表
 export function useCredentials() {
