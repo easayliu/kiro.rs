@@ -9,10 +9,10 @@ use axum::{
 use super::{
     middleware::{AdminRole, AdminState},
     types::{
-        AddCredentialRequest, BatchSetCredentialGroupRequest, MeResponse, SetCacheSkipRateRequest,
-        SetCredentialGroupRequest, SetDisabledRequest, SetGlobalCacheRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SetRpmLimitRequest, SuccessResponse,
-        UpsertProxyGroupRequest,
+        AddCredentialRequest, BatchSetCredentialGroupRequest, BatchSetPriorityRequest, MeResponse,
+        SetCacheSkipRateRequest, SetCredentialGroupRequest, SetDisabledRequest,
+        SetGlobalCacheRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetRpmLimitRequest,
+        SuccessResponse, UpsertProxyGroupRequest,
     },
 };
 
@@ -277,6 +277,18 @@ pub async fn set_credential_group(
             };
             Json(SuccessResponse::new(msg)).into_response()
         }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/priority/batch
+/// 批量设置凭据优先级
+pub async fn batch_set_priority(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchSetPriorityRequest>,
+) -> impl IntoResponse {
+    match state.service.batch_set_priority(payload) {
+        Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

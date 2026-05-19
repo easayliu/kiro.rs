@@ -12,6 +12,7 @@ import type {
   ProxyGroupsResponse,
   UpsertProxyGroupRequest,
   BatchSetCredentialGroupResponse,
+  BatchSetPriorityResponse,
   MeResponse,
 } from '@/types/api'
 
@@ -210,6 +211,17 @@ export async function batchSetCredentialGroup(
   const { data } = await api.post<BatchSetCredentialGroupResponse>(
     '/credentials/group/batch',
     { credentialIds, group },
+  )
+  return data
+}
+
+export async function batchSetPriority(
+  credentialIds: number[],
+  priority: number,
+): Promise<BatchSetPriorityResponse> {
+  const { data } = await api.post<BatchSetPriorityResponse>(
+    '/credentials/priority/batch',
+    { credentialIds, priority },
   )
   return data
 }

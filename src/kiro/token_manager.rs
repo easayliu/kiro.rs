@@ -1854,6 +1854,59 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 批量设置凭据优先级（Admin API）
+    ///
+    /// 内存写入和持久化合并为单次磁盘 IO；持久化失败时回滚所有已修改条目，
+    /// 整批转为失败。返回结构沿用 [`BatchSetGroupResult`] 的 succeeded/failed 形态。
+    pub fn set_priority_batch(&self, ids: &[u64], priority: u32) -> BatchSetGroupResult {
+        let mut succeeded = Vec::new();
+        let mut failed: Vec<BatchSetGroupFailure> = Vec::new();
+        let mut previous: Vec<(u64, u32)> = Vec::new();
+
+        {
+            let mut entries = self.entries.lock();
+            for id in ids {
+                match entries.iter_mut().find(|e| e.id == *id) {
+                    Some(entry) => {
+                        previous.push((*id, entry.credentials.priority));
+                        entry.credentials.priority = priority;
+                        succeeded.push(*id);
+                    }
+                    None => failed.push(BatchSetGroupFailure {
+                        id: *id,
+                        error: format!("凭据不存在: {}", id),
+                    }),
+                }
+            }
+        }
+
+        if !succeeded.is_empty() {
+            if let Err(err) = self.persist_credentials() {
+                let msg = err.to_string();
+                let mut entries = self.entries.lock();
+                for (id, prev) in &previous {
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == *id) {
+                        entry.credentials.priority = *prev;
+                    }
+                }
+                for id in &succeeded {
+                    failed.push(BatchSetGroupFailure {
+                        id: *id,
+                        error: format!("持久化失败: {}", msg),
+                    });
+                }
+                return BatchSetGroupResult {
+                    succeeded: vec![],
+                    failed,
+                };
+            }
+            // 持久化成功后按新优先级重新选择当前凭据
+            self.select_highest_priority();
+        }
+
+        BatchSetGroupResult { succeeded, failed }
+    }
+
     /// 设置凭据级 RPM 上限（Admin API）
     ///
     /// 传 None 表示清除凭据级覆盖，回退到全局默认；

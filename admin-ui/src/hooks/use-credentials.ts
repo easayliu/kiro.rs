@@ -23,6 +23,7 @@ import {
   deleteProxyGroup,
   setCredentialGroup,
   batchSetCredentialGroup,
+  batchSetPriority,
 } from '@/api/credentials'
 import type { AddCredentialRequest, UpsertProxyGroupRequest } from '@/types/api'
 
@@ -267,6 +268,17 @@ export function useBatchSetCredentialGroup() {
   return useMutation({
     mutationFn: ({ credentialIds, group }: { credentialIds: number[]; group: string | null }) =>
       batchSetCredentialGroup(credentialIds, group),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+export function useBatchSetPriority() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ credentialIds, priority }: { credentialIds: number[]; priority: number }) =>
+      batchSetPriority(credentialIds, priority),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

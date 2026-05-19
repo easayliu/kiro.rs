@@ -16,7 +16,8 @@ use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse,
     BatchSetCredentialGroupFailure, BatchSetCredentialGroupRequest,
-    BatchSetCredentialGroupResponse, CacheSkipRateResponse, CredentialStatusItem,
+    BatchSetCredentialGroupResponse, BatchSetPriorityRequest, BatchSetPriorityResponse,
+    CacheSkipRateResponse, CredentialStatusItem,
     CredentialsStatusResponse, GlobalCacheResponse, LoadBalancingModeResponse,
     ProxyGroupsResponse, SetCacheSkipRateRequest, SetCredentialGroupRequest,
     SetGlobalCacheRequest, SetLoadBalancingModeRequest, UpsertProxyGroupRequest,
@@ -460,6 +461,34 @@ impl AdminService {
         self.token_manager
             .set_group(id, req.group)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 批量设置凭据优先级
+    pub fn batch_set_priority(
+        &self,
+        req: BatchSetPriorityRequest,
+    ) -> Result<BatchSetPriorityResponse, AdminServiceError> {
+        if req.credential_ids.is_empty() {
+            return Err(AdminServiceError::InvalidParameter(
+                "credentialIds 不能为空".to_string(),
+            ));
+        }
+        let total = req.credential_ids.len();
+        let result = self
+            .token_manager
+            .set_priority_batch(&req.credential_ids, req.priority);
+        Ok(BatchSetPriorityResponse {
+            total,
+            succeeded: result.succeeded,
+            failed: result
+                .failed
+                .into_iter()
+                .map(|f| BatchSetCredentialGroupFailure {
+                    id: f.id,
+                    error: f.error,
+                })
+                .collect(),
+        })
     }
 
     /// 批量设置凭据所属代理分组

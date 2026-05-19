@@ -390,6 +390,23 @@ pub struct BatchSetCredentialGroupFailure {
     pub error: String,
 }
 
+/// 批量设置凭据优先级请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetPriorityRequest {
+    pub credential_ids: Vec<u64>,
+    pub priority: u32,
+}
+
+/// 批量设置凭据优先级响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetPriorityResponse {
+    pub total: usize,
+    pub succeeded: Vec<u64>,
+    pub failed: Vec<BatchSetCredentialGroupFailure>,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

@@ -7,10 +7,10 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, batch_set_credential_group, delete_credential, delete_proxy_group,
-        force_refresh_token, get_all_credentials, get_cache_scope, get_cache_skip_rate,
-        get_credential_balance, get_global_cache, get_load_balancing_mode, get_me,
-        list_proxy_groups, reset_failure_count, set_cache_scope, set_cache_skip_rate,
+        add_credential, batch_set_credential_group, batch_set_priority, delete_credential,
+        delete_proxy_group, force_refresh_token, get_all_credentials, get_cache_scope,
+        get_cache_skip_rate, get_credential_balance, get_global_cache, get_load_balancing_mode,
+        get_me, list_proxy_groups, reset_failure_count, set_cache_scope, set_cache_skip_rate,
         set_credential_disabled, set_credential_group, set_credential_priority,
         set_credential_rpm_limit, set_global_cache, set_load_balancing_mode, upsert_proxy_group,
     },
@@ -59,6 +59,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/balance", get(get_credential_balance))
         .route("/credentials/{id}/group", post(set_credential_group))
         .route("/credentials/group/batch", post(batch_set_credential_group))
+        .route("/credentials/priority/batch", post(batch_set_priority))
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),

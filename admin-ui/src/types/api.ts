@@ -149,3 +149,9 @@ export interface BatchSetCredentialGroupResponse {
   succeeded: number[]
   failed: BatchSetCredentialGroupFailure[]
 }
+
+export interface BatchSetPriorityResponse {
+  total: number
+  succeeded: number[]
+  failed: BatchSetCredentialGroupFailure[]
+}

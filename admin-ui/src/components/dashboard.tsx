@@ -20,6 +20,7 @@ import {
   MoreHorizontal,
   Settings2,
   Network,
+  ArrowUpDown,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -42,6 +43,7 @@ import {
   useCacheSkipRate,
   useSetCacheSkipRate,
   useIsReadOnly,
+  useBatchSetPriority,
 } from '@/hooks/use-credentials'
 import type { CacheScope } from '@/api/credentials'
 import {
@@ -94,6 +96,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<FilterKey>('all')
   const [policiesOpen, setPoliciesOpen] = useState(false)
+  const [batchPriorityDialogOpen, setBatchPriorityDialogOpen] = useState(false)
+  const [batchPriorityValue, setBatchPriorityValue] = useState('0')
   const [proxyGroupsOpen, setProxyGroupsOpen] = useState(false)
   const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const
   const [itemsPerPage, setItemsPerPage] = useState<number>(() => {
@@ -140,6 +144,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data, isLoading, error, refetch } = useCredentials()
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
+  const batchSetPriorityMutation = useBatchSetPriority()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const { data: cacheScopeData, isLoading: isLoadingCacheScope } = useCacheScope()
@@ -398,6 +403,35 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setQueryingInfo(false)
     if (failCount === 0) toast.success(`查询完成：成功 ${successCount}/${ids.length}`)
     else toast.warning(`查询完成：成功 ${successCount} 个，失败 ${failCount} 个`)
+  }
+
+  const openBatchPriorityDialog = () => {
+    if (selectedIds.size === 0) { toast.error('请先选择要调整的凭据'); return }
+    setBatchPriorityValue('0')
+    setBatchPriorityDialogOpen(true)
+  }
+
+  const handleBatchPrioritySubmit = () => {
+    const trimmed = batchPriorityValue.trim()
+    const parsed = Number(trimmed)
+    if (trimmed === '' || !Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+      toast.error('请输入 ≥ 0 的整数')
+      return
+    }
+    const ids = Array.from(selectedIds)
+    batchSetPriorityMutation.mutate(
+      { credentialIds: ids, priority: parsed },
+      {
+        onSuccess: res => {
+          const failed = res.failed.length
+          if (failed === 0) toast.success(`已将 ${res.succeeded.length} 个凭据优先级设为 ${parsed}`)
+          else toast.warning(`成功 ${res.succeeded.length} 个，失败 ${failed} 个`)
+          setBatchPriorityDialogOpen(false)
+          deselectAll()
+        },
+        onError: err => toast.error('批量调整失败: ' + (err as Error).message),
+      },
+    )
   }
 
   const handleBatchVerify = async () => {
@@ -960,6 +994,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   </BarAction>
                   <BarAction onClick={handleBatchResetFailure} icon={<RotateCcw className="h-3.5 w-3.5" />}>恢复</BarAction>
                   <BarAction
+                    onClick={openBatchPriorityDialog}
+                    disabled={batchSetPriorityMutation.isPending}
+                    icon={<ArrowUpDown className="h-3.5 w-3.5" />}
+                  >
+                    优先级
+                  </BarAction>
+                  <BarAction
                     onClick={handleBatchDelete}
                     disabled={selectedDisabledCount === 0}
                     tone="bad"
@@ -1026,6 +1067,45 @@ export function Dashboard({ onLogout }: DashboardProps) {
               onClick={handleToggleLoadBalancing}
             />
           </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={batchPriorityDialogOpen} onOpenChange={setBatchPriorityDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>批量调整优先级</DialogTitle>
+            <DialogDescription>
+              将选中的 <span className="font-mono tnum font-semibold">{selectedIds.size}</span> 个凭据统一设置为以下优先级（数字越小优先级越高）。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 py-2">
+            <Input
+              type="number"
+              min={0}
+              step={1}
+              placeholder="例如 0"
+              value={batchPriorityValue}
+              onChange={e => setBatchPriorityValue(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') handleBatchPrioritySubmit() }}
+              autoFocus
+              className="tnum font-mono"
+            />
+            <p className="text-2xs text-muted-foreground">
+              整数 ≥ 0。该值生效后会按新优先级重新选择当前活跃凭据。
+            </p>
+          </div>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setBatchPriorityDialogOpen(false)}
+              disabled={batchSetPriorityMutation.isPending}
+            >
+              取消
+            </Button>
+            <Button onClick={handleBatchPrioritySubmit} disabled={batchSetPriorityMutation.isPending}>
+              {batchSetPriorityMutation.isPending ? '保存中…' : '保存'}
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 
