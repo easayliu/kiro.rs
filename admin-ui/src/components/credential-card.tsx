@@ -57,6 +57,17 @@ interface CredentialCardProps {
   loadingBalance: boolean
 }
 
+// 把剩余毫秒格式化为简短中文（"45s" / "2m" / "1h12m"）
+function formatRemaining(ms: number): string {
+  const total = Math.ceil(ms / 1000)
+  if (total < 60) return `${total}s`
+  const m = Math.floor(total / 60)
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  const rem = m % 60
+  return rem > 0 ? `${h}h${rem}m` : `${h}h`
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -159,6 +170,11 @@ export function CredentialCard({
   const displayName = credential.email || `凭据 #${credential.id}`
   const initial = (credential.email?.[0] || '#').toUpperCase()
 
+  const throttledRemainingMs = credential.throttledUntil
+    ? Math.max(0, Date.parse(credential.throttledUntil) - Date.now())
+    : 0
+  const isThrottled = throttledRemainingMs > 0
+
   const barColor =
     !balance
       ? 'bg-muted'
@@ -171,18 +187,22 @@ export function CredentialCard({
   // Status label for the subtitle row
   const statusLabel = credential.disabled
     ? credential.disabledReason || '已禁用'
-    : hasFailures
-      ? '异常'
-      : credential.isCurrent
-        ? '活跃'
-        : null
+    : isThrottled
+      ? `限流冷却 剩${formatRemaining(throttledRemainingMs)}`
+      : hasFailures
+        ? '异常'
+        : credential.isCurrent
+          ? '活跃'
+          : null
   const statusClass = credential.disabled
     ? 'text-bad'
-    : hasFailures
+    : isThrottled
       ? 'text-warn'
-      : credential.isCurrent
-        ? 'text-foreground'
-        : 'text-muted-foreground'
+      : hasFailures
+        ? 'text-warn'
+        : credential.isCurrent
+          ? 'text-foreground'
+          : 'text-muted-foreground'
 
   return (
     <>

@@ -33,6 +33,8 @@ export interface CredentialStatusItem {
   group?: string
   refreshFailureCount: number
   disabledReason?: string
+  /** 上游 429 冷却到期时间（RFC3339）；不存在时表示未在冷却 */
+  throttledUntil?: string
 }
 
 // 余额响应

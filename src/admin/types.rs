@@ -73,6 +73,9 @@ pub struct CredentialStatusItem {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 上游 429 冷却到期时间（RFC3339）；None=未在冷却
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throttled_until: Option<String>,
 }
 
 // ============ 操作请求 ============

@@ -85,6 +85,7 @@ impl AdminService {
                 group: entry.group,
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
+                throttled_until: entry.throttled_until,
             })
             .collect();
 

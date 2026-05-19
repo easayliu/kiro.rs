@@ -481,6 +481,9 @@ pub struct CredentialEntrySnapshot {
     /// 禁用原因
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// 上游 429 冷却到期时间（RFC3339）；None=未在冷却
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throttled_until: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -1719,6 +1722,10 @@ impl MultiTokenManager {
                         DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                         DisabledReason::InvalidConfig => "InvalidConfig",
                     }.to_string()),
+                    throttled_until: e
+                        .throttled_until
+                        .filter(|t| *t > Utc::now())
+                        .map(|t| t.to_rfc3339()),
                 })
                 .collect(),
             current_id,
