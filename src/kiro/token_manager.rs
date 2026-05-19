@@ -557,6 +557,8 @@ pub struct MultiTokenManager {
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// 全局默认 RPM 上限（运行时可变；初始化自 config，Admin API 修改后实时生效并持久化）
+    default_rpm_limit: Mutex<Option<u32>>,
     /// 代理分组（运行时可修改，与 config.json 中 proxyGroups 同步）
     proxy_groups: RwLock<BTreeMap<String, ProxyGroupConfig>>,
     /// 最近一次统计持久化时间（用于 debounce）
@@ -572,15 +574,15 @@ const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 /// RPM 滑动窗口长度（秒）
 const RPM_WINDOW_SECS: i64 = 60;
 
-/// 根据凭据级与全局配置计算生效的 RPM 上限
+/// 根据凭据级与全局默认计算生效的 RPM 上限
 ///
 /// 优先级：凭据级 > 全局；任意一级显式为 0 视为"不限流"（停用该层级的限制）。
 /// 返回 None 表示无 RPM 限制。
-fn effective_rpm_limit(cred: &KiroCredentials, config: &Config) -> Option<u32> {
+fn effective_rpm_limit(cred: &KiroCredentials, default: Option<u32>) -> Option<u32> {
     match cred.rpm_limit {
         Some(0) => None,
         Some(n) => Some(n),
-        None => match config.default_rpm_limit {
+        None => match default {
             Some(0) => None,
             Some(n) => Some(n),
             None => None,
@@ -722,6 +724,7 @@ impl MultiTokenManager {
 
         let load_balancing_mode = config.load_balancing_mode.clone();
         let proxy_groups = config.proxy_groups.clone();
+        let default_rpm_limit = config.default_rpm_limit;
         let manager = Self {
             config,
             proxy,
@@ -731,6 +734,7 @@ impl MultiTokenManager {
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            default_rpm_limit: Mutex::new(default_rpm_limit),
             proxy_groups: RwLock::new(proxy_groups),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
@@ -909,6 +913,7 @@ impl MultiTokenManager {
         // 进一步剔除处于 429 冷却期或 RPM 已耗尽的凭据，得到"鲜活"集合
         let now = Utc::now();
         let rpm_cutoff = now - Duration::seconds(RPM_WINDOW_SECS);
+        let default_rpm = *self.default_rpm_limit.lock();
         let fresh_indices: Vec<usize> = base_indices
             .iter()
             .copied()
@@ -917,7 +922,7 @@ impl MultiTokenManager {
                 if entry.throttled_until.is_some_and(|until| until > now) {
                     return false;
                 }
-                if let Some(limit) = effective_rpm_limit(&entry.credentials, &self.config) {
+                if let Some(limit) = effective_rpm_limit(&entry.credentials, default_rpm) {
                     prune_rpm_window(&mut entry.rpm_window, rpm_cutoff);
                     if entry.rpm_window.len() >= limit as usize {
                         return false;
@@ -1457,9 +1462,10 @@ impl MultiTokenManager {
     /// 在 `acquire_context` 成功获取上下文后调用，统计实际派发到该凭据的请求数。
     /// 即使本次请求最终失败（401/429/网络等），也已计入——与上游对话单元一致。
     fn record_request_for_rpm(&self, id: u64) {
+        let default_rpm = *self.default_rpm_limit.lock();
         let mut entries = self.entries.lock();
         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-            if effective_rpm_limit(&entry.credentials, &self.config).is_none() {
+            if effective_rpm_limit(&entry.credentials, default_rpm).is_none() {
                 return;
             }
             let now = Utc::now();
@@ -1807,7 +1813,7 @@ impl MultiTokenManager {
             current_id,
             total: entries.len(),
             available,
-            default_rpm_limit: self.config.default_rpm_limit,
+            default_rpm_limit: *self.default_rpm_limit.lock(),
         }
     }
 
@@ -1922,6 +1928,56 @@ impl MultiTokenManager {
         }
         self.persist_credentials()?;
         Ok(())
+    }
+
+    /// 批量设置凭据级 RPM 上限（Admin API）
+    ///
+    /// 行为与 [`Self::set_priority_batch`] 一致：合并 IO + 失败回滚。
+    pub fn set_rpm_limit_batch(&self, ids: &[u64], rpm_limit: Option<u32>) -> BatchSetGroupResult {
+        let mut succeeded = Vec::new();
+        let mut failed: Vec<BatchSetGroupFailure> = Vec::new();
+        let mut previous: Vec<(u64, Option<u32>)> = Vec::new();
+
+        {
+            let mut entries = self.entries.lock();
+            for id in ids {
+                match entries.iter_mut().find(|e| e.id == *id) {
+                    Some(entry) => {
+                        previous.push((*id, entry.credentials.rpm_limit));
+                        entry.credentials.rpm_limit = rpm_limit;
+                        succeeded.push(*id);
+                    }
+                    None => failed.push(BatchSetGroupFailure {
+                        id: *id,
+                        error: format!("凭据不存在: {}", id),
+                    }),
+                }
+            }
+        }
+
+        if !succeeded.is_empty() {
+            if let Err(err) = self.persist_credentials() {
+                let msg = err.to_string();
+                let mut entries = self.entries.lock();
+                for (id, prev) in &previous {
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == *id) {
+                        entry.credentials.rpm_limit = *prev;
+                    }
+                }
+                for id in &succeeded {
+                    failed.push(BatchSetGroupFailure {
+                        id: *id,
+                        error: format!("持久化失败: {}", msg),
+                    });
+                }
+                return BatchSetGroupResult {
+                    succeeded: vec![],
+                    failed,
+                };
+            }
+        }
+
+        BatchSetGroupResult { succeeded, failed }
     }
 
     /// 设置凭据所属代理分组（Admin API）
@@ -2376,6 +2432,50 @@ impl MultiTokenManager {
     /// 获取负载均衡模式（Admin API）
     pub fn get_load_balancing_mode(&self) -> String {
         self.load_balancing_mode.lock().clone()
+    }
+
+    /// 获取全局默认 RPM 上限（Admin API）
+    pub fn get_default_rpm_limit(&self) -> Option<u32> {
+        *self.default_rpm_limit.lock()
+    }
+
+    /// 设置全局默认 RPM 上限（Admin API）；持久化到 config.json
+    ///
+    /// 传 None 表示清空；传 Some(0) 表示显式不限流。
+    pub fn set_default_rpm_limit(&self, value: Option<u32>) -> anyhow::Result<()> {
+        let previous = *self.default_rpm_limit.lock();
+        *self.default_rpm_limit.lock() = value;
+
+        if let Err(e) = self.persist_default_rpm_limit(value) {
+            // 持久化失败：回滚内存值
+            *self.default_rpm_limit.lock() = previous;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn persist_default_rpm_limit(&self, value: Option<u32>) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!(
+                    "配置文件路径未知，全局默认 RPM 仅在当前进程生效: {:?}",
+                    value
+                );
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.default_rpm_limit = value;
+        config
+            .save()
+            .with_context(|| format!("持久化全局默认 RPM 失败: {}", config_path.display()))?;
+
+        Ok(())
     }
 
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {

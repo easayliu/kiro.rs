@@ -21,6 +21,7 @@ import {
   Settings2,
   Network,
   ArrowUpDown,
+  Gauge,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -44,6 +45,9 @@ import {
   useSetCacheSkipRate,
   useIsReadOnly,
   useBatchSetPriority,
+  useBatchSetRpmLimit,
+  useDefaultRpmLimit,
+  useSetDefaultRpmLimit,
 } from '@/hooks/use-credentials'
 import type { CacheScope } from '@/api/credentials'
 import {
@@ -98,6 +102,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [policiesOpen, setPoliciesOpen] = useState(false)
   const [batchPriorityDialogOpen, setBatchPriorityDialogOpen] = useState(false)
   const [batchPriorityValue, setBatchPriorityValue] = useState('0')
+  const [batchRpmDialogOpen, setBatchRpmDialogOpen] = useState(false)
+  const [batchRpmValue, setBatchRpmValue] = useState('')
+  const [defaultRpmDialogOpen, setDefaultRpmDialogOpen] = useState(false)
+  const [defaultRpmValue, setDefaultRpmValue] = useState('')
   const [proxyGroupsOpen, setProxyGroupsOpen] = useState(false)
   const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const
   const [itemsPerPage, setItemsPerPage] = useState<number>(() => {
@@ -145,6 +153,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
   const batchSetPriorityMutation = useBatchSetPriority()
+  const batchSetRpmLimitMutation = useBatchSetRpmLimit()
+  const { data: defaultRpmData } = useDefaultRpmLimit()
+  const setDefaultRpmMutation = useSetDefaultRpmLimit()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const { data: cacheScopeData, isLoading: isLoadingCacheScope } = useCacheScope()
@@ -432,6 +443,81 @@ export function Dashboard({ onLogout }: DashboardProps) {
         onError: err => toast.error('批量调整失败: ' + (err as Error).message),
       },
     )
+  }
+
+  const openBatchRpmDialog = () => {
+    if (selectedIds.size === 0) { toast.error('请先选择要调整的凭据'); return }
+    setBatchRpmValue('')
+    setBatchRpmDialogOpen(true)
+  }
+
+  const handleBatchRpmSubmit = () => {
+    const trimmed = batchRpmValue.trim()
+    let payload: number | null
+    if (trimmed === '') {
+      payload = null
+    } else {
+      const parsed = Number(trimmed)
+      if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+        toast.error('请输入 ≥ 0 的整数（0 表示不限流，留空表示回退全局默认）')
+        return
+      }
+      payload = parsed
+    }
+    const ids = Array.from(selectedIds)
+    batchSetRpmLimitMutation.mutate(
+      { credentialIds: ids, rpmLimit: payload },
+      {
+        onSuccess: res => {
+          const failed = res.failed.length
+          const label = payload === null
+            ? '回退全局默认'
+            : payload === 0
+              ? '显式不限流'
+              : `${payload} 次/分钟`
+          if (failed === 0) toast.success(`已将 ${res.succeeded.length} 个凭据 RPM 设为${label}`)
+          else toast.warning(`成功 ${res.succeeded.length} 个，失败 ${failed} 个`)
+          setBatchRpmDialogOpen(false)
+          deselectAll()
+        },
+        onError: err => toast.error('批量调整失败: ' + (err as Error).message),
+      },
+    )
+  }
+
+  const openDefaultRpmDialog = () => {
+    setDefaultRpmValue(
+      typeof defaultRpmData?.rpmLimit === 'number' ? String(defaultRpmData.rpmLimit) : '',
+    )
+    setDefaultRpmDialogOpen(true)
+  }
+
+  const handleDefaultRpmSubmit = () => {
+    const trimmed = defaultRpmValue.trim()
+    let payload: number | null
+    if (trimmed === '') {
+      payload = null
+    } else {
+      const parsed = Number(trimmed)
+      if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+        toast.error('请输入 ≥ 0 的整数（0 表示不限流，留空表示清除）')
+        return
+      }
+      payload = parsed
+    }
+    setDefaultRpmMutation.mutate(payload, {
+      onSuccess: () => {
+        toast.success(
+          payload === null
+            ? '已清除全局默认 RPM'
+            : payload === 0
+              ? '全局默认已设为不限流'
+              : `全局默认 RPM 已设为 ${payload} 次/分钟`,
+        )
+        setDefaultRpmDialogOpen(false)
+      },
+      onError: err => toast.error('保存失败: ' + (err as Error).message),
+    })
   }
 
   const handleBatchVerify = async () => {
@@ -1001,6 +1087,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     优先级
                   </BarAction>
                   <BarAction
+                    onClick={openBatchRpmDialog}
+                    disabled={batchSetRpmLimitMutation.isPending}
+                    icon={<Gauge className="h-3.5 w-3.5" />}
+                  >
+                    RPM
+                  </BarAction>
+                  <BarAction
                     onClick={handleBatchDelete}
                     disabled={selectedDisabledCount === 0}
                     tone="bad"
@@ -1066,6 +1159,25 @@ export function Dashboard({ onLogout }: DashboardProps) {
               disabled={isLoadingMode || isSettingMode}
               onClick={handleToggleLoadBalancing}
             />
+            <PolicyRow
+              label="全局 RPM 默认"
+              sub={
+                defaultRpmData?.rpmLimit == null
+                  ? '未配置（不限流）'
+                  : defaultRpmData.rpmLimit === 0
+                    ? '显式不限流'
+                    : '凭据未单独配置时回退此值'
+              }
+              value={
+                defaultRpmData?.rpmLimit == null
+                  ? '关闭'
+                  : defaultRpmData.rpmLimit === 0
+                    ? '不限'
+                    : `${defaultRpmData.rpmLimit}/min`
+              }
+              disabled={setDefaultRpmMutation.isPending}
+              onClick={() => { setPoliciesOpen(false); openDefaultRpmDialog() }}
+            />
           </div>
         </DialogContent>
       </Dialog>
@@ -1104,6 +1216,102 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Button>
             <Button onClick={handleBatchPrioritySubmit} disabled={batchSetPriorityMutation.isPending}>
               {batchSetPriorityMutation.isPending ? '保存中…' : '保存'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={batchRpmDialogOpen} onOpenChange={setBatchRpmDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>批量调整 RPM 上限</DialogTitle>
+            <DialogDescription>
+              将选中的 <span className="font-mono tnum font-semibold">{selectedIds.size}</span> 个凭据统一设置每分钟请求上限。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 py-2">
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={0}
+                step={1}
+                placeholder={
+                  typeof defaultRpmData?.rpmLimit === 'number'
+                    ? `全局默认 ${defaultRpmData.rpmLimit}`
+                    : '留空使用全局默认'
+                }
+                value={batchRpmValue}
+                onChange={e => setBatchRpmValue(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') handleBatchRpmSubmit() }}
+                autoFocus
+                className="tnum font-mono"
+              />
+              <span className="shrink-0 text-xs text-muted-foreground">次/分钟</span>
+            </div>
+            <p className="text-2xs text-muted-foreground">
+              · 留空：清除凭据级覆盖，回退到全局默认
+              <br />
+              · 0：显式不限流（即使全局有默认）
+              <br />
+              · 正整数：限制为 N 次/分钟
+            </p>
+          </div>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setBatchRpmDialogOpen(false)}
+              disabled={batchSetRpmLimitMutation.isPending}
+            >
+              取消
+            </Button>
+            <Button onClick={handleBatchRpmSubmit} disabled={batchSetRpmLimitMutation.isPending}>
+              {batchSetRpmLimitMutation.isPending ? '保存中…' : '保存'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={defaultRpmDialogOpen} onOpenChange={setDefaultRpmDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>全局默认 RPM 上限</DialogTitle>
+            <DialogDescription>
+              凭据未单独设置 RPM 时回退到此值，立即生效并持久化到 config.json。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 py-2">
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={0}
+                step={1}
+                placeholder="留空表示关闭（不限流）"
+                value={defaultRpmValue}
+                onChange={e => setDefaultRpmValue(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') handleDefaultRpmSubmit() }}
+                autoFocus
+                className="tnum font-mono"
+              />
+              <span className="shrink-0 text-xs text-muted-foreground">次/分钟</span>
+            </div>
+            <p className="text-2xs text-muted-foreground">
+              · 留空：关闭全局默认（凭据未单独配置时不限流）
+              <br />
+              · 0：显式关闭，效果同留空
+              <br />
+              · 正整数：所有未单独配置的凭据均按此值限流
+            </p>
+          </div>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setDefaultRpmDialogOpen(false)}
+              disabled={setDefaultRpmMutation.isPending}
+            >
+              取消
+            </Button>
+            <Button onClick={handleDefaultRpmSubmit} disabled={setDefaultRpmMutation.isPending}>
+              {setDefaultRpmMutation.isPending ? '保存中…' : '保存'}
             </Button>
           </DialogFooter>
         </DialogContent>

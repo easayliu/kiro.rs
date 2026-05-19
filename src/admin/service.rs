@@ -17,10 +17,11 @@ use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse,
     BatchSetCredentialGroupFailure, BatchSetCredentialGroupRequest,
     BatchSetCredentialGroupResponse, BatchSetPriorityRequest, BatchSetPriorityResponse,
-    CacheSkipRateResponse, CredentialStatusItem,
-    CredentialsStatusResponse, GlobalCacheResponse, LoadBalancingModeResponse,
-    ProxyGroupsResponse, SetCacheSkipRateRequest, SetCredentialGroupRequest,
-    SetGlobalCacheRequest, SetLoadBalancingModeRequest, UpsertProxyGroupRequest,
+    BatchSetRpmLimitRequest, BatchSetRpmLimitResponse, CacheSkipRateResponse,
+    CredentialStatusItem, CredentialsStatusResponse, DefaultRpmLimitResponse, GlobalCacheResponse,
+    LoadBalancingModeResponse, ProxyGroupsResponse, SetCacheSkipRateRequest,
+    SetCredentialGroupRequest, SetDefaultRpmLimitRequest, SetGlobalCacheRequest,
+    SetLoadBalancingModeRequest, UpsertProxyGroupRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -488,6 +489,54 @@ impl AdminService {
                     error: f.error,
                 })
                 .collect(),
+        })
+    }
+
+    /// 批量设置凭据级 RPM 上限
+    pub fn batch_set_rpm_limit(
+        &self,
+        req: BatchSetRpmLimitRequest,
+    ) -> Result<BatchSetRpmLimitResponse, AdminServiceError> {
+        if req.credential_ids.is_empty() {
+            return Err(AdminServiceError::InvalidParameter(
+                "credentialIds 不能为空".to_string(),
+            ));
+        }
+        let total = req.credential_ids.len();
+        let result = self
+            .token_manager
+            .set_rpm_limit_batch(&req.credential_ids, req.rpm_limit);
+        Ok(BatchSetRpmLimitResponse {
+            total,
+            succeeded: result.succeeded,
+            failed: result
+                .failed
+                .into_iter()
+                .map(|f| BatchSetCredentialGroupFailure {
+                    id: f.id,
+                    error: f.error,
+                })
+                .collect(),
+        })
+    }
+
+    /// 获取全局默认 RPM 上限
+    pub fn get_default_rpm_limit(&self) -> DefaultRpmLimitResponse {
+        DefaultRpmLimitResponse {
+            rpm_limit: self.token_manager.get_default_rpm_limit(),
+        }
+    }
+
+    /// 设置全局默认 RPM 上限
+    pub fn set_default_rpm_limit(
+        &self,
+        req: SetDefaultRpmLimitRequest,
+    ) -> Result<DefaultRpmLimitResponse, AdminServiceError> {
+        self.token_manager
+            .set_default_rpm_limit(req.rpm_limit)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        Ok(DefaultRpmLimitResponse {
+            rpm_limit: req.rpm_limit,
         })
     }
 

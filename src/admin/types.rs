@@ -407,6 +407,40 @@ pub struct BatchSetPriorityResponse {
     pub failed: Vec<BatchSetCredentialGroupFailure>,
 }
 
+/// 批量设置凭据 RPM 上限请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetRpmLimitRequest {
+    pub credential_ids: Vec<u64>,
+    /// 同 `SetRpmLimitRequest.rpm_limit`：null=清除覆盖；0=显式不限流；正整数=上限
+    pub rpm_limit: Option<u32>,
+}
+
+/// 批量设置凭据 RPM 上限响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetRpmLimitResponse {
+    pub total: usize,
+    pub succeeded: Vec<u64>,
+    pub failed: Vec<BatchSetCredentialGroupFailure>,
+}
+
+/// 全局默认 RPM 上限响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefaultRpmLimitResponse {
+    /// 当前全局默认值（None=未配置，等同于不限流）
+    pub rpm_limit: Option<u32>,
+}
+
+/// 设置全局默认 RPM 上限请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDefaultRpmLimitRequest {
+    /// null=清除；0=显式不限流；正整数=每分钟 n 次
+    pub rpm_limit: Option<u32>,
+}
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

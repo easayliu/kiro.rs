@@ -155,3 +155,14 @@ export interface BatchSetPriorityResponse {
   succeeded: number[]
   failed: BatchSetCredentialGroupFailure[]
 }
+
+export interface BatchSetRpmLimitResponse {
+  total: number
+  succeeded: number[]
+  failed: BatchSetCredentialGroupFailure[]
+}
+
+export interface DefaultRpmLimitResponse {
+  /** 全局默认 RPM（null=未配置；0=显式不限流；正整数=限制） */
+  rpmLimit: number | null
+}

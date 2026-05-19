@@ -13,6 +13,8 @@ import type {
   UpsertProxyGroupRequest,
   BatchSetCredentialGroupResponse,
   BatchSetPriorityResponse,
+  BatchSetRpmLimitResponse,
+  DefaultRpmLimitResponse,
   MeResponse,
 } from '@/types/api'
 
@@ -223,5 +225,26 @@ export async function batchSetPriority(
     '/credentials/priority/batch',
     { credentialIds, priority },
   )
+  return data
+}
+
+export async function batchSetRpmLimit(
+  credentialIds: number[],
+  rpmLimit: number | null,
+): Promise<BatchSetRpmLimitResponse> {
+  const { data } = await api.post<BatchSetRpmLimitResponse>(
+    '/credentials/rpm-limit/batch',
+    { credentialIds, rpmLimit },
+  )
+  return data
+}
+
+export async function getDefaultRpmLimit(): Promise<DefaultRpmLimitResponse> {
+  const { data } = await api.get<DefaultRpmLimitResponse>('/config/default-rpm-limit')
+  return data
+}
+
+export async function setDefaultRpmLimit(rpmLimit: number | null): Promise<DefaultRpmLimitResponse> {
+  const { data } = await api.put<DefaultRpmLimitResponse>('/config/default-rpm-limit', { rpmLimit })
   return data
 }

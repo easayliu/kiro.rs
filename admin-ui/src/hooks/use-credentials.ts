@@ -24,6 +24,9 @@ import {
   setCredentialGroup,
   batchSetCredentialGroup,
   batchSetPriority,
+  batchSetRpmLimit,
+  getDefaultRpmLimit,
+  setDefaultRpmLimit,
 } from '@/api/credentials'
 import type { AddCredentialRequest, UpsertProxyGroupRequest } from '@/types/api'
 
@@ -280,6 +283,36 @@ export function useBatchSetPriority() {
     mutationFn: ({ credentialIds, priority }: { credentialIds: number[]; priority: number }) =>
       batchSetPriority(credentialIds, priority),
     onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+export function useBatchSetRpmLimit() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ credentialIds, rpmLimit }: { credentialIds: number[]; rpmLimit: number | null }) =>
+      batchSetRpmLimit(credentialIds, rpmLimit),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+export function useDefaultRpmLimit() {
+  return useQuery({
+    queryKey: ['default-rpm-limit'],
+    queryFn: getDefaultRpmLimit,
+    staleTime: 30 * 1000,
+  })
+}
+
+export function useSetDefaultRpmLimit() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (rpmLimit: number | null) => setDefaultRpmLimit(rpmLimit),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['default-rpm-limit'] })
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })

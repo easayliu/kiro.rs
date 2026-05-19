@@ -9,10 +9,11 @@ use axum::{
 use super::{
     middleware::{AdminRole, AdminState},
     types::{
-        AddCredentialRequest, BatchSetCredentialGroupRequest, BatchSetPriorityRequest, MeResponse,
-        SetCacheSkipRateRequest, SetCredentialGroupRequest, SetDisabledRequest,
-        SetGlobalCacheRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetRpmLimitRequest,
-        SuccessResponse, UpsertProxyGroupRequest,
+        AddCredentialRequest, BatchSetCredentialGroupRequest, BatchSetPriorityRequest,
+        BatchSetRpmLimitRequest, MeResponse, SetCacheSkipRateRequest, SetCredentialGroupRequest,
+        SetDefaultRpmLimitRequest, SetDisabledRequest, SetGlobalCacheRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SetRpmLimitRequest, SuccessResponse,
+        UpsertProxyGroupRequest,
     },
 };
 
@@ -288,6 +289,34 @@ pub async fn batch_set_priority(
     Json(payload): Json<BatchSetPriorityRequest>,
 ) -> impl IntoResponse {
     match state.service.batch_set_priority(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/rpm-limit/batch
+/// 批量设置凭据级 RPM 上限
+pub async fn batch_set_rpm_limit(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchSetRpmLimitRequest>,
+) -> impl IntoResponse {
+    match state.service.batch_set_rpm_limit(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/default-rpm-limit
+pub async fn get_default_rpm_limit(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_default_rpm_limit())
+}
+
+/// PUT /api/admin/config/default-rpm-limit
+pub async fn set_default_rpm_limit(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetDefaultRpmLimitRequest>,
+) -> impl IntoResponse {
+    match state.service.set_default_rpm_limit(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
