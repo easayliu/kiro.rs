@@ -559,6 +559,12 @@ pub struct MultiTokenManager {
     load_balancing_mode: Mutex<String>,
     /// 全局默认 RPM 上限（运行时可变；初始化自 config，Admin API 修改后实时生效并持久化）
     default_rpm_limit: Mutex<Option<u32>>,
+    /// 是否有任何 RPM 配置启用（凭据级 or 全局），用于热路径短路
+    ///
+    /// 单向 monotonic：一旦置 true 不再清零。误报（实际全关后仍为 true）
+    /// 只会让 `record_request_for_rpm` 多走一次 effective_rpm_limit 检查，
+    /// 不影响正确性；漏报（实际开启但仍为 false）才会导致漏记，所以保守置 true。
+    rpm_feature_enabled: AtomicBool,
     /// 代理分组（运行时可修改，与 config.json 中 proxyGroups 同步）
     proxy_groups: RwLock<BTreeMap<String, ProxyGroupConfig>>,
     /// 最近一次统计持久化时间（用于 debounce）
@@ -725,6 +731,10 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let proxy_groups = config.proxy_groups.clone();
         let default_rpm_limit = config.default_rpm_limit;
+        let any_cred_rpm = entries
+            .iter()
+            .any(|e| e.credentials.rpm_limit.unwrap_or(0) > 0);
+        let any_default_rpm = default_rpm_limit.unwrap_or(0) > 0;
         let manager = Self {
             config,
             proxy,
@@ -735,6 +745,7 @@ impl MultiTokenManager {
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
             default_rpm_limit: Mutex::new(default_rpm_limit),
+            rpm_feature_enabled: AtomicBool::new(any_cred_rpm || any_default_rpm),
             proxy_groups: RwLock::new(proxy_groups),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
@@ -912,8 +923,14 @@ impl MultiTokenManager {
 
         // 进一步剔除处于 429 冷却期或 RPM 已耗尽的凭据，得到"鲜活"集合
         let now = Utc::now();
+        let rpm_active = self.rpm_feature_enabled.load(Ordering::Relaxed);
         let rpm_cutoff = now - Duration::seconds(RPM_WINDOW_SECS);
-        let default_rpm = *self.default_rpm_limit.lock();
+        // 未启用 RPM 时不读这把锁，热路径更轻
+        let default_rpm = if rpm_active {
+            *self.default_rpm_limit.lock()
+        } else {
+            None
+        };
         let fresh_indices: Vec<usize> = base_indices
             .iter()
             .copied()
@@ -922,10 +939,12 @@ impl MultiTokenManager {
                 if entry.throttled_until.is_some_and(|until| until > now) {
                     return false;
                 }
-                if let Some(limit) = effective_rpm_limit(&entry.credentials, default_rpm) {
-                    prune_rpm_window(&mut entry.rpm_window, rpm_cutoff);
-                    if entry.rpm_window.len() >= limit as usize {
-                        return false;
+                if rpm_active {
+                    if let Some(limit) = effective_rpm_limit(&entry.credentials, default_rpm) {
+                        prune_rpm_window(&mut entry.rpm_window, rpm_cutoff);
+                        if entry.rpm_window.len() >= limit as usize {
+                            return false;
+                        }
                     }
                 }
                 true
@@ -1474,6 +1493,10 @@ impl MultiTokenManager {
     /// 在 `acquire_context` 成功获取上下文后调用，统计实际派发到该凭据的请求数。
     /// 即使本次请求最终失败（401/429/网络等），也已计入——与上游对话单元一致。
     fn record_request_for_rpm(&self, id: u64) {
+        // 热路径短路：从未启用过 RPM 时直接返回，避免无谓的锁与线性查找
+        if !self.rpm_feature_enabled.load(Ordering::Relaxed) {
+            return;
+        }
         let default_rpm = *self.default_rpm_limit.lock();
         let mut entries = self.entries.lock();
         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
@@ -1752,15 +1775,14 @@ impl MultiTokenManager {
 
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
-        let mut entries = self.entries.lock();
+        let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
         let now = Utc::now();
         let rpm_cutoff = now - Duration::seconds(RPM_WINDOW_SECS);
-        // 顺手裁剪一次窗口，让 rpm_current 反映真实"过去 60s"的请求数
-        for e in entries.iter_mut() {
-            prune_rpm_window(&mut e.rpm_window, rpm_cutoff);
-        }
+        // 仅读不修改：rpm_current 用 filter().count() 即时统计 60s 内的有效条目；
+        // 真正的裁剪交给热路径（select_next_credential / record_request_for_rpm），
+        // snapshot 不再争抢可变借用，admin 拉取与 API 请求的锁竞争更轻。
 
         ManagerSnapshot {
             entries: entries
@@ -1819,7 +1841,7 @@ impl MultiTokenManager {
                         .filter(|t| *t > now)
                         .map(|t| t.to_rfc3339()),
                     rpm_limit: e.credentials.rpm_limit,
-                    rpm_current: e.rpm_window.len() as u32,
+                    rpm_current: e.rpm_window.iter().filter(|t| **t > rpm_cutoff).count() as u32,
                 })
                 .collect(),
             current_id,
@@ -2014,6 +2036,9 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             entry.credentials.rpm_limit = rpm_limit;
         }
+        if rpm_limit.unwrap_or(0) > 0 {
+            self.rpm_feature_enabled.store(true, Ordering::Relaxed);
+        }
         self.persist_credentials()?;
         Ok(())
     }
@@ -2022,6 +2047,9 @@ impl MultiTokenManager {
     ///
     /// 行为与 [`Self::set_priority_batch`] 一致：合并 IO + 失败回滚。
     pub fn set_rpm_limit_batch(&self, ids: &[u64], rpm_limit: Option<u32>) -> BatchSetGroupResult {
+        if rpm_limit.unwrap_or(0) > 0 {
+            self.rpm_feature_enabled.store(true, Ordering::Relaxed);
+        }
         let mut succeeded = Vec::new();
         let mut failed: Vec<BatchSetGroupFailure> = Vec::new();
         let mut previous: Vec<(u64, Option<u32>)> = Vec::new();
@@ -2292,6 +2320,9 @@ impl MultiTokenManager {
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
     pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
+        if new_cred.rpm_limit.unwrap_or(0) > 0 {
+            self.rpm_feature_enabled.store(true, Ordering::Relaxed);
+        }
         // 1. 基本验证
         if new_cred.is_api_key_credential() {
             let api_key = new_cred
@@ -2530,13 +2561,21 @@ impl MultiTokenManager {
     /// 设置全局默认 RPM 上限（Admin API）；持久化到 config.json
     ///
     /// 传 None 表示清空；传 Some(0) 表示显式不限流。
+    ///
+    /// 锁全程持有以串行化并发写：读 previous → 写 value → persist →
+    /// 失败时回滚，全在同一把锁内完成。Mutex 守的是 Option<u32>，
+    /// 持锁期间的磁盘 IO 阻塞其它 set/get 是预期行为（admin 操作，低频）。
     pub fn set_default_rpm_limit(&self, value: Option<u32>) -> anyhow::Result<()> {
-        let previous = *self.default_rpm_limit.lock();
-        *self.default_rpm_limit.lock() = value;
+        let mut guard = self.default_rpm_limit.lock();
+        let previous = *guard;
+        *guard = value;
+
+        if value.unwrap_or(0) > 0 {
+            self.rpm_feature_enabled.store(true, Ordering::Relaxed);
+        }
 
         if let Err(e) = self.persist_default_rpm_limit(value) {
-            // 持久化失败：回滚内存值
-            *self.default_rpm_limit.lock() = previous;
+            *guard = previous;
             return Err(e);
         }
         Ok(())
