@@ -1019,12 +1019,19 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
+                let now = Utc::now();
                 // 第一轮优先尝试粘性绑定凭据（只试一次，后续轮次 fallback）
+                // 仍要校验 throttled_until：被上游限流的凭据若被粘性命中，
+                // 会绕过冷却继续发送请求并累积 throttle_count，永远逃不出冷却。
                 let preferred_hit = preferred_pending.take().and_then(|pid| {
                     let entries = self.entries.lock();
                     entries
                         .iter()
-                        .find(|e| e.id == pid && !e.disabled)
+                        .find(|e| {
+                            e.id == pid
+                                && !e.disabled
+                                && e.throttled_until.is_none_or(|until| until <= now)
+                        })
                         .filter(|e| !is_opus || e.credentials.supports_opus())
                         .map(|e| (e.id, e.credentials.clone()))
                 });
@@ -1036,6 +1043,7 @@ impl MultiTokenManager {
 
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
+                // 同上：current_id 也要排除冷却中的凭据，避免循环踩 429。
                 let current_hit = if is_balanced {
                     None
                 } else {
@@ -1043,7 +1051,11 @@ impl MultiTokenManager {
                     let current_id = *self.current_id.lock();
                     entries
                         .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
+                        .find(|e| {
+                            e.id == current_id
+                                && !e.disabled
+                                && e.throttled_until.is_none_or(|until| until <= now)
+                        })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
 
