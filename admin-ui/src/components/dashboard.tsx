@@ -122,11 +122,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
     localStorage.setItem('kiro-page-size', String(size))
   }
 
-  type SortKey = 'default' | 'plan-desc' | 'plan-asc' | 'group'
+  type SortKey =
+    | 'default'
+    | 'plan-desc'
+    | 'plan-asc'
+    | 'group'
+    | 'last-used-desc'
+    | 'last-used-asc'
   const SORT_OPTIONS: { key: SortKey; label: string }[] = [
     { key: 'default', label: '默认（优先级）' },
     { key: 'plan-desc', label: '订阅等级 · 高→低' },
     { key: 'plan-asc', label: '订阅等级 · 低→高' },
+    { key: 'last-used-desc', label: '最近使用 · 最新→最旧' },
+    { key: 'last-used-asc', label: '最近使用 · 最旧→最新' },
     { key: 'group', label: '代理分组（聚合）' },
   ]
   const [sortKey, setSortKey] = useState<SortKey>(() => {
@@ -210,6 +218,26 @@ export function Dashboard({ onLogout }: DashboardProps) {
           if (!gb) return -1
           return ga.localeCompare(gb)
         }
+        if (a.priority !== b.priority) return a.priority - b.priority
+        return a.id - b.id
+      })
+    }
+
+    if (sortKey === 'last-used-desc' || sortKey === 'last-used-asc') {
+      // lastUsedAt 是 RFC3339 字符串，字典序与时间序一致。null（从未使用）
+      // 无论升降序都排到末尾，避免与"很久没用"的真实活动混淆。
+      const desc = sortKey === 'last-used-desc'
+      return [...filtered].sort((a, b) => {
+        const la = a.lastUsedAt
+        const lb = b.lastUsedAt
+        if (la == null && lb == null) {
+          if (a.priority !== b.priority) return a.priority - b.priority
+          return a.id - b.id
+        }
+        if (la == null) return 1
+        if (lb == null) return -1
+        const cmp = la < lb ? -1 : la > lb ? 1 : 0
+        if (cmp !== 0) return desc ? -cmp : cmp
         if (a.priority !== b.priority) return a.priority - b.priority
         return a.id - b.id
       })
@@ -973,7 +1001,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
                               ? '等级 ↓'
                               : sortKey === 'plan-asc'
                                 ? '等级 ↑'
-                                : '分组'}
+                                : sortKey === 'last-used-desc'
+                                  ? '最近 ↓'
+                                  : sortKey === 'last-used-asc'
+                                    ? '最近 ↑'
+                                    : '分组'}
                         </span>
                         <ChevronDown className="h-3 w-3" />
                       </button>
