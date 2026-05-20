@@ -596,6 +596,33 @@ fn effective_rpm_limit(cred: &KiroCredentials, default: Option<u32>) -> Option<u
     }
 }
 
+/// 比较两个候选凭据，返回 new 是否优于 current
+///
+/// 规则：
+/// - priority 数字越小越优
+/// - 同 priority 时，balanced 模式按 last_used_at 升序（None 视为最早，优先派给新凭据）
+/// - 同 priority 时，priority 模式保持稳定（不替换）
+/// - current=None 时新候选总是更优
+fn is_better(new: &CredentialEntry, current: Option<&CredentialEntry>, balanced: bool) -> bool {
+    let Some(cur) = current else {
+        return true;
+    };
+    if new.credentials.priority != cur.credentials.priority {
+        return new.credentials.priority < cur.credentials.priority;
+    }
+    if balanced {
+        // LRU within tier; None < Some (从未使用排最前)
+        match (&new.last_used_at, &cur.last_used_at) {
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (Some(a), Some(b)) => a < b,
+            (None, None) => false,
+        }
+    } else {
+        false
+    }
+}
+
 /// 裁剪窗口里早于 cutoff 的时间戳
 fn prune_rpm_window(window: &mut VecDeque<DateTime<Utc>>, cutoff: DateTime<Utc>) {
     while let Some(front) = window.front() {
@@ -896,107 +923,85 @@ impl MultiTokenManager {
     fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
         let mut entries = self.entries.lock();
 
-        // 检查是否是 opus 模型
         let is_opus = model
             .map(|m| m.to_lowercase().contains("opus"))
             .unwrap_or(false);
 
-        // 基础可用集合：仅排除 disabled / 不支持目标模型
-        let base_indices: Vec<usize> = entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| {
-                if e.disabled {
-                    return false;
-                }
-                if is_opus && !e.credentials.supports_opus() {
-                    return false;
-                }
-                true
-            })
-            .map(|(i, _)| i)
-            .collect();
-
-        if base_indices.is_empty() {
-            return None;
-        }
-
-        // 进一步剔除处于 429 冷却期或 RPM 已耗尽的凭据，得到"鲜活"集合
         let now = Utc::now();
         let rpm_active = self.rpm_feature_enabled.load(Ordering::Relaxed);
         let rpm_cutoff = now - Duration::seconds(RPM_WINDOW_SECS);
-        // 未启用 RPM 时不读这把锁，热路径更轻
+        // 锁外读不到，但只读一次：在 entries 锁内额外拿一次 default_rpm_limit
+        // 锁是短锁，且这两个锁的获取顺序在所有代码路径上一致（entries → default_rpm_limit）。
         let default_rpm = if rpm_active {
             *self.default_rpm_limit.lock()
         } else {
             None
         };
-        let fresh_indices: Vec<usize> = base_indices
-            .iter()
-            .copied()
-            .filter(|&i| {
-                let entry = &mut entries[i];
-                if entry.throttled_until.is_some_and(|until| until > now) {
-                    return false;
-                }
-                if rpm_active {
-                    if let Some(limit) = effective_rpm_limit(&entry.credentials, default_rpm) {
-                        prune_rpm_window(&mut entry.rpm_window, rpm_cutoff);
-                        if entry.rpm_window.len() >= limit as usize {
-                            return false;
-                        }
+        let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+
+        // 单次扫描同时维护两个候选：
+        // - best_fresh：未冷却且 RPM 未耗尽的"鲜活"凭据中的最优解
+        // - best_fallback：放宽冷却/RPM 限制的最优解，用于全员限流时的退路
+        // 比较规则：低 priority 优先；balanced 模式下同档按 last_used_at 升序（None 最早）
+        let mut best_fresh: Option<usize> = None;
+        let mut best_fallback: Option<usize> = None;
+        let mut had_eligible = false;
+
+        for i in 0..entries.len() {
+            let entry = &entries[i];
+            if entry.disabled {
+                continue;
+            }
+            if is_opus && !entry.credentials.supports_opus() {
+                continue;
+            }
+            had_eligible = true;
+
+            if is_better(entry, best_fallback.map(|j| &entries[j]), is_balanced) {
+                best_fallback = Some(i);
+            }
+
+            // 鲜活性检查（throttled / RPM）：失败则不能更新 best_fresh，但 fallback 已记录
+            if entry.throttled_until.is_some_and(|until| until > now) {
+                continue;
+            }
+            if rpm_active {
+                if let Some(limit) = effective_rpm_limit(&entry.credentials, default_rpm) {
+                    // 用 filter().count() 即时计数，避免修改 rpm_window；
+                    // 真正的窗口裁剪由 record_request_for_rpm 在选中后做。
+                    let count = entry
+                        .rpm_window
+                        .iter()
+                        .filter(|t| **t > rpm_cutoff)
+                        .count();
+                    if count >= limit as usize {
+                        continue;
                     }
                 }
-                true
-            })
-            .collect();
-
-        // 优先在鲜活集合里挑；全员冷却时退回 base_indices（避免无意义 bail），
-        // LRU 会选 last_used_at 最早者——即最先被限流、冷却最早结束的那个。
-        let candidates: Vec<usize> = if fresh_indices.is_empty() {
-            tracing::warn!(
-                "所有可用凭据（共 {} 个）均处于 429 冷却期，回退选择 LRU 最早者",
-                base_indices.len()
-            );
-            base_indices
-        } else {
-            fresh_indices
-        };
-
-        let mode = self.load_balancing_mode.lock().clone();
-        let mode = mode.as_str();
-
-        let selected_index = match mode {
-            "balanced" => {
-                // 分档 LRU：先在 candidates 内取最小 priority（最高优先级一档），
-                // 再仅在该档内按 last_used_at 选最久未使用者。
-                // 高优先级档全部不可用时，min_priority 自然变为下一档的值，实现降级。
-                let min_priority = candidates
-                    .iter()
-                    .map(|&i| entries[i].credentials.priority)
-                    .min()?;
-                // RFC3339 时间字符串的字典序与时间序一致，可直接比较；
-                // None（从未使用）排在最前，优先分配给新加入的凭据。
-                *candidates
-                    .iter()
-                    .filter(|&&i| entries[i].credentials.priority == min_priority)
-                    .min_by_key(|&&i| entries[i].last_used_at.clone())?
             }
-            _ => {
-                // priority 模式（默认）：选择优先级最高的
-                *candidates
-                    .iter()
-                    .min_by_key(|&&i| entries[i].credentials.priority)?
+
+            if is_better(entry, best_fresh.map(|j| &entries[j]), is_balanced) {
+                best_fresh = Some(i);
+            }
+        }
+
+        if !had_eligible {
+            return None;
+        }
+
+        let selected_index = match best_fresh {
+            Some(i) => i,
+            None => {
+                tracing::warn!("所有可用凭据均处于 429 冷却/RPM 限制，回退选择 LRU 最早者");
+                best_fallback?
             }
         };
 
         let entry = &mut entries[selected_index];
         let result = (entry.id, entry.credentials.clone());
 
-        // balanced 模式下立即标记 last_used_at，在同一把锁内完成，
-        // 确保并发请求不会选中同一个凭据
-        if mode == "balanced" {
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
+        if is_balanced {
+            entry.last_used_at = Some(now.to_rfc3339());
         }
 
         Some(result)
