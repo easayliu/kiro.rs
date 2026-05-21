@@ -607,16 +607,27 @@ impl KiroProvider {
                     continue;
                 }
 
-                // 其他 400（如 "Improperly formed request"）：请求侧问题，
-                // 重试/切换凭据无意义。dump 出实际发往上游的 payload + 响应体，便于离线复现。
-                tracing::error!(
-                    cred_id = ctx.id,
-                    status = %status,
-                    api_type = api_type,
-                    response_body = %body,
-                    request_body = %outbound_body,
-                    "API 400 Bad Request - dump 上游请求/响应"
-                );
+                // 其他 400：请求侧问题，重试/切换凭据无意义。
+                // 仅当响应是 "Improperly formed request"（我们这边发出的格式 bug）时才
+                // dump 完整 outbound payload 离线复现；其他 400（如用户输入超长）只记简要日志。
+                if Self::is_improperly_formed_request(&body) {
+                    tracing::error!(
+                        cred_id = ctx.id,
+                        status = %status,
+                        api_type = api_type,
+                        response_body = %body,
+                        request_body = %outbound_body,
+                        "API 400 Improperly formed request - dump 上游请求/响应"
+                    );
+                } else {
+                    tracing::warn!(
+                        cred_id = ctx.id,
+                        status = %status,
+                        api_type = api_type,
+                        "API 400 Bad Request: {}",
+                        body
+                    );
+                }
                 anyhow::bail!(UpstreamHttpError {
                     status: status.as_u16(),
                     body,
@@ -804,6 +815,13 @@ impl KiroProvider {
     /// API 会返回 401/403 并携带此特征消息。
     fn is_bearer_token_invalid(body: &str) -> bool {
         body.contains("The bearer token included in the request is invalid")
+    }
+
+    /// 判断 400 响应是否为"我们发出去的请求格式有问题"：
+    /// 形如 `{"message":"Improperly formed request.","reason":null}`，
+    /// 这种才需要 dump 出 outbound payload 离线复现；其他 400（如用户输入超长）不 dump。
+    fn is_improperly_formed_request(body: &str) -> bool {
+        body.contains("Improperly formed request")
     }
 }
 
