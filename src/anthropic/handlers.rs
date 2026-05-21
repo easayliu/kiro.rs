@@ -140,13 +140,19 @@ fn map_provider_error(err: Error) -> Response {
                 .into_response();
         }
 
-        let (mapped_status, err_type) = match upstream.status {
-            429 => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
-            // 上游 5xx 仍归类为 502 Bad Gateway，避免把上游 502 直接转成下游 502
-            // 之外的歧义（如 504 Gateway Timeout 客户端可能误判为我们超时）
-            s if (500..=599).contains(&s) => (StatusCode::BAD_GATEWAY, "api_error"),
-            // 其他 4xx：维持当前 502 映射
-            _ => (StatusCode::BAD_GATEWAY, "api_error"),
+        // 透传上游 status，让客户端按上游真实状态分类（4xx 不重试、5xx 可重试）。
+        // err_type 按 Anthropic error 规范归类，未知 status 兜底为 502。
+        let mapped_status = StatusCode::from_u16(upstream.status)
+            .unwrap_or(StatusCode::BAD_GATEWAY);
+        let err_type = match upstream.status {
+            400 => "invalid_request_error",
+            401 => "authentication_error",
+            403 => "permission_error",
+            404 => "not_found_error",
+            413 => "request_too_large",
+            429 => "rate_limit_error",
+            s if (500..=599).contains(&s) => "api_error",
+            _ => "api_error",
         };
         tracing::error!(
             upstream_status = upstream.status,
