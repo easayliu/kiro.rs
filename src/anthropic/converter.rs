@@ -364,18 +364,22 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
 
-    // 8. 验证并过滤 tool_use/tool_result 配对
+    // 8. 先逐轮对齐 history 中相邻 (assistant, user) 的 tool_use/tool_result
+    // 必须在 validate 之前：align 可能移除某些 history tool_use（例如 assistant 一轮里
+    // 调了多个工具、但部分结果在 currentMessage 而非紧邻的 history user 轮）。若 validate
+    // 先跑，会基于"未对齐"的 history 把 current result 判为配对成功并保留；随后 align 删掉
+    // 对应的 history tool_use，current result 就变成 orphan → 上游 400
+    // TOOL_USE_RESULT_MISMATCH（toolResult exceeds toolUse）。
+    align_history_tool_pairing(&mut history);
+
+    // 9. 验证并过滤 tool_use/tool_result 配对（基于已对齐的 history）
     // 移除孤立的 tool_result（没有对应的 tool_use）
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
     let (validated_tool_results, orphaned_tool_use_ids) =
         validate_tool_pairing(&history, &tool_results);
 
-    // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
+    // 10. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
     remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
-
-    // 9.5. 逐轮对齐 history 中相邻 (assistant, user) 的 tool_use/tool_result
-    // 全局校验无法保证逐轮一致，这里兜底，避免上游 400 TOOL_USE_RESULT_MISMATCH
-    align_history_tool_pairing(&mut history);
 
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
@@ -1344,6 +1348,165 @@ mod pairing_tests {
         ];
         align_history_tool_pairing(&mut history);
         assert_eq!(result_ids(&history[1]), vec!["toolu_1".to_string()]);
+    }
+
+    #[test]
+    fn test_convert_request_drops_current_orphan_result() {
+        // 复现 17:13 dump：currentMessage 带一个在 history 中找不到对应 tool_use 的
+        // orphan toolResult（call_wfsHLid），且其前一轮 assistant 是自动补的 "OK"。
+        // 期望：current 的 orphan result 被 validate_tool_pairing 丢弃，不发往上游。
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-opus-4-7".to_string(),
+            max_tokens: 64,
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("search ankr login api"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "Let me search."},
+                        {"type": "tool_use", "id": "call_1d6", "name": "Glob", "input": {"pattern": "**/*.ts"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "call_1d6", "content": "No file found"}
+                    ]),
+                },
+                // 最后一条 = currentMessage：orphan toolResult，无对应 tool_use
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "call_wfsHLid", "content": "Nothing found"}
+                    ]),
+                },
+            ],
+        };
+
+        let result = convert_request(&req, "AI_EDITOR", false).unwrap();
+        let current_results = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results;
+        assert!(
+            current_results.is_empty(),
+            "current 的 orphan toolResult 应被丢弃，实际保留了 {} 个",
+            current_results.len()
+        );
+
+        // 同时：history 中也不应残留 call_wfsHLid 的 result
+        for msg in &result.conversation_state.history {
+            if let Message::User(u) = msg {
+                for r in &u.user_input_message.user_input_message_context.tool_results {
+                    assert_ne!(r.tool_use_id, "call_wfsHLid", "history 不应残留 orphan result");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_convert_request_multi_tool_split_results() {
+        // 复现 17:13 live bug：assistant 一轮调用两个工具（call_1d6 + call_wfsHLid），
+        // call_1d6 的结果在 history、call_wfsHLid 的结果在 currentMessage。
+        // 旧顺序（validate 先于 align）会保留 current 的 call_wfsHLid result，再被 align
+        // 删掉对应 history use，导致 orphan → 上游 400。
+        // 修复后（align 先于 validate）：align 移除 history 中 call_wfsHLid use，validate
+        // 随即把 current 的 call_wfsHLid orphan result 丢弃 → 请求合法。
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-opus-4-7".to_string(),
+            max_tokens: 64,
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("search ankr login api"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "Let me search."},
+                        {"type": "tool_use", "id": "call_1d6", "name": "Glob", "input": {}},
+                        {"type": "tool_use", "id": "call_wfsHLid", "name": "SearchCodebase", "input": {}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "call_1d6", "content": "No file found"}
+                    ]),
+                },
+                // currentMessage：call_wfsHLid 的结果
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "call_wfsHLid", "content": "Nothing found"}
+                    ]),
+                },
+            ],
+        };
+
+        let result = convert_request(&req, "AI_EDITOR", false).unwrap();
+        let cs = &result.conversation_state;
+
+        // 收集 history 中所有 tool_use_id
+        let history_use_ids: std::collections::HashSet<String> = cs
+            .history
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant(a) => a.assistant_response_message.tool_uses.as_ref(),
+                _ => None,
+            })
+            .flatten()
+            .map(|t| t.tool_use_id.clone())
+            .collect();
+
+        // current 的每个 result 都必须能在 history 中找到对应 use（否则就是会触发 400 的 orphan）
+        for r in &cs.current_message.user_input_message.user_input_message_context.tool_results {
+            assert!(
+                history_use_ids.contains(&r.tool_use_id),
+                "current result {} 在 history 中无对应 tool_use（orphan，会触发 400）",
+                r.tool_use_id
+            );
+        }
+
+        // 逐轮校验 history：每个 user 轮的 result 数 <= 紧邻上一轮 assistant 的 use 数
+        for i in 1..cs.history.len() {
+            if let Message::User(u) = &cs.history[i] {
+                let res = u.user_input_message.user_input_message_context.tool_results.len();
+                let prev_uses = match &cs.history[i - 1] {
+                    Message::Assistant(a) => a
+                        .assistant_response_message
+                        .tool_uses
+                        .as_ref()
+                        .map(|t| t.len())
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                assert!(res <= prev_uses, "history[{}] result 数 {} > 上一轮 use 数 {}", i, res, prev_uses);
+            }
+        }
     }
 
     #[test]
