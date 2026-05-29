@@ -373,6 +373,10 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
     // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
     remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
 
+    // 9.5. 逐轮对齐 history 中相邻 (assistant, user) 的 tool_use/tool_result
+    // 全局校验无法保证逐轮一致，这里兜底，避免上游 400 TOOL_USE_RESULT_MISMATCH
+    align_history_tool_pairing(&mut history);
+
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
     // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
@@ -658,6 +662,86 @@ fn remove_orphaned_tool_uses(
     }
 }
 
+/// 逐轮对齐 history 中相邻 (assistant, user) 的 tool_use / tool_result
+///
+/// Bedrock 按相邻轮次成对校验：每个 user 轮的 toolResult 必须与"紧邻的上一轮
+/// assistant"的 toolUse 一一对应（数量、id 都要匹配）。全局配对校验（见
+/// [`validate_tool_pairing`]）只保证 id 在整段对话里"某处"存在，无法保证逐轮一致，
+/// 会出现某 user 轮的 result 指向更早/前缀不一致/已被移除的 use，触发上游 400
+/// `TOOL_USE_RESULT_MISMATCH`（"toolResult blocks exceeds toolUse blocks"）。
+///
+/// 这里对每个相邻 (assistant_i, user_{i+1}) 对取 tool_use_id 交集，双向裁剪：
+/// - assistant 只保留有对应 result 的 tool_use；
+/// - user 只保留有对应 use 的 tool_result，并按 id 去重。
+///
+/// 注意：history 中"最后一条 assistant"的 tool_use 结果可能落在 currentMessage
+/// （已由 [`validate_tool_pairing`] 单独校验），故跳过 `i+1` 越界的尾部 assistant，
+/// 避免误删其待配对的 tool_use。
+fn align_history_tool_pairing(history: &mut [Message]) {
+    use std::collections::HashSet;
+
+    for i in 0..history.len().saturating_sub(1) {
+        // 仅处理 (assistant_i, user_{i+1}) 相邻对
+        let (use_ids, res_ids): (HashSet<String>, HashSet<String>) =
+            match (&history[i], &history[i + 1]) {
+                (Message::Assistant(a), Message::User(u)) => {
+                    let uses = a
+                        .assistant_response_message
+                        .tool_uses
+                        .as_ref()
+                        .map(|tus| tus.iter().map(|t| t.tool_use_id.clone()).collect())
+                        .unwrap_or_default();
+                    let ress = u
+                        .user_input_message
+                        .user_input_message_context
+                        .tool_results
+                        .iter()
+                        .map(|r| r.tool_use_id.clone())
+                        .collect();
+                    (uses, ress)
+                }
+                _ => continue,
+            };
+
+        if use_ids.is_empty() && res_ids.is_empty() {
+            continue;
+        }
+
+        let common: HashSet<String> = use_ids.intersection(&res_ids).cloned().collect();
+
+        // 裁剪 assistant.tool_uses
+        if let Message::Assistant(a) = &mut history[i] {
+            if let Some(tus) = a.assistant_response_message.tool_uses.as_mut() {
+                let before = tus.len();
+                tus.retain(|t| common.contains(&t.tool_use_id));
+                if tus.len() != before {
+                    tracing::warn!(
+                        "逐轮对齐：assistant 轮移除 {} 个无对应 result 的 tool_use",
+                        before - tus.len()
+                    );
+                }
+                if tus.is_empty() {
+                    a.assistant_response_message.tool_uses = None;
+                }
+            }
+        }
+
+        // 裁剪 user.tool_results（保留有对应 use 的，并按 id 去重）
+        if let Message::User(u) = &mut history[i + 1] {
+            let results = &mut u.user_input_message.user_input_message_context.tool_results;
+            let before = results.len();
+            let mut seen = HashSet::new();
+            results.retain(|r| common.contains(&r.tool_use_id) && seen.insert(r.tool_use_id.clone()));
+            if results.len() != before {
+                tracing::warn!(
+                    "逐轮对齐：user 轮移除 {} 个无对应 tool_use / 重复的 tool_result",
+                    before - results.len()
+                );
+            }
+        }
+    }
+}
+
 /// Kiro API 工具名称最大长度限制
 const TOOL_NAME_MAX_LEN: usize = 63;
 
@@ -766,6 +850,21 @@ fn map_tool_use_id(id: &str) -> String {
     hasher.update(id.as_bytes());
     let hash_hex = format!("{:x}", hasher.finalize());
     format!("toolu_h{}", &hash_hex[..24])
+}
+
+/// 将 kiro 返回的 tool_use_id 规范化为 Anthropic 客户端兼容形式（出口统一补 `toolu_` 前缀）。
+///
+/// kiro/CodeWhisperer 返回的 id 形如 `tooluse_xxx`，不带 Anthropic 习惯的 `toolu_`
+/// 前缀。部分客户端（如 Claude Code）会自行补 `toolu_` 前缀后存入 tool_result，导致
+/// 下一轮请求里 assistant 的 tool_use 与 user 的 tool_result id 前缀不一致 → 配对失败
+/// → 上游 400 `TOOL_USE_RESULT_MISMATCH`。这里在发给客户端的出口统一补前缀，使
+/// assistant tool_use 与回传的 tool_result id 一致，从源头消除前缀分歧。
+pub fn normalize_tool_use_id_for_client(id: &str) -> String {
+    if id.starts_with("toolu_") {
+        id.to_string()
+    } else {
+        format!("toolu_{}", id)
+    }
 }
 
 /// 转换工具定义
@@ -1121,6 +1220,142 @@ fn merge_assistant_messages(
     Ok(HistoryAssistantMessage {
         assistant_response_message: assistant,
     })
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::*;
+    use crate::kiro::model::requests::tool::{ToolResult, ToolUseEntry};
+
+    /// 构造一个带 tool_results 的历史 user 轮
+    fn user_with_results(ids: &[&str]) -> Message {
+        let mut ctx = UserInputMessageContext::new();
+        ctx = ctx.with_tool_results(
+            ids.iter()
+                .map(|id| ToolResult::success(*id, "ok".to_string()))
+                .collect(),
+        );
+        Message::User(HistoryUserMessage {
+            user_input_message: UserMessage::new(" ", "claude-sonnet-4.5").with_context(ctx),
+        })
+    }
+
+    /// 构造一个带 tool_uses 的历史 assistant 轮
+    fn assistant_with_uses(ids: &[&str]) -> Message {
+        let mut a = AssistantMessage::new(" ");
+        if !ids.is_empty() {
+            a = a.with_tool_uses(
+                ids.iter()
+                    .map(|id| ToolUseEntry::new(*id, "Read"))
+                    .collect(),
+            );
+        }
+        Message::Assistant(HistoryAssistantMessage {
+            assistant_response_message: a,
+        })
+    }
+
+    fn result_ids(msg: &Message) -> Vec<String> {
+        match msg {
+            Message::User(u) => u
+                .user_input_message
+                .user_input_message_context
+                .tool_results
+                .iter()
+                .map(|r| r.tool_use_id.clone())
+                .collect(),
+            _ => vec![],
+        }
+    }
+
+    fn use_count(msg: &Message) -> usize {
+        match msg {
+            Message::Assistant(a) => a
+                .assistant_response_message
+                .tool_uses
+                .as_ref()
+                .map(|t| t.len())
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn test_normalize_tool_use_id_adds_prefix() {
+        assert_eq!(
+            normalize_tool_use_id_for_client("tooluse_Gg6F7Mb"),
+            "toolu_tooluse_Gg6F7Mb"
+        );
+    }
+
+    #[test]
+    fn test_normalize_tool_use_id_passthrough() {
+        // 已带 toolu_ 前缀的原样返回，避免重复加前缀
+        assert_eq!(
+            normalize_tool_use_id_for_client("toolu_01ABC"),
+            "toolu_01ABC"
+        );
+        assert_eq!(
+            normalize_tool_use_id_for_client("toolu_tooluse_x"),
+            "toolu_tooluse_x"
+        );
+    }
+
+    #[test]
+    fn test_align_removes_orphan_results_after_useless_assistant() {
+        // 复现日志现场：assistant 无 tool_use，紧邻的 user 却带 2 个 tool_result
+        let mut history = vec![
+            assistant_with_uses(&[]),
+            user_with_results(&["toolu_tooluse_a", "toolu_tooluse_b"]),
+        ];
+        align_history_tool_pairing(&mut history);
+        // 上一轮 assistant 无 use → 交集为空 → user 的 result 全部清除
+        assert_eq!(result_ids(&history[1]).len(), 0);
+    }
+
+    #[test]
+    fn test_align_keeps_matching_pair() {
+        let mut history = vec![
+            assistant_with_uses(&["toolu_1", "toolu_2"]),
+            user_with_results(&["toolu_1", "toolu_2"]),
+        ];
+        align_history_tool_pairing(&mut history);
+        assert_eq!(use_count(&history[0]), 2);
+        assert_eq!(result_ids(&history[1]).len(), 2);
+    }
+
+    #[test]
+    fn test_align_intersects_partial_overlap() {
+        // assistant 有 use {1,2}，user 有 result {2,3} → 只保留交集 {2}
+        let mut history = vec![
+            assistant_with_uses(&["toolu_1", "toolu_2"]),
+            user_with_results(&["toolu_2", "toolu_3"]),
+        ];
+        align_history_tool_pairing(&mut history);
+        assert_eq!(use_count(&history[0]), 1);
+        assert_eq!(result_ids(&history[1]), vec!["toolu_2".to_string()]);
+    }
+
+    #[test]
+    fn test_align_dedups_duplicate_results() {
+        let mut history = vec![
+            assistant_with_uses(&["toolu_1"]),
+            user_with_results(&["toolu_1", "toolu_1"]),
+        ];
+        align_history_tool_pairing(&mut history);
+        assert_eq!(result_ids(&history[1]), vec!["toolu_1".to_string()]);
+    }
+
+    #[test]
+    fn test_align_skips_trailing_assistant() {
+        // history 末尾的 assistant（其 result 在 currentMessage）不应被裁剪
+        let mut history = vec![
+            user_with_results(&[]),
+            assistant_with_uses(&["toolu_pending"]),
+        ];
+        align_history_tool_pairing(&mut history);
+        assert_eq!(use_count(&history[1]), 1, "尾部 assistant 的 tool_use 应保留");
+    }
 }
 
 #[cfg(test)]

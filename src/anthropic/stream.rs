@@ -1048,6 +1048,10 @@ impl StreamContext {
             .cloned()
             .unwrap_or_else(|| tool_use.name.clone());
 
+        // 规范化 tool_use_id：补 `toolu_` 前缀，与回传的 tool_result id 对齐
+        let client_tool_use_id =
+            super::converter::normalize_tool_use_id_for_client(&tool_use.tool_use_id);
+
         // 发送 content_block_start
         let start_events = self.state_manager.handle_content_block_start(
             block_index,
@@ -1057,7 +1061,7 @@ impl StreamContext {
                 "index": block_index,
                 "content_block": {
                     "type": "tool_use",
-                    "id": tool_use.tool_use_id,
+                    "id": client_tool_use_id,
                     "name": original_name,
                     "input": {}
                 }
