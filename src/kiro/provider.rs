@@ -608,16 +608,17 @@ impl KiroProvider {
                 }
 
                 // 其他 400：请求侧问题，重试/切换凭据无意义。
-                // 仅当响应是 "Improperly formed request"（我们这边发出的格式 bug）时才
-                // dump 完整 outbound payload 离线复现；其他 400（如用户输入超长）只记简要日志。
-                if Self::is_improperly_formed_request(&body) {
+                // 仅当响应是请求格式 bug（"Improperly formed request" 或
+                // "TOOL_USE_RESULT_MISMATCH"，都是我们这边发出的格式问题）时才 dump
+                // 完整 outbound payload 离线复现；其他 400（如用户输入超长）只记简要日志。
+                if Self::is_malformed_request(&body) {
                     tracing::error!(
                         cred_id = ctx.id,
                         status = %status,
                         api_type = api_type,
                         response_body = %body,
                         request_body = %outbound_body,
-                        "API 400 Improperly formed request - dump 上游请求/响应"
+                        "API 400 请求格式错误 - dump 上游请求/响应"
                     );
                 } else {
                     tracing::warn!(
@@ -822,6 +823,18 @@ impl KiroProvider {
     /// 这种才需要 dump 出 outbound payload 离线复现；其他 400（如用户输入超长）不 dump。
     fn is_improperly_formed_request(body: &str) -> bool {
         body.contains("Improperly formed request")
+    }
+
+    /// 判断 400 响应是否为 tool_use/tool_result 配对不一致：
+    /// 形如 `{"message":"...toolResult blocks ... exceeds ... toolUse blocks...","reason":"TOOL_USE_RESULT_MISMATCH"}`。
+    /// 同样是"我们发出去的请求格式有问题"，需要 dump outbound payload 离线复现。
+    fn is_tool_use_result_mismatch(body: &str) -> bool {
+        body.contains("TOOL_USE_RESULT_MISMATCH")
+    }
+
+    /// 判断 400 是否属于"请求格式 bug"（应 dump outbound payload 离线复现）。
+    fn is_malformed_request(body: &str) -> bool {
+        Self::is_improperly_formed_request(body) || Self::is_tool_use_result_mismatch(body)
     }
 }
 
