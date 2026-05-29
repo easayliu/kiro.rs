@@ -35,6 +35,16 @@ pub struct ApiCallResult {
     pub credential_id: u64,
 }
 
+/// 已缓冲完整响应体的调用结果（非流式专用）
+///
+/// 与 [`ApiCallResult`] 的区别：body 已在重试范围内读完。"头 200 但 body 中途
+/// 被上游 RST/EOF" 属于上游瞬态，[`crate::kiro::provider::KiroProvider::call_api`]
+/// 收到响应头即返回、覆盖不到 body 读取；这里把 body 读进重试范围。
+pub struct BufferedApiCallResult {
+    pub body: bytes::Bytes,
+    pub credential_id: u64,
+}
+
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
@@ -195,27 +205,75 @@ impl KiroProvider {
         serde_json::to_string(&json).unwrap_or_else(|_| request_body.to_string())
     }
 
-    /// 发送非流式 API 请求
+    /// 发送非流式 API 请求并缓冲完整响应体，body 读取失败时重新发起整轮调用（含换凭据）
     ///
-    /// 支持多凭据故障转移：
-    /// - 400 Bad Request: 直接返回错误，不计入凭据失败
-    ///   （例外：INVALID_MODEL_ID 仅 LRU 轮转到下一凭据，不计失败计数）
-    /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
-    /// - 402 MONTHLY_REQUEST_COUNT / OVERAGE_REQUEST_LIMIT_EXCEEDED: 视为额度用尽，禁用凭据并切换
-    /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
+    /// 状态级故障转移（400/401/403/402/429/5xx/网络瞬态）由内层 `call_api_with_retry`
+    /// 处理；本方法在其外补一层 body 读取重试。
     ///
-    /// # Arguments
-    /// * `request_body` - JSON 格式的请求体字符串
-    ///
-    /// # Returns
-    /// 返回原始的 HTTP Response，不做解析
-    pub async fn call_api(
+    /// 背景：`call_api_with_retry` 收到响应头（200）即返回，body 在 handler 里才读，
+    /// 因此"头 200 但 body 中途被上游 HTTP/2 RST_STREAM(INTERNAL_ERROR) / EOF"这类
+    /// **上游瞬态**错误落在重试范围之外，过去只能记日志返回 502、无重试无故障转移。
+    /// 这里在外层补一层 body 读取重试：失败则重新发起整轮调用（`call_api_with_retry`
+    /// 会经 LRU 重新选凭据，自然故障转移），对齐 5xx 瞬态语义。
+    pub async fn call_api_buffered(
         &self,
         request_body: &str,
         preferred_credential: Option<u64>,
-    ) -> anyhow::Result<ApiCallResult> {
-        self.call_api_with_retry(request_body, false, preferred_credential)
-            .await
+    ) -> anyhow::Result<BufferedApiCallResult> {
+        const BODY_READ_MAX_ATTEMPTS: usize = 3;
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for attempt in 0..BODY_READ_MAX_ATTEMPTS {
+            // 仅首轮使用粘性绑定凭据；body 读失败后续轮次走默认选择以实现故障转移
+            let preferred = if attempt == 0 { preferred_credential } else { None };
+
+            // 状态级错误（连接/4xx/5xx）已由内层重试循环处理；这里拿到的是 200 响应头
+            let result = self
+                .call_api_with_retry(request_body, false, preferred)
+                .await?;
+            let credential_id = result.credential_id;
+
+            match result.response.bytes().await {
+                Ok(body) => {
+                    return Ok(BufferedApiCallResult {
+                        body,
+                        credential_id,
+                    });
+                }
+                Err(e) => {
+                    // 拼接完整错误源链，区分 timeout / connect reset / 上游提前 EOF / h2 RST
+                    let mut chain = e.to_string();
+                    let mut src = std::error::Error::source(&e);
+                    while let Some(s) = src {
+                        chain.push_str(" -> ");
+                        chain.push_str(&s.to_string());
+                        src = s.source();
+                    }
+                    tracing::warn!(
+                        cred_id = credential_id,
+                        is_timeout = e.is_timeout(),
+                        is_connect = e.is_connect(),
+                        is_body = e.is_body(),
+                        is_decode = e.is_decode(),
+                        "读取响应体失败（上游瞬态，body 重试 {}/{}）: {}",
+                        attempt + 1,
+                        BODY_READ_MAX_ATTEMPTS,
+                        chain
+                    );
+                    last_error = Some(anyhow::Error::new(e));
+                    if attempt + 1 < BODY_READ_MAX_ATTEMPTS {
+                        sleep(Self::retry_delay(attempt)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            anyhow::anyhow!(
+                "非流式 API 读取响应体失败：已达到最大重试次数（{}次）",
+                BODY_READ_MAX_ATTEMPTS
+            )
+        }))
     }
 
     /// 列出当前可用的凭据 id（供粘性绑定表作为候选池）

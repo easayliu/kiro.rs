@@ -636,8 +636,9 @@ async fn handle_non_stream_request(
     binding_key: Option<u64>,
     preferred: Option<u64>,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let api_result = match provider.call_api(request_body, preferred).await {
+    // 调用 Kiro API 并缓冲完整响应体（支持多凭据故障转移；body 中途被上游 RST/EOF
+    // 时会重新发起整轮调用并换凭据，见 call_api_buffered）
+    let api_result = match provider.call_api_buffered(request_body, preferred).await {
         Ok(resp) => resp,
         Err(e) => {
             update_binding_after_call(
@@ -670,40 +671,7 @@ async fn handle_non_stream_request(
         uncached_input_tokens: cache_result.uncached_input_tokens,
     };
 
-    let credential_id = api_result.credential_id;
-    let response = api_result.response;
-
-    // 读取响应体
-    let body_bytes = match response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            // 拼接完整错误源链，便于区分 timeout / connect reset / 上游提前 EOF
-            let mut chain = e.to_string();
-            let mut src = std::error::Error::source(&e);
-            while let Some(s) = src {
-                chain.push_str(" -> ");
-                chain.push_str(&s.to_string());
-                src = s.source();
-            }
-            tracing::error!(
-                cred_id = credential_id,
-                is_timeout = e.is_timeout(),
-                is_connect = e.is_connect(),
-                is_body = e.is_body(),
-                is_decode = e.is_decode(),
-                "读取响应体失败: {}",
-                chain
-            );
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new(
-                    "api_error",
-                    format!("读取响应失败: {}", e),
-                )),
-            )
-                .into_response();
-        }
-    };
+    let body_bytes = api_result.body;
 
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
