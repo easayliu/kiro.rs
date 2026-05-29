@@ -670,13 +670,30 @@ async fn handle_non_stream_request(
         uncached_input_tokens: cache_result.uncached_input_tokens,
     };
 
+    let credential_id = api_result.credential_id;
     let response = api_result.response;
 
     // 读取响应体
     let body_bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
-            tracing::error!("读取响应体失败: {}", e);
+            // 拼接完整错误源链，便于区分 timeout / connect reset / 上游提前 EOF
+            let mut chain = e.to_string();
+            let mut src = std::error::Error::source(&e);
+            while let Some(s) = src {
+                chain.push_str(" -> ");
+                chain.push_str(&s.to_string());
+                src = s.source();
+            }
+            tracing::error!(
+                cred_id = credential_id,
+                is_timeout = e.is_timeout(),
+                is_connect = e.is_connect(),
+                is_body = e.is_body(),
+                is_decode = e.is_decode(),
+                "读取响应体失败: {}",
+                chain
+            );
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
