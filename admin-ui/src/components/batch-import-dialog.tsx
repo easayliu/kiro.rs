@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
+import { CheckCircle2, XCircle, AlertCircle, Loader2, Upload } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -49,6 +49,22 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    // 重置 value，确保连续选择同一文件也能再次触发 onChange
+    e.target.value = ''
+    if (!file) return
+    try {
+      const text = await file.text()
+      setJsonInput(text)
+      setResults([])
+      toast.success(`已读取文件: ${file.name}`)
+    } catch (error) {
+      toast.error('读取文件失败: ' + extractErrorMessage(error))
+    }
+  }
 
   const { data: existingCredentials } = useCredentials()
   const { mutateAsync: addCredential } = useAddCredential()
@@ -320,9 +336,29 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
-            <label className="text-sm font-medium">
-              JSON 格式凭据
-            </label>
+            <div className="flex items-center justify-between">
+              <label className="text-sm font-medium">
+                JSON 格式凭据
+              </label>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".json,application/json"
+                className="hidden"
+                onChange={handleFileSelect}
+                disabled={importing}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={importing}
+              >
+                <Upload className="w-4 h-4" />
+                从文件导入
+              </Button>
+            </div>
             <textarea
               placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n例如: [{"refreshToken":"...","clientId":"...","clientSecret":"...","authRegion":"us-east-1","apiRegion":"us-west-2"}]\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
