@@ -564,7 +564,6 @@ impl KiroProvider {
                 .post(&url)
                 .body(outbound_body.clone())
                 .header("content-type", "application/json")
-                .header("x-amzn-codewhisperer-optout", "false")
                 .header("x-amzn-kiro-agent-mode", "vibe")
                 .header("x-amz-user-agent", &x_amz_user_agent)
                 .header("user-agent", &user_agent)

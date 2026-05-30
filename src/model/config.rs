@@ -312,7 +312,7 @@ impl Config {
                 self.kiro_cli_version
             ),
             ClientMode::KiroIde => format!(
-                "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
+                "aws-sdk-js/1.0.39 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.39 m/N KiroIDE-{}-{}",
                 self.system_version, self.node_version, self.kiro_version, machine_id
             ),
         }
@@ -322,7 +322,7 @@ impl Config {
     pub fn streaming_x_amz_user_agent(&self, machine_id: &str, mode: ClientMode) -> String {
         match mode {
             ClientMode::KiroCli => "aws-sdk-rust/1.3.14 ua/2.1 api/codewhispererstreaming/0.1.14474 os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI".to_string(),
-            ClientMode::KiroIde => format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", self.kiro_version, machine_id),
+            ClientMode::KiroIde => format!("aws-sdk-js/1.0.39 KiroIDE-{}-{}", self.kiro_version, machine_id),
         }
     }
 
