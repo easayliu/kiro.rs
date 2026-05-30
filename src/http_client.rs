@@ -96,7 +96,13 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    // 固定 HTTP/1.1：
+    // 1. 与真实 Kiro IDE（aws-sdk-js / node）一致——抓包显示其用 HTTP/1.1 + Connection: close；
+    // 2. 规避上游 HTTP/2 在传 body 中途发 RST_STREAM(INTERNAL_ERROR) 导致的
+    //    "stream error received" 502（不固定时 reqwest 会经 ALPN 协商成 h2）。
+    let mut builder = Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .http1_only();
 
     if tls_backend == TlsBackend::Rustls {
         builder = builder.use_rustls_tls();
