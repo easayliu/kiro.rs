@@ -26,34 +26,6 @@ use crate::kiro::model::token_refresh::{
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::{Config, ProxyGroupConfig};
 
-/// Social 登录（Google/Github）账号的共享 profileArn。
-/// Kiro IDE 对 social 免费账号统一使用这个 profile。
-const SOCIAL_PROFILE_ARN: &str =
-    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
-
-/// AWS Builder ID 账号的共享 profileArn。
-/// Kiro IDE 对 Builder ID 账号统一使用这个 profile（抓包确认）。
-const BUILDER_ID_PROFILE_ARN: &str =
-    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
-
-/// 凭据缺失 profileArn 时，按 auth_method 推断默认共享 profileArn。
-///
-/// - social → social 共享 ARN
-/// - idc / builder-id / iam → Builder ID 共享 ARN
-/// - api_key → 不注入（走另一套鉴权）
-///
-/// Builder ID / IdC 刷新（AWS SSO-OIDC）不返回 profileArn，而 `getUsageLimits`
-/// 需要有效 profileArn，否则上游返回 `400 Invalid profileArn`。
-fn default_profile_arn(credentials: &KiroCredentials) -> Option<&'static str> {
-    if credentials.is_api_key_credential() {
-        return None;
-    }
-    match credentials.auth_method.as_deref() {
-        Some(m) if m.eq_ignore_ascii_case("social") => Some(SOCIAL_PROFILE_ARN),
-        _ => Some(BUILDER_ID_PROFILE_ARN),
-    }
-}
-
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
     credentials: &KiroCredentials,
@@ -372,12 +344,8 @@ pub(crate) async fn get_usage_limits(
 
     // profileArn：凭据自带则用自带（Social/Pro 刷新会返回），否则按 auth_method 兜底共享 ARN
     // （Builder ID / IdC 刷新不返回 profileArn，缺失时上游会 400 Invalid profileArn）。
-    let profile_arn = credentials
-        .profile_arn
-        .as_deref()
-        .or_else(|| default_profile_arn(credentials));
-    if let Some(profile_arn) = profile_arn {
-        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
+    if let Some(profile_arn) = credentials.effective_profile_arn() {
+        url.push_str(&format!("&profileArn={}", urlencoding::encode(&profile_arn)));
     }
 
     // 构建 User-Agent headers

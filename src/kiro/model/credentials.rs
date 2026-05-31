@@ -126,6 +126,16 @@ fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
+/// Social 登录（Google/Github）账号的共享 profileArn。
+/// Kiro IDE 对 social 免费账号统一使用这个 profile。
+pub const SOCIAL_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+
+/// AWS Builder ID 账号的共享 profileArn。
+/// Kiro IDE 对 Builder ID 账号统一使用这个 profile（抓包确认）。
+pub const BUILDER_ID_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+
 fn canonicalize_auth_method_value(value: &str) -> &str {
     if value.eq_ignore_ascii_case("builder-id") || value.eq_ignore_ascii_case("iam") {
         "idc"
@@ -304,6 +314,38 @@ impl KiroCredentials {
             // 如果还没有获取订阅信息，暂时允许（首次使用时会获取）
             None => true,
         }
+    }
+
+    /// 凭据缺失 profileArn 时，按 auth_method 推断默认共享 profileArn。
+    ///
+    /// - social → social 共享 ARN
+    /// - idc / builder-id / iam → Builder ID 共享 ARN
+    /// - api_key → 不注入（走另一套鉴权）
+    fn default_profile_arn(&self) -> Option<&'static str> {
+        if self.is_api_key_credential() {
+            return None;
+        }
+        match self.auth_method.as_deref() {
+            Some(m) if m.eq_ignore_ascii_case("social") => Some(SOCIAL_PROFILE_ARN),
+            _ => Some(BUILDER_ID_PROFILE_ARN),
+        }
+    }
+
+    /// 获取实际应使用的 profileArn：自带优先，缺失则按 auth_method 兜底共享 ARN。
+    ///
+    /// Builder ID / IdC 刷新（AWS SSO-OIDC）不返回 profileArn，而 `getUsageLimits`
+    /// 与会话/MCP 请求都需要有效 profileArn，否则上游报
+    /// `profileArn is required` / `Invalid profileArn`。
+    pub fn effective_profile_arn(&self) -> Option<String> {
+        if let Some(arn) = self
+            .profile_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(arn.to_string());
+        }
+        self.default_profile_arn().map(|s| s.to_string())
     }
 
     /// 检查是否为 API Key 凭据

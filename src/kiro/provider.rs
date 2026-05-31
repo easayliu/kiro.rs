@@ -363,8 +363,8 @@ impl KiroProvider {
                 .body(request_body.to_string())
                 .header("content-type", "application/json");
 
-            // MCP 请求需要携带 profile ARN（如果凭据中存在）
-            if let Some(ref arn) = ctx.credentials.profile_arn {
+            // MCP 请求需要携带 profile ARN（自带优先，缺失则按 auth_method 兜底共享 ARN）
+            if let Some(arn) = ctx.credentials.effective_profile_arn() {
                 request = request.header("x-amzn-kiro-profile-arn", arn);
             }
 
@@ -555,8 +555,12 @@ impl KiroProvider {
             let user_agent = config.streaming_user_agent(&machine_id, mode);
 
             // 按实际凭据重写 body：profileArn / origin / envState 均按凭据级 mode 决定
-            let outbound_body =
-                Self::apply_credential_overrides(request_body, &ctx.credentials.profile_arn, mode);
+            // profileArn 缺失时按 auth_method 兜底共享 ARN，否则上游报 profileArn is required
+            let outbound_body = Self::apply_credential_overrides(
+                request_body,
+                &ctx.credentials.effective_profile_arn(),
+                mode,
+            );
 
             // 发送请求；clone 一份留给 400 等请求侧错误时回溯实际发往上游的 payload
             let mut request = self
