@@ -36,10 +36,13 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     // 移除 $schema（kiro API 不接受此字段，且 Draft 2020-12 声明会触发校验失败）
     obj.remove("$schema");
 
-    // type（必须是字符串）
-    if !obj.get("type").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
-        obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
-    }
+    // type（顶层 inputSchema 必须恒为 "object"）
+    //
+    // Bedrock 要求工具顶层 inputSchema.type 必须是 "object"，否则 400
+    // "inputSchema.json.type must be one of the following: object."。
+    // 部分客户端/MCP 工具会传成 "string"/"array" 等其它值，这里直接强制覆盖，
+    // 而不是仅在缺失时补全。
+    obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
 
     // properties（必须是 object）；递归规范化每个 property 的子 schema
     match obj.remove("properties") {
@@ -842,13 +845,21 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
     short
 }
 
-/// 缩短超长 tool_use_id（确定性 hash，保证 tool_use 和 tool_result 端映射一致）
+/// 规范化 tool_use_id：净化非法字符 + 缩短超长（确定性，保证 tool_use 和 tool_result 端映射一致）
 ///
-/// 短于上限的原样返回；否则用 SHA256 前缀生成 `toolu_h` + 24 位 hex（共 31 字符），
-/// 形态与 Anthropic 原生 `toolu_xxx` 兼容，避免上游 Smithy 长度校验失败。
+/// 1. 先把 `[a-zA-Z0-9_-]` 以外的字符替换为 `_`，满足 Bedrock 的
+///    `^[a-zA-Z0-9_-]+$` 校验（否则 400 `tool_use.id: String should match pattern ...`）。
+/// 2. 净化后若仍超长（或净化为空），用原始 id 的 SHA256 前缀生成 `toolu_h` + 24 位 hex
+///    （共 31 字符），形态与 Anthropic 原生 `toolu_xxx` 兼容，避免上游 Smithy 长度校验失败。
+///
+/// tool_use 与 tool_result 两端都以相同的原始 id 调用本函数，因此映射结果一致，不会破坏配对。
 fn map_tool_use_id(id: &str) -> String {
-    if id.len() <= TOOL_USE_ID_MAX_LEN {
-        return id.to_string();
+    let sanitized: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    if !sanitized.is_empty() && sanitized.len() <= TOOL_USE_ID_MAX_LEN {
+        return sanitized;
     }
     let mut hasher = Sha256::new();
     hasher.update(id.as_bytes());
@@ -1303,6 +1314,46 @@ mod pairing_tests {
             normalize_tool_use_id_for_client("toolu_tooluse_x"),
             "toolu_tooluse_x"
         );
+    }
+
+    #[test]
+    fn test_map_tool_use_id_sanitizes_illegal_chars() {
+        // 含非法字符（`.` `:` `/`）→ 全部替换为 `_`，满足 ^[a-zA-Z0-9_-]+$
+        assert_eq!(map_tool_use_id("call.foo:bar/baz"), "call_foo_bar_baz");
+        // 合法字符（字母数字 + `_` + `-`）原样保留
+        assert_eq!(map_tool_use_id("toolu_01-AbZ9"), "toolu_01-AbZ9");
+        // tool_use 与 tool_result 两端以相同原始 id 调用 → 映射一致，配对不破裂
+        assert_eq!(map_tool_use_id("x@y"), map_tool_use_id("x@y"));
+    }
+
+    #[test]
+    fn test_map_tool_use_id_overlong_falls_back_to_hash() {
+        let long = format!("call.{}", "x".repeat(80));
+        let mapped = map_tool_use_id(&long);
+        assert!(mapped.starts_with("toolu_h"));
+        assert_eq!(mapped.len(), 31);
+        // 确定性：同一输入两次结果相同
+        assert_eq!(mapped, map_tool_use_id(&long));
+        // 结果本身也满足合法字符集
+        assert!(mapped.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+    }
+
+    #[test]
+    fn test_normalize_json_schema_forces_object_type() {
+        // 顶层 type 是非 object 值 → 强制覆盖为 "object"
+        let out = normalize_json_schema(serde_json::json!({
+            "type": "string",
+            "properties": {}
+        }));
+        assert_eq!(out["type"], serde_json::json!("object"));
+
+        // 缺失 type → 补 "object"
+        let out2 = normalize_json_schema(serde_json::json!({"properties": {}}));
+        assert_eq!(out2["type"], serde_json::json!("object"));
+
+        // 非 object 顶层（数组）→ 回退为标准空 object schema
+        let out3 = normalize_json_schema(serde_json::json!([1, 2, 3]));
+        assert_eq!(out3["type"], serde_json::json!("object"));
     }
 
     #[test]
