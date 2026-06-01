@@ -218,10 +218,14 @@ impl KiroCredentials {
     }
 
     /// 获取有效的 API Region（用于 API 请求）
-    /// 优先级：凭据.api_region > config.api_region > config.region
+    /// 优先级：凭据.api_region（显式覆盖）> profileArn 内嵌 region > config.api_region > config.region
+    ///
+    /// 企业 IdC 的 Q API region 以账号自有 profileArn 内嵌的为准（探测写回后生效），未必等于
+    /// SSO 认证 region，也未必等于 config 默认 region。
     pub fn effective_api_region<'a>(&'a self, config: &'a Config) -> &'a str {
         self.api_region
             .as_deref()
+            .or_else(|| self.profile_arn_region())
             .unwrap_or(config.effective_api_region())
     }
 
@@ -308,16 +312,28 @@ impl KiroCredentials {
 
     /// 获取实际应使用的 profileArn。
     ///
-    /// 对齐上游原版（hank9999/kiro.rs）：**只用凭据自带的 profileArn**，不做任何共享 ARN 兜底。
-    /// profileArn 对上游是可选的——Social/Pro 刷新会返回并写入 `profile_arn`，
-    /// Builder ID / 企业 IdC 没有则直接不带（企业账号若被塞入共享/外来 ARN 反而会被
-    /// 403 Invalid token / 400 Invalid profileArn 拒绝）。
+    /// **只用凭据自带的 profileArn**，不做任何共享/默认 ARN 兜底（给企业 IdC 塞外来 ARN 会被
+    /// 上游 403 Invalid token 拒绝）。企业 IdC / Builder ID 账号的 token 不带 profileArn，需在
+    /// 登录后通过 `ListAvailableProfiles` 探测出账号自有 ARN 并写回 `profile_arn`（见
+    /// `token_manager::list_available_profiles`），之后这里即可正常返回。
     pub fn effective_profile_arn(&self) -> Option<String> {
         self.profile_arn
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
+    }
+
+    /// 从 `profile_arn` 解析出所属 region（`arn:aws:codewhisperer:{region}:acct:profile/x`）。
+    ///
+    /// 企业 IdC 账号的 Q API region 以 profileArn 内嵌的为准，未必等于 SSO 认证 region。
+    pub fn profile_arn_region(&self) -> Option<&str> {
+        self.profile_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|arn| arn.split(':').nth(3))
+            .filter(|s| !s.is_empty())
     }
 
     /// 检查是否为 API Key 凭据
@@ -380,22 +396,34 @@ mod tests {
 
     #[test]
     fn test_effective_profile_arn_uses_own_only() {
-        // 对齐上游：只用凭据自带的 profileArn，缺失则返回 None（不兜底共享 ARN）
+        // 只用凭据自带 ARN，不兜底共享/默认 ARN；SSO OIDC 账号探测到 ARN 后同样照常返回。
         let mut cred = KiroCredentials {
             auth_method: Some("idc".to_string()),
             ..Default::default()
         };
         assert_eq!(cred.effective_profile_arn(), None, "缺失时不兜底");
 
-        cred.profile_arn = Some("arn:aws:codewhisperer:us-east-1:111122223333:profile/OWN".to_string());
+        // 探测/刷新写回自有 ARN 后，照常返回（企业 IdC 的真实 ARN）
+        cred.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:607416644019:profile/74G7G3NXYGXY".to_string());
         assert_eq!(
             cred.effective_profile_arn(),
-            Some("arn:aws:codewhisperer:us-east-1:111122223333:profile/OWN".to_string())
+            Some("arn:aws:codewhisperer:us-east-1:607416644019:profile/74G7G3NXYGXY".to_string())
         );
 
         // 空白串视为缺失
         cred.profile_arn = Some("   ".to_string());
         assert_eq!(cred.effective_profile_arn(), None);
+    }
+
+    #[test]
+    fn test_profile_arn_region() {
+        let mut cred = KiroCredentials::default();
+        assert_eq!(cred.profile_arn_region(), None);
+
+        cred.profile_arn =
+            Some("arn:aws:codewhisperer:ap-southeast-2:111122223333:profile/X".to_string());
+        assert_eq!(cred.profile_arn_region(), Some("ap-southeast-2"));
     }
 
     #[test]

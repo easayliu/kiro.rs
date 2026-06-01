@@ -317,10 +317,103 @@ async fn refresh_idc_token(
         new_credentials.profile_arn = Some(profile_arn);
     }
 
+    // 企业 IdC / Builder ID 的 token 不携带 profileArn，但 getUsageLimits / 对话都需要账号自有
+    // ARN。对齐真实 Kiro IDE：登录后调用 ListAvailableProfiles 探测并写回 profile_arn，之后随
+    // 凭据持久化、后续请求复用。探测失败不阻断刷新（仅记日志，本次拿不到额度但 token 仍有效）。
+    if new_credentials
+        .profile_arn
+        .as_deref()
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true)
+        && let Some(access_token) = new_credentials.access_token.as_deref()
+    {
+        // 探测用账号 SSO region（cred.region，导入时即 us-east-1）；profileArn 尚未知晓。
+        let probe_region = new_credentials.effective_auth_region(config).to_string();
+        match list_available_profiles(&new_credentials, config, access_token, proxy, &probe_region)
+            .await
+        {
+            Ok(Some(arn)) => {
+                tracing::info!("IdC 账号探测到 profileArn: {}", arn);
+                new_credentials.profile_arn = Some(arn);
+            }
+            Ok(None) => tracing::warn!("IdC 账号 ListAvailableProfiles 未返回可用 profileArn"),
+            Err(e) => tracing::warn!("IdC 账号 ListAvailableProfiles 探测失败（不阻断刷新）: {}", e),
+        }
+    }
+
     Ok(new_credentials)
 }
 
-/// 获取使用额度信息
+/// 探测 SSO OIDC（企业 IdC / Builder ID）账号自有的 profileArn。
+///
+/// 对齐真实 Kiro IDE：登录后 `POST https://q.{region}.amazonaws.com/ListAvailableProfiles`，
+/// body `{}`，仅凭 Bearer token 鉴权（无需 profileArn），返回账号可用的 profile 列表，取第一个
+/// `arn`。企业 IdC 的 token 不携带 profileArn，必须经此探测拿到，否则 getUsageLimits / 对话
+/// 都会被上游 400 Invalid profileArn 拒绝。
+///
+/// 失败（网络/非 2xx/无 profile）返回 `Ok(None)`，由调用方决定是否致命——探测本身不应打断刷新。
+pub(crate) async fn list_available_profiles(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+    region: &str,
+) -> anyhow::Result<Option<String>> {
+    let host = format!("q.{}.amazonaws.com", region);
+    let url = format!("https://{}/ListAvailableProfiles", host);
+    let machine_id = machine_id::generate_from_credentials(credentials, config)
+        .unwrap_or_default();
+    let mode = credentials.effective_client_mode(config);
+    let user_agent = config.runtime_user_agent(&machine_id, mode);
+    let amz_user_agent = config.runtime_x_amz_user_agent(&machine_id, mode);
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let response = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Connection", "close")
+        .body("{}")
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        tracing::warn!("ListAvailableProfiles 返回 {}：{}", status, body);
+        return Ok(None);
+    }
+
+    let json: serde_json::Value = response.json().await?;
+    Ok(extract_first_profile_arn(&json))
+}
+
+/// 从 ListAvailableProfiles 响应里取第一个 profile 的 ARN（兼容字段名差异）。
+fn extract_first_profile_arn(json: &serde_json::Value) -> Option<String> {
+    let arr = json
+        .get("profiles")
+        .or_else(|| json.get("availableProfiles"))
+        .and_then(|v| v.as_array())?;
+    arr.iter().find_map(|p| {
+        p.get("arn")
+            .or_else(|| p.get("profileArn"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    })
+}
+
+/// 获取使用额度信息。
+///
+/// region 以 profileArn 内嵌的为准（企业 IdC 的 Q API region 未必等于 SSO 认证 region），
+/// 缺失时回退到凭据生效 region。profileArn 只用凭据自带（企业 IdC 由
+/// [`list_available_profiles`] 探测后写回），不兜底任何共享 ARN。
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
     config: &Config,
@@ -329,26 +422,22 @@ pub(crate) async fn get_usage_limits(
 ) -> anyhow::Result<UsageLimitsResponse> {
     tracing::debug!("正在获取使用额度信息...");
 
-    // 优先级：凭据.api_region > config.api_region > config.region
-    let region = credentials.effective_api_region(config);
+    let region = credentials.effective_api_region(config).to_string();
     let host = format!("q.{}.amazonaws.com", region);
     let machine_id = machine_id::generate_from_credentials(credentials, config)
         .unwrap_or_default();
     let mode = credentials.effective_client_mode(config);
 
-    // 构建 URL
+    // 构建 URL（对齐真实 Kiro IDE：isEmailRequired=true → origin → profileArn → resourceType）
     let mut url = format!(
-        "https://{}/getUsageLimits?origin={}&resourceType=AGENTIC_REQUEST",
+        "https://{}/getUsageLimits?isEmailRequired=true&origin={}&resourceType=AGENTIC_REQUEST",
         host, mode.origin()
     );
 
-    // profileArn：凭据自带则用自带（Social/Pro 刷新会返回），否则按 auth_method 兜底共享 ARN
-    // （Builder ID / IdC 刷新不返回 profileArn，缺失时上游会 400 Invalid profileArn）。
     if let Some(profile_arn) = credentials.effective_profile_arn() {
         url.push_str(&format!("&profileArn={}", urlencoding::encode(&profile_arn)));
     }
 
-    // 构建 User-Agent headers
     let user_agent = config.runtime_user_agent(&machine_id, mode);
     let amz_user_agent = config.runtime_x_amz_user_agent(&machine_id, mode);
 

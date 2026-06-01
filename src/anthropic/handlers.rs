@@ -528,6 +528,20 @@ fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
+/// 上游中途掐断（真截断，likely_complete=false）时发给下游的 SSE `error` 事件。
+///
+/// 为什么用 error 事件而不是补 message_stop：上游（AWS/Kiro）或中间代理对长回复
+/// 施加了响应时长上限，会在 ~4 分钟处 abrupt close（peer 未发 close_notify），此时
+/// 响应并未完成（saw_metering=false）。若照常补 `message_delta{stop_reason:end_turn}`
+/// + `message_stop`，客户端（Claude Code/SDK）会把半截回复当成正常 end_turn 收下、
+/// 不会重试，用户静默拿到残缺答案。改发 `error` 事件，SDK 才能识别异常并触发重试。
+/// 类型用 `api_error`（上游连接失败，可重试），与 Anthropic 流式错误事件格式一致。
+fn create_truncation_error_sse() -> Bytes {
+    Bytes::from(
+        "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Upstream closed the connection before the response completed (likely an upstream/proxy response-duration limit). The reply was truncated; please retry.\"}}\n\n",
+    )
+}
+
 /// 流式转发过程统计（仅用于诊断"回复中断"：耗时 / 字节 / 帧数）
 ///
 /// 用于在流结束（正常 EOF 或读取出错）时，对比"中断"与"正常结束"两类样本的
@@ -664,15 +678,20 @@ fn create_sse_stream(
                                 saw_context_usage = stats.saw_context_usage,
                                 likely_complete = likely_complete,
                                 output_tokens = ctx.output_tokens,
-                                "流式响应中断：读取上游响应流失败，补发收尾事件（likely_complete=true 表示响应其实已完整、疑似 rustls 缺 close_notify 误判）: {}",
+                                "流式响应中断：读取上游响应流失败（likely_complete=false→发 error 事件让客户端重试；likely_complete=true→疑似 rustls 缺 close_notify 误判、响应其实已完整，照常补干净收尾）: {}",
                                 describe_reqwest_error(&e)
                             );
-                            // 发送最终事件并结束
-                            let final_events = ctx.generate_final_events();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
+                            // likely_complete=true（误判，响应其实已完整）：照常补 message_stop 等干净收尾。
+                            // likely_complete=false（真截断）：只发 error 事件，不补 message_stop——
+                            //   否则客户端会把半截回复当成正常 end_turn 收下、不重试。
+                            let bytes: Vec<Result<Bytes, Infallible>> = if likely_complete {
+                                ctx.generate_final_events()
+                                    .into_iter()
+                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .collect()
+                            } else {
+                                vec![Ok(create_truncation_error_sse())]
+                            };
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, stats)))
                         }
                         None => {
@@ -1317,15 +1336,21 @@ fn create_buffered_sse_stream(
                                     saw_context_usage = stats.saw_context_usage,
                                     likely_complete = likely_complete,
                                     output_tokens = ctx.output_tokens(),
-                                    "流式响应中断（缓冲模式）：读取上游响应流失败，补发已缓冲内容+收尾事件（likely_complete=true 疑似 rustls 缺 close_notify 误判）: {}",
+                                    "流式响应中断（缓冲模式）：读取上游响应流失败（likely_complete=false→发已缓冲内容+error 事件让客户端重试；likely_complete=true→疑似 rustls 缺 close_notify 误判、响应其实已完整，照常补干净收尾）: {}",
                                     describe_reqwest_error(&e)
                                 );
-                                // 发生错误，完成处理并返回所有事件
-                                let all_events = ctx.finish_and_get_all_events();
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
+                                // likely_complete=true（误判，响应其实已完整）：照常补干净收尾。
+                                // likely_complete=false（真截断）：只发 error 事件，不补 message_stop——
+                                //   否则客户端会把半截回复当成正常 end_turn 收下、不重试。缓冲模式下
+                                //   尚未向客户端发过任何内容，error 事件可作为首个事件直接交付。
+                                let bytes: Vec<Result<Bytes, Infallible>> = if likely_complete {
+                                    ctx.finish_and_get_all_events()
+                                        .into_iter()
+                                        .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                        .collect()
+                                } else {
+                                    vec![Ok(create_truncation_error_sse())]
+                                };
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, stats)));
                             }
                             None => {

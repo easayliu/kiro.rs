@@ -175,8 +175,15 @@ impl KiroProvider {
             return request_body.to_string();
         };
 
-        if let Some(arn) = profile_arn {
-            json["profileArn"] = serde_json::Value::String(arn.clone());
+        // 有则写入，无则剥离已存在的 profileArn（对齐 xkiro.rs：SSO OIDC 凭据带任何 ARN
+        // 都会被上游 403/400，effective_profile_arn 已对其返回 None，这里确保 body 不残留）。
+        match profile_arn {
+            Some(arn) => json["profileArn"] = serde_json::Value::String(arn.clone()),
+            None => {
+                if let Some(obj) = json.as_object_mut() {
+                    obj.remove("profileArn");
+                }
+            }
         }
 
         if let Some(user_input) =
@@ -363,7 +370,8 @@ impl KiroProvider {
                 .body(request_body.to_string())
                 .header("content-type", "application/json");
 
-            // MCP 请求需要携带 profile ARN（自带优先，缺失则按 auth_method 兜底共享 ARN）
+            // MCP 请求按需携带 profile ARN：仅 Social/Pro 自带 ARN 时附带；
+            // SSO OIDC（Builder ID / 企业 IdC）由 effective_profile_arn 返回 None，不带。
             if let Some(arn) = ctx.credentials.effective_profile_arn() {
                 request = request.header("x-amzn-kiro-profile-arn", arn);
             }
@@ -554,8 +562,9 @@ impl KiroProvider {
             let x_amz_user_agent = config.streaming_x_amz_user_agent(&machine_id, mode);
             let user_agent = config.streaming_user_agent(&machine_id, mode);
 
-            // 按实际凭据重写 body：profileArn / origin / envState 均按凭据级 mode 决定
-            // profileArn 缺失时按 auth_method 兜底共享 ARN，否则上游报 profileArn is required
+            // 按实际凭据重写 body：profileArn / origin / envState 均按凭据级 mode 决定。
+            // profileArn 只用凭据自带（Social/Pro）；SSO OIDC 凭据由 effective_profile_arn
+            // 返回 None，apply_credential_overrides 会顺带剥离 body 中残留的 profileArn。
             let outbound_body = Self::apply_credential_overrides(
                 request_body,
                 &ctx.credentials.effective_profile_arn(),
