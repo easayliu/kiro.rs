@@ -100,8 +100,14 @@ pub fn build_client(
     // 1. 与真实 Kiro IDE（aws-sdk-js / node）一致——抓包显示其用 HTTP/1.1 + Connection: close；
     // 2. 规避上游 HTTP/2 在传 body 中途发 RST_STREAM(INTERNAL_ERROR) 导致的
     //    "stream error received" 502（不固定时 reqwest 会经 ALPN 协商成 h2）。
+    // TCP keepalive：对齐真实 Kiro IDE（aws-sdk-js/Node 的 socket 默认开 keepAlive）。
+    // opus 长时间思考期间上游连接会进入静默，若无 keepalive 探针，路径上的
+    // NAT/防火墙/边缘会按 ~4 分钟 idle 上限把空闲 TLS 连接丢弃，rustls 随即报
+    // "peer closed connection without sending TLS close_notify"，表现为回复中途截断。
+    // 设 30s 首探针间隔（远小于观测到的 ~240s 截断点），空闲期持续产生探针保活。
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
+        .tcp_keepalive(Duration::from_secs(30))
         .http1_only();
 
     if tls_backend == TlsBackend::Rustls {
