@@ -1229,6 +1229,16 @@ impl BufferedStreamContext {
         self.inner.set_cache_usage(ctx);
     }
 
+    /// 请求的模型名称（仅用于诊断日志）
+    pub fn model(&self) -> &str {
+        &self.inner.model
+    }
+
+    /// 已累计的输出 token 估算（仅用于诊断日志）
+    pub fn output_tokens(&self) -> i32 {
+        self.inner.output_tokens
+    }
+
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。

@@ -18,7 +18,7 @@ use axum::{
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use serde_json::json;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::interval;
 use uuid::Uuid;
 
@@ -528,6 +528,40 @@ fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
+/// 流式转发过程统计（仅用于诊断"回复中断"：耗时 / 字节 / 帧数）
+///
+/// 用于在流结束（正常 EOF 或读取出错）时，对比"中断"与"正常结束"两类样本的
+/// 已耗时分布。若中断样本的 `elapsed_secs` 普遍贴近上游 client 的总超时（720s）
+/// 且 `is_timeout=true`，即可坐实是 reqwest 总超时（含读 body 的总死线）截断了长回复。
+#[derive(Debug)]
+struct StreamStats {
+    start: Instant,
+    bytes: usize,
+    frames: usize,
+}
+
+impl StreamStats {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            bytes: 0,
+            frames: 0,
+        }
+    }
+}
+
+/// 展开 reqwest 错误的完整 source 链，便于区分 timeout / connect reset / 上游提前 EOF / h2 RST
+fn describe_reqwest_error(e: &reqwest::Error) -> String {
+    let mut chain = e.to_string();
+    let mut src = std::error::Error::source(e);
+    while let Some(s) = src {
+        chain.push_str(" -> ");
+        chain.push_str(&s.to_string());
+        src = s.source();
+    }
+    chain
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     response: reqwest::Response,
@@ -545,8 +579,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), StreamStats::new()),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut stats)| async move {
             if finished {
                 return None;
             }
@@ -557,15 +591,22 @@ fn create_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
+                            stats.bytes += chunk.len();
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
-                                tracing::warn!("缓冲区溢出: {}", e);
+                                tracing::warn!(
+                                    elapsed_secs = stats.start.elapsed().as_secs_f64(),
+                                    bytes = stats.bytes,
+                                    "缓冲区溢出（chunk 被丢弃，后续帧可能错位导致截断）: {}",
+                                    e
+                                );
                             }
 
                             let mut events = Vec::new();
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
+                                        stats.frames += 1;
                                         if let Ok(event) = Event::from_frame(frame) {
                                             let sse_events = ctx.process_kiro_event(&event);
                                             events.extend(sse_events);
@@ -583,26 +624,49 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, stats)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", e);
+                            // 流式响应中断：读取上游 body 失败。重点看 is_timeout 与 elapsed_secs：
+                            // 若普遍贴近 720s 且 is_timeout=true，即为 reqwest 总超时（含读 body）截断长回复。
+                            tracing::error!(
+                                model = %ctx.model,
+                                is_timeout = e.is_timeout(),
+                                is_body = e.is_body(),
+                                is_decode = e.is_decode(),
+                                is_request = e.is_request(),
+                                elapsed_secs = stats.start.elapsed().as_secs_f64(),
+                                bytes = stats.bytes,
+                                frames = stats.frames,
+                                output_tokens = ctx.output_tokens,
+                                "流式响应中断：读取上游响应流失败，补发收尾事件（stop_reason 将显示为正常结束，客户端看到的是半截回复）: {}",
+                                describe_reqwest_error(&e)
+                            );
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, stats)))
                         }
                         None => {
+                            // 流正常结束（上游 EOF）。作为对照样本，便于与中断样本对比 elapsed_secs 分布。
+                            tracing::info!(
+                                model = %ctx.model,
+                                elapsed_secs = stats.start.elapsed().as_secs_f64(),
+                                bytes = stats.bytes,
+                                frames = stats.frames,
+                                output_tokens = ctx.output_tokens,
+                                "上游流正常结束（EOF）"
+                            );
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, stats)))
                         }
                     }
                 }
@@ -610,7 +674,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, stats)))
                 }
             }
         },
@@ -1137,8 +1201,9 @@ fn create_buffered_sse_stream(
             EventStreamDecoder::new(),
             false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            StreamStats::new(),
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut stats)| async move {
             if finished {
                 return None;
             }
@@ -1153,21 +1218,28 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, stats)));
                     }
 
                     // 然后处理数据流
                     chunk_result = body_stream.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
+                                stats.bytes += chunk.len();
                                 // 解码事件
                                 if let Err(e) = decoder.feed(&chunk) {
-                                    tracing::warn!("缓冲区溢出: {}", e);
+                                    tracing::warn!(
+                                        elapsed_secs = stats.start.elapsed().as_secs_f64(),
+                                        bytes = stats.bytes,
+                                        "缓冲区溢出（chunk 被丢弃，后续帧可能错位导致截断）: {}",
+                                        e
+                                    );
                                 }
 
                                 for result in decoder.decode_iter() {
                                     match result {
                                         Ok(frame) => {
+                                            stats.frames += 1;
                                             if let Ok(event) = Event::from_frame(frame) {
                                                 // 缓冲事件（复用 StreamContext 的处理逻辑）
                                                 ctx.process_and_buffer(&event);
@@ -1181,23 +1253,46 @@ fn create_buffered_sse_stream(
                                 // 继续读取下一个 chunk，不发送任何数据
                             }
                             Some(Err(e)) => {
-                                tracing::error!("读取响应流失败: {}", e);
+                                // 缓冲模式（/cc/v1，Claude Code 端点）：全程只发 ping，撞总超时概率最大。
+                                // 同样重点看 is_timeout 与 elapsed_secs。
+                                tracing::error!(
+                                    model = %ctx.model(),
+                                    is_timeout = e.is_timeout(),
+                                    is_body = e.is_body(),
+                                    is_decode = e.is_decode(),
+                                    is_request = e.is_request(),
+                                    elapsed_secs = stats.start.elapsed().as_secs_f64(),
+                                    bytes = stats.bytes,
+                                    frames = stats.frames,
+                                    output_tokens = ctx.output_tokens(),
+                                    "流式响应中断（缓冲模式）：读取上游响应流失败，补发已缓冲的部分内容+收尾事件: {}",
+                                    describe_reqwest_error(&e)
+                                );
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, stats)));
                             }
                             None => {
+                                // 流正常结束（上游 EOF）。对照样本，便于对比 elapsed_secs 分布。
+                                tracing::info!(
+                                    model = %ctx.model(),
+                                    elapsed_secs = stats.start.elapsed().as_secs_f64(),
+                                    bytes = stats.bytes,
+                                    frames = stats.frames,
+                                    output_tokens = ctx.output_tokens(),
+                                    "上游流正常结束（EOF，缓冲模式）"
+                                );
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, stats)));
                             }
                         }
                     }
