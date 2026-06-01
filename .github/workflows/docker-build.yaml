@@ -28,9 +28,6 @@ jobs:
           - platform: linux/amd64
             runner: ubuntu-latest
             arch: amd64
-          - platform: linux/arm64
-            runner: ubuntu-22.04-arm
-            arch: arm64
 
     steps:
       - name: Checkout
@@ -85,14 +82,12 @@ jobs:
           VERSION="${{ needs.build.outputs.version }}"
           IMAGE="ghcr.io/${{ github.repository_owner }}/kiro-rs"
 
-          # Create manifest for version tag
+          # Create manifest for version tag（已移除 arm64，仅 amd64）
           docker manifest create ${IMAGE}:${VERSION} \
-            ${IMAGE}:${VERSION}-amd64 \
-            ${IMAGE}:${VERSION}-arm64
+            ${IMAGE}:${VERSION}-amd64
           docker manifest push ${IMAGE}:${VERSION}
 
           # Create latest alias tag (tag/manual builds are considered stable)
           docker manifest create ${IMAGE}:latest \
-            ${IMAGE}:${VERSION}-amd64 \
-            ${IMAGE}:${VERSION}-arm64
+            ${IMAGE}:${VERSION}-amd64
           docker manifest push ${IMAGE}:latest
