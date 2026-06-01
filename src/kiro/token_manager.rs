@@ -412,8 +412,9 @@ fn extract_first_profile_arn(json: &serde_json::Value) -> Option<String> {
 /// 获取使用额度信息。
 ///
 /// region 以 profileArn 内嵌的为准（企业 IdC 的 Q API region 未必等于 SSO 认证 region），
-/// 缺失时回退到凭据生效 region。profileArn 只用凭据自带（企业 IdC 由
-/// [`list_available_profiles`] 探测后写回），不兜底任何共享 ARN。
+/// 缺失时回退到凭据生效 region。profileArn 三级优先级（见
+/// [`KiroCredentials::effective_profile_arn`]）：凭据自带 → `ListAvailableProfiles` 探测写回
+/// → 按 auth_method 兜底共享 ARN（企业 IdC 不兜，避免外来 ARN 触发 403 Invalid token）。
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
     config: &Config,

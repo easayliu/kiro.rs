@@ -175,8 +175,8 @@ impl KiroProvider {
             return request_body.to_string();
         };
 
-        // 有则写入，无则剥离已存在的 profileArn（对齐 xkiro.rs：SSO OIDC 凭据带任何 ARN
-        // 都会被上游 403/400，effective_profile_arn 已对其返回 None，这里确保 body 不残留）。
+        // 有则写入，无则剥离已存在的 profileArn（effective_profile_arn 对企业 IdC / api_key
+        // 返回 None，需保证 body 不残留 handlers 阶段拼入的旧 ARN，避免身份不匹配触发 403）。
         match profile_arn {
             Some(arn) => json["profileArn"] = serde_json::Value::String(arn.clone()),
             None => {
@@ -370,8 +370,8 @@ impl KiroProvider {
                 .body(request_body.to_string())
                 .header("content-type", "application/json");
 
-            // MCP 请求按需携带 profile ARN：仅 Social/Pro 自带 ARN 时附带；
-            // SSO OIDC（Builder ID / 企业 IdC）由 effective_profile_arn 返回 None，不带。
+            // MCP 请求按需携带 profile ARN：effective_profile_arn 自带优先，Builder ID/Social
+            // 缺失时按 auth_method 兜底共享 ARN，企业 IdC / api_key 返回 None 则不附带。
             if let Some(arn) = ctx.credentials.effective_profile_arn() {
                 request = request.header("x-amzn-kiro-profile-arn", arn);
             }
@@ -563,8 +563,8 @@ impl KiroProvider {
             let user_agent = config.streaming_user_agent(&machine_id, mode);
 
             // 按实际凭据重写 body：profileArn / origin / envState 均按凭据级 mode 决定。
-            // profileArn 只用凭据自带（Social/Pro）；SSO OIDC 凭据由 effective_profile_arn
-            // 返回 None，apply_credential_overrides 会顺带剥离 body 中残留的 profileArn。
+            // profileArn 由 effective_profile_arn 三级解析（自带 → 探测写回 → auth_method 兜底，
+            // 企业 IdC / api_key 返回 None），apply_credential_overrides 会顺带剥离残留 ARN。
             let outbound_body = Self::apply_credential_overrides(
                 request_body,
                 &ctx.credentials.effective_profile_arn(),

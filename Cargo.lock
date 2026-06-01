@@ -961,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "kiro-rs"
-version = "2026.3.93"
+version = "2026.3.94"
 dependencies = [
  "anyhow",
  "axum",
