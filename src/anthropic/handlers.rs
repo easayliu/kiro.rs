@@ -538,6 +538,10 @@ struct StreamStats {
     start: Instant,
     bytes: usize,
     frames: usize,
+    /// 是否见过 meteringEvent（计费事件，上游生成全部完成后才发，是最可靠的收尾信号）
+    saw_metering: bool,
+    /// 是否见过 contextUsageEvent（上下文用量，同样在流末尾）
+    saw_context_usage: bool,
 }
 
 impl StreamStats {
@@ -546,6 +550,17 @@ impl StreamStats {
             start: Instant::now(),
             bytes: 0,
             frames: 0,
+            saw_metering: false,
+            saw_context_usage: false,
+        }
+    }
+
+    /// 记录终止类事件，用于 EOF 时判断是否为静默截断
+    fn note_event(&mut self, event: &Event) {
+        match event {
+            Event::Metering(_) => self.saw_metering = true,
+            Event::ContextUsage(_) => self.saw_context_usage = true,
+            _ => {}
         }
     }
 }
@@ -608,6 +623,7 @@ fn create_sse_stream(
                                     Ok(frame) => {
                                         stats.frames += 1;
                                         if let Ok(event) = Event::from_frame(frame) {
+                                            stats.note_event(&event);
                                             let sse_events = ctx.process_kiro_event(&event);
                                             events.extend(sse_events);
                                         }
@@ -651,15 +667,35 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, stats)))
                         }
                         None => {
-                            // 流正常结束（上游 EOF）。作为对照样本，便于与中断样本对比 elapsed_secs 分布。
-                            tracing::info!(
-                                model = %ctx.model,
-                                elapsed_secs = stats.start.elapsed().as_secs_f64(),
-                                bytes = stats.bytes,
-                                frames = stats.frames,
-                                output_tokens = ctx.output_tokens,
-                                "上游流正常结束（EOF）"
-                            );
+                            // 流结束（上游 EOF）。区分"正常结束"与"静默截断"：
+                            // 静默截断走的也是 None 分支（尤其 HTTP/1.1 close-delimited body 被提前关闭时），
+                            // 不会报错，需靠应用层判据识别：
+                            //   判据1 pending_bytes>0 → 切在半个帧中间；
+                            //   判据2 没见过 meteringEvent → 收尾事件缺失，几乎可断定被提前截断。
+                            let pending = decoder.pending_bytes();
+                            let suspected_truncation = pending > 0 || !stats.saw_metering;
+                            if suspected_truncation {
+                                tracing::warn!(
+                                    model = %ctx.model,
+                                    elapsed_secs = stats.start.elapsed().as_secs_f64(),
+                                    bytes = stats.bytes,
+                                    frames = stats.frames,
+                                    pending_bytes = pending,
+                                    saw_metering = stats.saw_metering,
+                                    saw_context_usage = stats.saw_context_usage,
+                                    output_tokens = ctx.output_tokens,
+                                    "疑似静默截断：流以 EOF 正常结束但缺少收尾信号（残留半帧或未收到 meteringEvent），客户端会看到半截回复"
+                                );
+                            } else {
+                                tracing::info!(
+                                    model = %ctx.model,
+                                    elapsed_secs = stats.start.elapsed().as_secs_f64(),
+                                    bytes = stats.bytes,
+                                    frames = stats.frames,
+                                    output_tokens = ctx.output_tokens,
+                                    "上游流正常结束（EOF）"
+                                );
+                            }
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -1241,6 +1277,7 @@ fn create_buffered_sse_stream(
                                         Ok(frame) => {
                                             stats.frames += 1;
                                             if let Ok(event) = Event::from_frame(frame) {
+                                                stats.note_event(&event);
                                                 // 缓冲事件（复用 StreamContext 的处理逻辑）
                                                 ctx.process_and_buffer(&event);
                                             }
@@ -1277,15 +1314,31 @@ fn create_buffered_sse_stream(
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, stats)));
                             }
                             None => {
-                                // 流正常结束（上游 EOF）。对照样本，便于对比 elapsed_secs 分布。
-                                tracing::info!(
-                                    model = %ctx.model(),
-                                    elapsed_secs = stats.start.elapsed().as_secs_f64(),
-                                    bytes = stats.bytes,
-                                    frames = stats.frames,
-                                    output_tokens = ctx.output_tokens(),
-                                    "上游流正常结束（EOF，缓冲模式）"
-                                );
+                                // 流结束（上游 EOF）。同样区分正常结束与静默截断（判据同直传路径）。
+                                let pending = decoder.pending_bytes();
+                                let suspected_truncation = pending > 0 || !stats.saw_metering;
+                                if suspected_truncation {
+                                    tracing::warn!(
+                                        model = %ctx.model(),
+                                        elapsed_secs = stats.start.elapsed().as_secs_f64(),
+                                        bytes = stats.bytes,
+                                        frames = stats.frames,
+                                        pending_bytes = pending,
+                                        saw_metering = stats.saw_metering,
+                                        saw_context_usage = stats.saw_context_usage,
+                                        output_tokens = ctx.output_tokens(),
+                                        "疑似静默截断（缓冲模式）：流以 EOF 正常结束但缺少收尾信号（残留半帧或未收到 meteringEvent）"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        model = %ctx.model(),
+                                        elapsed_secs = stats.start.elapsed().as_secs_f64(),
+                                        bytes = stats.bytes,
+                                        frames = stats.frames,
+                                        output_tokens = ctx.output_tokens(),
+                                        "上游流正常结束（EOF，缓冲模式）"
+                                    );
+                                }
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events

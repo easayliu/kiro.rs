@@ -607,6 +607,20 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
+                // 截断诊断：打一次上游响应的 framing 头。
+                // - Transfer-Encoding: chunked → hyper 能靠"缺结尾 0 长度块"检测出截断并报错，
+                //   不会发生"静默截断"；
+                // - 既无 chunked 也无 Content-Length（close-delimited）→ 连接被提前关闭会被当成
+                //   正常 EOF，才是 HTTP/1.1 + Connection: close 下静默截断的土壤。
+                let headers = response.headers();
+                tracing::debug!(
+                    version = ?response.version(),
+                    transfer_encoding = ?headers.get(reqwest::header::TRANSFER_ENCODING),
+                    content_length = ?headers.get(reqwest::header::CONTENT_LENGTH),
+                    content_type = ?headers.get(reqwest::header::CONTENT_TYPE),
+                    connection = ?headers.get(reqwest::header::CONNECTION),
+                    "上游响应 framing（截断诊断）"
+                );
                 self.token_manager.report_success(ctx.id);
                 return Ok(ApiCallResult {
                     response,
