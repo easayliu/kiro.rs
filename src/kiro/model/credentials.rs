@@ -136,6 +136,10 @@ pub const SOCIAL_PROFILE_ARN: &str =
 pub const BUILDER_ID_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
 
+/// AWS Builder ID 的固定 SSO 登录目录 host。
+/// 企业 IdC 的登录目录是 `d-*.awsapps.com`（或自定义域名），据此与 Builder ID 区分。
+const BUILDER_ID_START_HOST: &str = "view.awsapps.com";
+
 fn canonicalize_auth_method_value(value: &str) -> &str {
     if value.eq_ignore_ascii_case("builder-id") || value.eq_ignore_ascii_case("iam") {
         "idc"
@@ -316,13 +320,60 @@ impl KiroCredentials {
         }
     }
 
+    /// 从 client_secret(JWT) 中解出 SSO 登录目录的 host。
+    ///
+    /// IdC 凭据的 client_secret 是一段 JWT：payload 里有 `serialized` 字段（再次转义的 JSON 字符串），
+    /// 其中 `initiateLoginUri` 指向该账号的 SSO 起始页：
+    /// - AWS Builder ID：`https://view.awsapps.com/start`
+    /// - 企业 IdC：`https://d-XXXXXXXXXX.awsapps.com/start`（企业 SSO 目录）或自定义域名
+    ///
+    /// 仅读取 payload、不验签（只为区分账号类型，不用于鉴权）。
+    fn sso_login_host(&self) -> Option<String> {
+        use base64::Engine;
+
+        let secret = self.client_secret.as_deref()?;
+        let payload_b64 = secret.split('.').nth(1)?;
+        // JWT 用 base64url 无填充
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload_b64)
+            .ok()?;
+        let outer: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+        let serialized = outer.get("serialized")?.as_str()?;
+        let inner: serde_json::Value = serde_json::from_str(serialized).ok()?;
+        let uri = inner.get("initiateLoginUri")?.as_str()?;
+        let host = uri.split("://").nth(1)?.split('/').next()?;
+        if host.is_empty() {
+            return None;
+        }
+        Some(host.to_string())
+    }
+
+    /// 是否为企业 IdC 账号。
+    ///
+    /// 企业账号的 SSO 登录目录是 `d-*.awsapps.com`（或自定义域名），而非 Builder ID 固定的
+    /// `view.awsapps.com`。企业账号有自己的 profile，若注入共享的 Builder ID ARN，上游会以
+    /// `403 Invalid token` 拒绝（token 属企业 SSO 实例、ARN 属另一 AWS 账户，身份不匹配）。
+    ///
+    /// 判定保守：仅当能从 client_secret 解出登录 host、且该 host 不是 Builder ID 的
+    /// `view.awsapps.com` 时才视为企业；解析失败一律按非企业处理（保留原有兜底行为）。
+    pub fn is_enterprise_idc(&self) -> bool {
+        match self.sso_login_host() {
+            Some(host) => !host.eq_ignore_ascii_case(BUILDER_ID_START_HOST),
+            None => false,
+        }
+    }
+
     /// 凭据缺失 profileArn 时，按 auth_method 推断默认共享 profileArn。
     ///
+    /// - 企业 IdC → 不注入（企业账号有自己的 profile，共享 ARN 会被 403 Invalid token 拒绝）
     /// - social → social 共享 ARN
     /// - idc / builder-id / iam → Builder ID 共享 ARN
     /// - api_key → 不注入（走另一套鉴权）
     fn default_profile_arn(&self) -> Option<&'static str> {
         if self.is_api_key_credential() {
+            return None;
+        }
+        if self.is_enterprise_idc() {
             return None;
         }
         match self.auth_method.as_deref() {
@@ -404,6 +455,75 @@ mod tests {
 
         let creds = KiroCredentials::from_json(json).unwrap();
         assert_eq!(creds.access_token, Some("test_token".to_string()));
+    }
+
+    /// 构造一个 client_secret 风格的 JWT（仅 payload 有效，签名段任意），
+    /// payload.serialized 内嵌 initiateLoginUri，用于测试 SSO 目录识别。
+    fn make_client_secret(initiate_login_uri: &str) -> String {
+        use base64::Engine;
+        let inner = serde_json::json!({ "initiateLoginUri": initiate_login_uri }).to_string();
+        let outer = serde_json::json!({ "serialized": inner }).to_string();
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"alg\":\"HS384\"}");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(outer.as_bytes());
+        format!("{header}.{payload}.sig")
+    }
+
+    fn idc_cred_with_secret(secret: Option<String>) -> KiroCredentials {
+        KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_secret: secret,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_enterprise_idc_detected_from_directory_host() {
+        let cred = idc_cred_with_secret(Some(make_client_secret(
+            "https://d-90660ceab3.awsapps.com/start/",
+        )));
+        assert!(cred.is_enterprise_idc(), "d-* 目录应判定为企业 IdC");
+        // 企业账号不注入共享 ARN
+        assert_eq!(cred.effective_profile_arn(), None);
+    }
+
+    #[test]
+    fn test_builder_id_not_enterprise() {
+        let cred = idc_cred_with_secret(Some(make_client_secret(
+            "https://view.awsapps.com/start",
+        )));
+        assert!(!cred.is_enterprise_idc(), "Builder ID 不应判定为企业");
+        // Builder ID 仍走共享 ARN 兜底
+        assert_eq!(
+            cred.effective_profile_arn(),
+            Some(BUILDER_ID_PROFILE_ARN.to_string())
+        );
+    }
+
+    #[test]
+    fn test_idc_without_parsable_secret_keeps_fallback() {
+        // 无 client_secret 或无法解析时，保守按非企业处理，保留 Builder ID 兜底
+        let cred = idc_cred_with_secret(None);
+        assert!(!cred.is_enterprise_idc());
+        assert_eq!(
+            cred.effective_profile_arn(),
+            Some(BUILDER_ID_PROFILE_ARN.to_string())
+        );
+
+        let cred_bad = idc_cred_with_secret(Some("not-a-jwt".to_string()));
+        assert!(!cred_bad.is_enterprise_idc());
+    }
+
+    #[test]
+    fn test_enterprise_own_arn_takes_priority() {
+        // 即便是企业账号，若凭据自带 profileArn，仍优先使用自带的
+        let mut cred = idc_cred_with_secret(Some(make_client_secret(
+            "https://d-90660ceab3.awsapps.com/start/",
+        )));
+        cred.profile_arn = Some("arn:aws:codewhisperer:us-east-1:111122223333:profile/OWN".to_string());
+        assert_eq!(
+            cred.effective_profile_arn(),
+            Some("arn:aws:codewhisperer:us-east-1:111122223333:profile/OWN".to_string())
+        );
     }
 
     #[test]
