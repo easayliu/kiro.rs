@@ -643,8 +643,13 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, stats)))
                         }
                         Some(Err(e)) => {
-                            // 流式响应中断：读取上游 body 失败。重点看 is_timeout 与 elapsed_secs：
-                            // 若普遍贴近 720s 且 is_timeout=true，即为 reqwest 总超时（含读 body）截断长回复。
+                            // 流式响应中断：读取上游 body 失败。
+                            // is_timeout=true + elapsed≈720s → reqwest 总超时；
+                            // is_decode=true + "close_notify" → 上游/代理中途关 TLS 连接。
+                            // likely_complete 用于区分"真截断"与"rustls 缺 close_notify 误判"：
+                            //   收到 meteringEvent 且解码器无残留 → 响应其实已完整，换 native-tls 即可消除该错误。
+                            let pending = decoder.pending_bytes();
+                            let likely_complete = stats.saw_metering && pending == 0;
                             tracing::error!(
                                 model = %ctx.model,
                                 is_timeout = e.is_timeout(),
@@ -654,8 +659,12 @@ fn create_sse_stream(
                                 elapsed_secs = stats.start.elapsed().as_secs_f64(),
                                 bytes = stats.bytes,
                                 frames = stats.frames,
+                                pending_bytes = pending,
+                                saw_metering = stats.saw_metering,
+                                saw_context_usage = stats.saw_context_usage,
+                                likely_complete = likely_complete,
                                 output_tokens = ctx.output_tokens,
-                                "流式响应中断：读取上游响应流失败，补发收尾事件（stop_reason 将显示为正常结束，客户端看到的是半截回复）: {}",
+                                "流式响应中断：读取上游响应流失败，补发收尾事件（likely_complete=true 表示响应其实已完整、疑似 rustls 缺 close_notify 误判）: {}",
                                 describe_reqwest_error(&e)
                             );
                             // 发送最终事件并结束
@@ -1290,8 +1299,10 @@ fn create_buffered_sse_stream(
                                 // 继续读取下一个 chunk，不发送任何数据
                             }
                             Some(Err(e)) => {
-                                // 缓冲模式（/cc/v1，Claude Code 端点）：全程只发 ping，撞总超时概率最大。
-                                // 同样重点看 is_timeout 与 elapsed_secs。
+                                // 缓冲模式（/cc/v1，Claude Code 端点）：全程只发 ping。
+                                // likely_complete=true 表示响应其实已完整、疑似 rustls 缺 close_notify 误判。
+                                let pending = decoder.pending_bytes();
+                                let likely_complete = stats.saw_metering && pending == 0;
                                 tracing::error!(
                                     model = %ctx.model(),
                                     is_timeout = e.is_timeout(),
@@ -1301,8 +1312,12 @@ fn create_buffered_sse_stream(
                                     elapsed_secs = stats.start.elapsed().as_secs_f64(),
                                     bytes = stats.bytes,
                                     frames = stats.frames,
+                                    pending_bytes = pending,
+                                    saw_metering = stats.saw_metering,
+                                    saw_context_usage = stats.saw_context_usage,
+                                    likely_complete = likely_complete,
                                     output_tokens = ctx.output_tokens(),
-                                    "流式响应中断（缓冲模式）：读取上游响应流失败，补发已缓冲的部分内容+收尾事件: {}",
+                                    "流式响应中断（缓冲模式）：读取上游响应流失败，补发已缓冲内容+收尾事件（likely_complete=true 疑似 rustls 缺 close_notify 误判）: {}",
                                     describe_reqwest_error(&e)
                                 );
                                 // 发生错误，完成处理并返回所有事件
