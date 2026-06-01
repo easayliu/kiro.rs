@@ -521,6 +521,9 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+    /// 订阅等级为 Free（确认 subscription_title 含 FREE）后自动禁用；
+    /// 升级到 PRO+ 等非 Free 等级时会自动解除（自愈），也可手动重新启用。
+    FreeSubscription,
 }
 
 /// 统计数据持久化条目
@@ -1930,6 +1933,7 @@ impl MultiTokenManager {
                         DisabledReason::QuotaExceeded => "QuotaExceeded",
                         DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                         DisabledReason::InvalidConfig => "InvalidConfig",
+                        DisabledReason::FreeSubscription => "FreeSubscription",
                     }.to_string()),
                     throttled_until: e
                         .throttled_until
@@ -2369,10 +2373,13 @@ impl MultiTokenManager {
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
+            // 确认为 Free：title 非空且大写含 FREE（None/未知一律不算，避免误判）
+            let is_free = subscription_title.to_uppercase().contains("FREE");
             let changed = {
                 let mut entries = self.entries.lock();
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                     let old_title = entry.credentials.subscription_title.clone();
+                    let mut changed = false;
                     if old_title.as_deref() != Some(subscription_title) {
                         entry.credentials.subscription_title =
                             Some(subscription_title.to_string());
@@ -2382,10 +2389,28 @@ impl MultiTokenManager {
                             old_title,
                             subscription_title
                         );
-                        true
-                    } else {
-                        false
+                        changed = true;
                     }
+
+                    // 严格模式：每次查询只要确认 Free 且当前启用就禁用（不看是否变化）；
+                    // 手动重新启用的 Free 账号会在下次余额刷新时被再次禁用。
+                    if is_free && !entry.disabled {
+                        entry.disabled = true;
+                        entry.disabled_reason = Some(DisabledReason::FreeSubscription);
+                        tracing::info!("凭据 #{} 订阅为 Free，已自动禁用", id);
+                        changed = true;
+                    } else if !is_free
+                        && entry.disabled
+                        && entry.disabled_reason == Some(DisabledReason::FreeSubscription)
+                    {
+                        // 升级到非 Free：自愈解除之前因 Free 的自动禁用。
+                        entry.disabled = false;
+                        entry.disabled_reason = None;
+                        entry.failure_count = 0;
+                        tracing::info!("凭据 #{} 订阅已升级为非 Free，自动解除禁用", id);
+                        changed = true;
+                    }
+                    changed
                 } else {
                     false
                 }

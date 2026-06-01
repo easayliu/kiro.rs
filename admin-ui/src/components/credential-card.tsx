@@ -238,9 +238,22 @@ export function CredentialCard({
           ? 'bg-warn'
           : 'bg-ok'
 
+  // 禁用原因 → 中文展示
+  const disabledReasonLabels: Record<string, string> = {
+    Manual: '手动禁用',
+    TooManyFailures: '连续失败',
+    TooManyRefreshFailures: '刷新失败',
+    QuotaExceeded: '额度用尽',
+    InvalidRefreshToken: 'Token 失效',
+    InvalidConfig: '配置无效',
+    FreeSubscription: 'Free 订阅（自动禁用）',
+  }
+
   // Status label for the subtitle row
   const statusLabel = credential.disabled
-    ? credential.disabledReason || '已禁用'
+    ? (credential.disabledReason
+        ? disabledReasonLabels[credential.disabledReason] || credential.disabledReason
+        : '已禁用')
     : isThrottled
       ? `限流冷却 剩${formatRemaining(throttledRemainingMs)}`
       : hasFailures
