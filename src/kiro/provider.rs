@@ -621,18 +621,29 @@ impl KiroProvider {
             let status = response.status();
             let send_ms = send_start.elapsed().as_millis();
 
-            // [TTFT 埋点] 一行分段：acquire(凭据准备/刷新) vs send(上游响应头)。
-            // acquire 大 → 卡在本地刷新；send 大 → 卡在上游。这两段不含流式后续吐字。
-            // 凭据数量变化时对比 acquire 即可验证“凭证多→首字高”。
+            // [TTFT 埋点] 补 model / 上游域名 / 代理主机，判断慢 send 是否聚集在
+            // 某些代理或 region 上（代理只记 host，不含账号密码）。
+            // acquire 大 → 本地刷新；send 大 → 上游/链路；这两段不含流式后续吐字。
+            let proxy_host = {
+                let groups = self.token_manager.proxy_groups_snapshot();
+                ctx.credentials
+                    .effective_proxy(self.global_proxy.as_ref(), &groups)
+                    .and_then(|p| reqwest::Url::parse(&p.url).ok())
+                    .and_then(|u| u.host_str().map(str::to_string))
+                    .unwrap_or_else(|| "直连".to_string())
+            };
             tracing::info!(
-                "[TTFT] 凭据 #{} {} attempt={}/{} status={} acquire={}ms send={}ms",
+                "[TTFT] 凭据 #{} {} model={} attempt={}/{} status={} acquire={}ms send={}ms host={} proxy={}",
                 ctx.id,
                 api_type,
+                model.as_deref().unwrap_or("-"),
                 attempt + 1,
                 max_retries,
                 status.as_u16(),
                 acquire_ms,
-                send_ms
+                send_ms,
+                self.base_domain_for(&ctx.credentials),
+                proxy_host,
             );
 
             // 成功响应
