@@ -5,6 +5,8 @@ import {
   setCredentialDisabled,
   setCredentialPriority,
   setCredentialRpmLimit,
+  setCredentialOverage,
+  batchSetOverage,
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
@@ -96,6 +98,18 @@ export function useSetRpmLimit() {
   return useMutation({
     mutationFn: ({ id, rpmLimit }: { id: number; rpmLimit: number | null }) =>
       setCredentialRpmLimit(id, rpmLimit),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 切换 overage（超额计费）开关
+export function useSetOverage() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      setCredentialOverage(id, enabled),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
@@ -305,6 +319,17 @@ export function useBatchSetDisabled() {
   return useMutation({
     mutationFn: ({ credentialIds, disabled }: { credentialIds: number[]; disabled: boolean }) =>
       batchSetDisabled(credentialIds, disabled),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+export function useBatchSetOverage() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ credentialIds, enabled }: { credentialIds: number[]; enabled: boolean }) =>
+      batchSetOverage(credentialIds, enabled),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

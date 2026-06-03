@@ -13,6 +13,7 @@ import {
   ChevronDown,
   Network,
   Gauge,
+  CircleDollarSign,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { RelativeTime } from '@/components/relative-time'
@@ -42,6 +43,7 @@ import {
   useSetDisabled,
   useSetPriority,
   useSetRpmLimit,
+  useSetOverage,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
@@ -100,6 +102,7 @@ export function CredentialCard({
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const setRpmLimit = useSetRpmLimit()
+  const setOverage = useSetOverage()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
@@ -167,6 +170,17 @@ export function CredentialCard({
     )
   }
 
+  const handleSetOverage = (enabled: boolean) => {
+    if (credential.overage === enabled) return
+    setOverage.mutate(
+      { id: credential.id, enabled },
+      {
+        onSuccess: res => toast.success(res.message),
+        onError: err => toast.error('切换 overage 失败: ' + (err as Error).message),
+      },
+    )
+  }
+
   const handleDelete = () => {
     if (!credential.disabled) {
       toast.error('请先禁用凭据再删除')
@@ -206,6 +220,22 @@ export function CredentialCard({
   const hasFailures = credential.failureCount > 0 || credential.refreshFailureCount > 0
   const usedPercent = balance ? Math.max(0, Math.min(100, balance.usagePercentage)) : 0
   const isOverLimit = !!balance && balance.usagePercentage >= 100
+  // 后端把 usagePercentage 封顶在 100；overage 开启后用量会越过额度继续计费，
+  // 用 currentUsage/usageLimit 还原真实（可 >100%）的百分比。
+  const rawUsagePercent =
+    balance && balance.usageLimit > 0
+      ? (balance.currentUsage / balance.usageLimit) * 100
+      : balance?.usagePercentage ?? 0
+  // 超额计费状态优先取上游真实下发的 overageStatus，回退到本地 overage 开关。
+  const overageFromUpstream = balance?.overageStatus != null
+  const overageEnabled = overageFromUpstream
+    ? balance!.overageStatus!.toUpperCase() === 'ENABLED'
+    : credential.overage === true
+  // 三态：上游已下发 overageStatus，或本地开关曾下发过，才算"已知"。
+  const overageKnown = overageFromUpstream || credential.overage !== undefined
+  // 已实际产生超额用量，或（开了超额且越过额度）= 正在超额计费（amber 警示，而非"耗尽"红色）。
+  const hasActualOverage = !!balance && balance.currentOverages > 0
+  const isOverageBilling = hasActualOverage || (overageEnabled && isOverLimit)
 
   const tier = resolveTier(balance?.subscriptionTitle)
   const displayName = credential.email || `凭据 #${credential.id}`
@@ -232,11 +262,13 @@ export function CredentialCard({
   const barColor =
     !balance
       ? 'bg-muted'
-      : balance.usagePercentage >= 90
-        ? 'bg-bad'
-        : balance.usagePercentage >= 70
-          ? 'bg-warn'
-          : 'bg-ok'
+      : isOverageBilling
+        ? 'bg-warn'
+        : balance.usagePercentage >= 90
+          ? 'bg-bad'
+          : balance.usagePercentage >= 70
+            ? 'bg-warn'
+            : 'bg-ok'
 
   // 禁用原因 → 中文展示
   const disabledReasonLabels: Record<string, string> = {
@@ -308,37 +340,44 @@ export function CredentialCard({
             >
               {displayName}
             </h3>
-            <div className="mt-1 flex items-center gap-1.5 font-mono text-2xs text-muted-foreground">
-              <span className="tnum">#{String(credential.id).padStart(3, '0')}</span>
+            <div className="mt-1 flex min-w-0 items-center gap-x-2 overflow-hidden whitespace-nowrap font-mono text-2xs text-muted-foreground">
+              <span className="tnum shrink-0">#{String(credential.id).padStart(3, '0')}</span>
               {balance?.subscriptionTitle && (
-                <>
-                  <span className="text-border">·</span>
-                  <span className={cn('font-medium', tier.labelText)}>{balance.subscriptionTitle}</span>
-                </>
+                <span className={cn('shrink-0 font-medium', tier.labelText)}>{balance.subscriptionTitle}</span>
               )}
+              <span
+                className="inline-flex shrink-0 items-center"
+                title={
+                  !overageKnown
+                    ? '超额计费：未知（尚未下发过）'
+                    : overageEnabled
+                      ? `超额计费：已开启${overageFromUpstream ? '（上游确认）' : ''}`
+                      : `超额计费：已关闭${overageFromUpstream ? '（上游确认）' : ''}`
+                }
+              >
+                <CircleDollarSign
+                  className={cn(
+                    'h-3 w-3 shrink-0',
+                    !overageKnown
+                      ? 'text-muted-foreground/40'
+                      : overageEnabled
+                        ? 'text-warn'
+                        : 'text-muted-foreground',
+                  )}
+                />
+              </span>
               {statusLabel && (
-                <>
-                  <span className="text-border">·</span>
-                  <span className={cn('font-medium', statusClass)}>{statusLabel}</span>
-                </>
+                <span className={cn('shrink-0 font-medium', statusClass)}>{statusLabel}</span>
               )}
-              {credential.hasProfileArn && (
-                <>
-                  <span className="text-border">·</span>
-                  <span>ARN</span>
-                </>
-              )}
+              {credential.hasProfileArn && <span className="shrink-0">ARN</span>}
               {credential.group && (
-                <>
-                  <span className="text-border">·</span>
-                  <span
-                    className="inline-flex items-center gap-0.5 text-foreground"
-                    title={`代理分组: ${credential.group}`}
-                  >
-                    <Network className="h-2.5 w-2.5" />
-                    {credential.group}
-                  </span>
-                </>
+                <span
+                  className="inline-flex min-w-0 items-center gap-0.5 text-foreground"
+                  title={`代理分组: ${credential.group}`}
+                >
+                  <Network className="h-2.5 w-2.5 shrink-0" />
+                  <span className="truncate">{credential.group}</span>
+                </span>
               )}
             </div>
           </div>
@@ -365,8 +404,19 @@ export function CredentialCard({
                   </span>
                 ) : balance ? (
                   <>
-                    <span className={cn('font-semibold', isOverLimit ? 'text-bad' : 'text-foreground')}>
-                      {balance.usagePercentage.toFixed(1)}%
+                    {isOverageBilling && (
+                      <span className="mr-1.5 inline-flex items-center gap-0.5 text-warn" title="用量已越过额度，正在按超额计费">
+                        <CircleDollarSign className="h-3 w-3" />
+                        超额计费中
+                      </span>
+                    )}
+                    <span
+                      className={cn(
+                        'font-semibold',
+                        isOverageBilling ? 'text-warn' : isOverLimit ? 'text-bad' : 'text-foreground',
+                      )}
+                    >
+                      {(isOverageBilling ? rawUsagePercent : balance.usagePercentage).toFixed(1)}%
                     </span>
                     <span className="ml-1.5 text-muted-foreground">
                       {balance.currentUsage.toFixed(2)}/{balance.usageLimit.toFixed(2)}
@@ -383,6 +433,25 @@ export function CredentialCard({
                 style={{ width: balance ? `${usedPercent}%` : '0%' }}
               />
             </div>
+            {balance && hasActualOverage && (
+              <div className="mt-1 flex items-center justify-between text-[11px] text-warn">
+                <span>
+                  超额 {balance.currentOverages.toFixed(2)}
+                  {balance.overageCap > 0 && (
+                    <span className="text-muted-foreground">/{balance.overageCap.toFixed(0)}</span>
+                  )}
+                </span>
+                <span className="tnum font-mono">
+                  {balance.overageCharges.toFixed(2)} {balance.currency ?? ''}
+                  {balance.overageRate > 0 && (
+                    <span className="text-muted-foreground">
+                      {' '}
+                      (@{balance.overageRate}/次)
+                    </span>
+                  )}
+                </span>
+              </div>
+            )}
           </div>
 
           {/* Meta key-values — definition-list style grid */}
@@ -512,6 +581,30 @@ export function CredentialCard({
               >
                 <Gauge /> RPM 上限
               </DropdownMenuItem>
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>
+                  <CircleDollarSign /> 超额计费
+                  <span className="ml-auto text-2xs text-muted-foreground">
+                    {!overageKnown ? '未知' : overageEnabled ? '开' : '关'}
+                  </span>
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent className="w-40">
+                  <DropdownMenuItem
+                    onClick={() => handleSetOverage(true)}
+                    disabled={setOverage.isPending}
+                  >
+                    {overageKnown && overageEnabled && <Check />}
+                    开启超额
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onClick={() => handleSetOverage(false)}
+                    disabled={setOverage.isPending}
+                  >
+                    {overageKnown && !overageEnabled && <Check />}
+                    关闭超额
+                  </DropdownMenuItem>
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
               <DropdownMenuSub>
                 <DropdownMenuSubTrigger>
                   <Network /> 代理分组

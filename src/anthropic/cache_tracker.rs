@@ -344,7 +344,7 @@ impl CacheTracker {
             .collect();
 
         let Some(last_breakpoint) = profile.last_cacheable_breakpoint() else {
-            tracing::info!(
+            tracing::debug!(
                 credential_id,
                 block_count = profile.blocks.len(),
                 breakpoints = ?breakpoints_info,
@@ -369,7 +369,7 @@ impl CacheTracker {
         let skipped_lookup = self.should_skip_lookup();
 
         if skipped_lookup {
-            tracing::info!(
+            tracing::debug!(
                 credential_id,
                 effective_id,
                 skip_rate = ?self.cache_skip_rate(),
@@ -480,7 +480,7 @@ impl CacheTracker {
             .saturating_sub(cache_creation)
             .max(0);
 
-        tracing::info!(
+        tracing::debug!(
             credential_id,
             block_count = profile.blocks.len(),
             breakpoints = ?breakpoints_info,

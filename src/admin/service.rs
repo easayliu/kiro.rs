@@ -18,7 +18,8 @@ use super::types::{
     BatchSetCredentialGroupFailure, BatchSetCredentialGroupRequest,
     BatchSetCredentialGroupResponse, BatchSetDisabledRequest, BatchSetDisabledResponse,
     BatchSetPriorityRequest, BatchSetPriorityResponse, BatchSetRpmLimitRequest,
-    BatchSetRpmLimitResponse, CacheSkipRateResponse, CredentialStatusItem,
+    BatchSetOverageRequest, BatchSetOverageResponse, BatchSetRpmLimitResponse,
+    CacheSkipRateResponse, CredentialStatusItem,
     CredentialsStatusResponse, DefaultRpmLimitResponse, GlobalCacheResponse,
     LoadBalancingModeResponse, ProxyGroupsResponse, SetCacheSkipRateRequest,
     SetCredentialGroupRequest, SetDefaultRpmLimitRequest, SetGlobalCacheRequest,
@@ -91,6 +92,7 @@ impl AdminService {
                 throttled_until: entry.throttled_until,
                 rpm_limit: entry.rpm_limit,
                 rpm_current: entry.rpm_current,
+                overage: entry.overage,
             })
             .collect();
 
@@ -139,6 +141,47 @@ impl AdminService {
         self.token_manager
             .set_rpm_limit(id, rpm_limit)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 切换凭据的 overage（超额计费）开关
+    pub async fn set_overage(&self, id: u64, enabled: bool) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_overage_for(id, enabled)
+            .await
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 批量切换 overage 开关。
+    ///
+    /// 每个凭据各是一次上游网络调用（可能附带 token 刷新），故**顺序排队**逐个处理，
+    /// 不并发——避免同时打爆上游 setUserPreference、以及多凭据并发刷新争用刷新锁。
+    /// 单个失败不影响后续，结果按 succeeded / failed 分别汇总返回。
+    pub async fn batch_set_overage(
+        &self,
+        req: BatchSetOverageRequest,
+    ) -> Result<BatchSetOverageResponse, AdminServiceError> {
+        if req.credential_ids.is_empty() {
+            return Err(AdminServiceError::InvalidParameter(
+                "credentialIds 不能为空".to_string(),
+            ));
+        }
+        let total = req.credential_ids.len();
+        let mut succeeded = Vec::new();
+        let mut failed = Vec::new();
+        for id in req.credential_ids {
+            match self.set_overage(id, req.enabled).await {
+                Ok(_) => succeeded.push(id),
+                Err(e) => failed.push(BatchSetCredentialGroupFailure {
+                    id,
+                    error: e.to_string(),
+                }),
+            }
+        }
+        Ok(BatchSetOverageResponse {
+            total,
+            succeeded,
+            failed,
+        })
     }
 
     /// 重置失败计数并重新启用
@@ -206,6 +249,12 @@ impl AdminService {
             remaining,
             usage_percentage,
             next_reset_at: usage.next_date_reset,
+            overage_status: usage.overage_status().map(|s| s.to_string()),
+            current_overages: usage.current_overages(),
+            overage_charges: usage.overage_charges(),
+            overage_rate: usage.overage_rate(),
+            overage_cap: usage.overage_cap(),
+            currency: usage.currency().map(|s| s.to_string()),
         })
     }
 
@@ -240,6 +289,7 @@ impl AdminService {
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             rpm_limit: None,
+            overage: None,
         };
 
         // 调用 token_manager 添加凭据

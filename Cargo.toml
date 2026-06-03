@@ -1,6 +1,6 @@
 [package]
 name = "kiro-rs"
-version = "2026.3.94"
+version = "2026.3.95"
 edition = "2024"
 
 [profile.release]
@@ -15,6 +15,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"  # 非阻塞日志写入（后台线程刷盘，避免阻塞 async 执行器导致卡顿）
 anyhow = "1.0"
 http = "1.0"
 futures = "0.3"

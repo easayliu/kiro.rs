@@ -3,7 +3,7 @@
 //! 负责 Token 过期检测和刷新，支持 Social 和 IdC 认证方式
 //! 支持多凭据 (MultiTokenManager) 管理
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -473,8 +473,75 @@ pub(crate) async fn get_usage_limits(
         bail!("{}: {} {}", error_msg, status, body_text);
     }
 
-    let data: UsageLimitsResponse = response.json().await?;
+    // 先读原始 body，便于排查上游真实返回了哪些字段（我们的模型会静默丢弃未知字段）
+    let body_text = response.text().await?;
+    tracing::debug!("getUsageLimits 原始响应: {}", body_text);
+
+    let data: UsageLimitsResponse = serde_json::from_str(&body_text)
+        .with_context(|| format!("解析 getUsageLimits 响应失败: {}", body_text))?;
     Ok(data)
+}
+
+/// 切换 overage（超额计费）开关：POST setUserPreference。
+///
+/// 对齐真实 Kiro IDE 与参考实现（main.py `kiro_set_overage`）：body 为
+/// `{overageConfiguration:{overageStatus:ENABLED|DISABLED}, profileArn}`。
+/// region / header / profileArn 来源与 [`get_usage_limits`] 一致（企业 IdC 的 Q API
+/// region 以 profileArn 内嵌为准，缺失回退凭据生效 region）。无 profileArn 直接报错——
+/// setUserPreference 必须带 profileArn，否则上游 400 Invalid profileArn。
+pub(crate) async fn set_overage(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    enabled: bool,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<()> {
+    let profile_arn = credentials
+        .effective_profile_arn()
+        .ok_or_else(|| anyhow::anyhow!("缺少 profileArn，无法切换 overage"))?;
+
+    let region = credentials.effective_api_region(config).to_string();
+    let host = format!("q.{}.amazonaws.com", region);
+    let url = format!("https://{}/setUserPreference", host);
+    let machine_id = machine_id::generate_from_credentials(credentials, config)
+        .unwrap_or_default();
+    let mode = credentials.effective_client_mode(config);
+
+    let body = serde_json::json!({
+        "overageConfiguration": {
+            "overageStatus": if enabled { "ENABLED" } else { "DISABLED" },
+        },
+        "profileArn": profile_arn,
+    });
+
+    let user_agent = config.runtime_user_agent(&machine_id, mode);
+    let amz_user_agent = config.runtime_x_amz_user_agent(&machine_id, mode);
+
+    let client = build_client(proxy, 30, config.tls_backend)?;
+
+    let mut request = client
+        .post(&url)
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/json")
+        .header("Connection", "close")
+        .json(&body);
+
+    if credentials.is_api_key_credential() {
+        request = request.header("tokentype", "API_KEY");
+    }
+
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        bail!("切换 overage 失败: {} {}", status, body_text);
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -586,6 +653,9 @@ pub struct CredentialEntrySnapshot {
     /// 最近 60s 滑动窗口内的请求数
     #[serde(default)]
     pub rpm_current: u32,
+    /// overage（超额计费）上次下发状态（None=从未下发，状态未知）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overage: Option<bool>,
 }
 
 /// 凭据管理器状态快照
@@ -1942,6 +2012,7 @@ impl MultiTokenManager {
                         .map(|t| t.to_rfc3339()),
                     rpm_limit: e.credentials.rpm_limit,
                     rpm_current: e.rpm_window.iter().filter(|t| **t > rpm_cutoff).count() as u32,
+                    overage: e.credentials.overage,
                 })
                 .collect(),
             current_id,
@@ -2666,6 +2737,106 @@ impl MultiTokenManager {
         }
 
         tracing::info!("凭据 #{} Token 已强制刷新", id);
+        Ok(())
+    }
+
+    /// 取指定凭据的有效 access_token（按需刷新），用于 Admin 侧需要上游鉴权的调用。
+    ///
+    /// API Key 凭据直接返回 kiroApiKey；OAuth 凭据在过期/临期时持刷新锁刷新并持久化。
+    /// 逻辑与 [`Self::get_usage_limits_for`] 中的取 token 流程一致。
+    async fn ensure_valid_token_for(&self, id: u64) -> anyhow::Result<String> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        if credentials.is_api_key_credential() {
+            return credentials
+                .kiro_api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"));
+        }
+
+        let needs_refresh = is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
+        if !needs_refresh {
+            return credentials
+                .access_token
+                .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"));
+        }
+
+        let _guard = self.refresh_lock.lock().await;
+        let current_creds = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+        // 双检：可能已被其它任务在持锁期间刷新
+        if !(is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds)) {
+            return current_creds
+                .access_token
+                .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"));
+        }
+
+        let effective_proxy =
+            current_creds.effective_proxy(self.proxy.as_ref(), &self.proxy_groups.read());
+        let new_creds =
+            refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.credentials = new_creds.clone();
+            }
+        }
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+        }
+        new_creds
+            .access_token
+            .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))
+    }
+
+    /// 切换指定凭据的 overage（超额计费）开关（Admin API）。
+    ///
+    /// 成功后把下发值记录到凭据的 `overage` 字段并持久化，作为前端展示/核对依据
+    /// （上游无读接口）。失败不写入本地状态。
+    pub async fn set_overage_for(&self, id: u64, enabled: bool) -> anyhow::Result<()> {
+        let token = self.ensure_valid_token_for(id).await?;
+
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        let effective_proxy =
+            credentials.effective_proxy(self.proxy.as_ref(), &self.proxy_groups.read());
+        set_overage(&credentials, &self.config, &token, enabled, effective_proxy.as_ref()).await?;
+
+        // 下发成功后回写本地状态
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.credentials.overage = Some(enabled);
+            }
+        }
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("overage 下发成功但持久化失败: {}", e);
+        }
+        tracing::info!(
+            "凭据 #{} overage 已切换为 {}",
+            id,
+            if enabled { "ENABLED" } else { "DISABLED" }
+        );
         Ok(())
     }
 

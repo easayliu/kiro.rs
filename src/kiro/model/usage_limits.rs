@@ -16,9 +16,22 @@ pub struct UsageLimitsResponse {
     #[serde(default)]
     pub subscription_info: Option<SubscriptionInfo>,
 
+    /// 超额计费配置（上游真实下发的 overage 开关状态）
+    #[serde(default)]
+    pub overage_configuration: Option<OverageConfiguration>,
+
     /// 使用量明细列表
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
+}
+
+/// 超额计费配置
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverageConfiguration {
+    /// 超额计费状态 (ENABLED / DISABLED)
+    #[serde(default)]
+    pub overage_status: Option<String>,
 }
 
 /// 订阅信息
@@ -62,6 +75,38 @@ pub struct UsageBreakdown {
     /// 使用限额（精确值）
     #[serde(default)]
     pub usage_limit_with_precision: f64,
+
+    /// 当前超额用量（已越过 usageLimit 的部分）
+    #[serde(default)]
+    pub current_overages: i64,
+
+    /// 当前超额用量（精确值）
+    #[serde(default)]
+    pub current_overages_with_precision: f64,
+
+    /// 超额上限
+    #[serde(default)]
+    pub overage_cap: i64,
+
+    /// 超额上限（精确值）
+    #[serde(default)]
+    pub overage_cap_with_precision: f64,
+
+    /// 已产生的超额费用
+    #[serde(default)]
+    pub overage_charges: f64,
+
+    /// 超额单价（每单位费用）
+    #[serde(default)]
+    pub overage_rate: f64,
+
+    /// 计量单位 (如 INVOCATIONS)
+    #[serde(default)]
+    pub unit: Option<String>,
+
+    /// 货币 (如 USD)
+    #[serde(default)]
+    pub currency: Option<String>,
 }
 
 /// 奖励额度
@@ -198,5 +243,54 @@ impl UsageLimitsResponse {
         }
 
         total
+    }
+
+    /// 超额计费状态 (ENABLED / DISABLED)
+    pub fn overage_status(&self) -> Option<&str> {
+        self.overage_configuration
+            .as_ref()
+            .and_then(|c| c.overage_status.as_deref())
+    }
+
+    /// 超额计费是否已开启
+    #[allow(dead_code)]
+    pub fn is_overage_enabled(&self) -> bool {
+        self.overage_status()
+            .map(|s| s.eq_ignore_ascii_case("ENABLED"))
+            .unwrap_or(false)
+    }
+
+    /// 当前超额用量（精确值）
+    pub fn current_overages(&self) -> f64 {
+        self.primary_breakdown()
+            .map(|b| b.current_overages_with_precision)
+            .unwrap_or(0.0)
+    }
+
+    /// 超额上限（精确值）
+    pub fn overage_cap(&self) -> f64 {
+        self.primary_breakdown()
+            .map(|b| b.overage_cap_with_precision)
+            .unwrap_or(0.0)
+    }
+
+    /// 已产生的超额费用
+    pub fn overage_charges(&self) -> f64 {
+        self.primary_breakdown()
+            .map(|b| b.overage_charges)
+            .unwrap_or(0.0)
+    }
+
+    /// 超额单价
+    pub fn overage_rate(&self) -> f64 {
+        self.primary_breakdown()
+            .map(|b| b.overage_rate)
+            .unwrap_or(0.0)
+    }
+
+    /// 货币
+    pub fn currency(&self) -> Option<&str> {
+        self.primary_breakdown()
+            .and_then(|b| b.currency.as_deref())
     }
 }

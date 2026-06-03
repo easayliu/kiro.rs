@@ -24,11 +24,22 @@ async fn main() {
     let args = Args::parse();
 
     // 初始化日志
+    //
+    // 使用 tracing-appender 的非阻塞写入器：实际的 stdout 写入在后台专用线程完成，
+    // async 任务只把日志推入无锁队列即返回，避免在 tokio worker 线程上执行阻塞 write
+    // 系统调用阻塞执行器（高并发/流式请求时表现为卡顿）。
+    //
+    // `_log_guard` 必须存活到 main 结束：Drop 时会 flush 队列中尚未写出的日志，
+    // 否则进程退出时可能丢失尾部日志。
+    let (non_blocking, _log_guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        // 仅在输出到真正的终端时启用 ANSI 颜色；重定向到文件/管道时关闭，避免转义码污染日志。
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+        .with_writer(non_blocking)
         .init();
 
     // 加载配置

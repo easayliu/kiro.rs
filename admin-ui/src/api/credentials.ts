@@ -15,6 +15,7 @@ import type {
   BatchSetPriorityResponse,
   BatchSetRpmLimitResponse,
   BatchSetDisabledResponse,
+  BatchSetOverageResponse,
   DefaultRpmLimitResponse,
   MeResponse,
 } from '@/types/api'
@@ -80,6 +81,18 @@ export async function setCredentialRpmLimit(
   const { data } = await api.post<SuccessResponse>(
     `/credentials/${id}/rpm-limit`,
     { rpmLimit } as SetRpmLimitRequest
+  )
+  return data
+}
+
+// 切换 overage（超额计费）开关
+export async function setCredentialOverage(
+  id: number,
+  enabled: boolean
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/overage`,
+    { enabled }
   )
   return data
 }
@@ -247,6 +260,17 @@ export async function batchSetDisabled(
   const { data } = await api.post<BatchSetDisabledResponse>(
     '/credentials/disabled/batch',
     { credentialIds, disabled },
+  )
+  return data
+}
+
+export async function batchSetOverage(
+  credentialIds: number[],
+  enabled: boolean,
+): Promise<BatchSetOverageResponse> {
+  const { data } = await api.post<BatchSetOverageResponse>(
+    '/credentials/overage/batch',
+    { credentialIds, enabled },
   )
   return data
 }

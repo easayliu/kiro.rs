@@ -85,6 +85,9 @@ pub struct CredentialStatusItem {
     /// 最近 60s 滑动窗口内的请求数（用于前端展示 X/limit）
     #[serde(default)]
     pub rpm_current: u32,
+    /// overage（超额计费）上次下发状态（None=从未下发，前端显示为未知）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overage: Option<bool>,
 }
 
 // ============ 操作请求 ============
@@ -114,6 +117,32 @@ pub struct SetRpmLimitRequest {
     /// - Some(0)：显式不限流
     /// - Some(n>0)：限制为 n 次/分钟
     pub rpm_limit: Option<u32>,
+}
+
+/// 切换 overage（超额计费）开关请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetOverageRequest {
+    /// true=ENABLED，false=DISABLED
+    pub enabled: bool,
+}
+
+/// 批量切换 overage 开关请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetOverageRequest {
+    pub credential_ids: Vec<u64>,
+    /// true=ENABLED，false=DISABLED
+    pub enabled: bool,
+}
+
+/// 批量切换 overage 开关响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetOverageResponse {
+    pub total: usize,
+    pub succeeded: Vec<u64>,
+    pub failed: Vec<BatchSetCredentialGroupFailure>,
 }
 
 /// 添加凭据请求
@@ -212,6 +241,18 @@ pub struct BalanceResponse {
     pub usage_percentage: f64,
     /// 下次重置时间（Unix 时间戳）
     pub next_reset_at: Option<f64>,
+    /// 超额计费状态（ENABLED / DISABLED，上游真实下发）
+    pub overage_status: Option<String>,
+    /// 当前超额用量（已越过额度的部分）
+    pub current_overages: f64,
+    /// 已产生的超额费用
+    pub overage_charges: f64,
+    /// 超额单价（每单位费用）
+    pub overage_rate: f64,
+    /// 超额上限
+    pub overage_cap: f64,
+    /// 货币（如 USD）
+    pub currency: Option<String>,
 }
 
 // ============ 负载均衡配置 ============

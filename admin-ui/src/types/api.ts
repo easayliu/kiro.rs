@@ -41,6 +41,8 @@ export interface CredentialStatusItem {
   rpmLimit?: number
   /** 最近 60s 滑动窗口内的请求数（默认 0） */
   rpmCurrent?: number
+  /** overage（超额计费）上次下发状态（不存在=从未下发，状态未知） */
+  overage?: boolean
 }
 
 // 余额响应
@@ -52,6 +54,18 @@ export interface BalanceResponse {
   remaining: number
   usagePercentage: number
   nextResetAt: number | null
+  /** 超额计费状态（ENABLED / DISABLED，上游真实下发） */
+  overageStatus: string | null
+  /** 当前超额用量（已越过额度的部分） */
+  currentOverages: number
+  /** 已产生的超额费用 */
+  overageCharges: number
+  /** 超额单价（每单位费用） */
+  overageRate: number
+  /** 超额上限 */
+  overageCap: number
+  /** 货币（如 USD） */
+  currency: string | null
 }
 
 // 成功响应
@@ -163,6 +177,12 @@ export interface BatchSetRpmLimitResponse {
 }
 
 export interface BatchSetDisabledResponse {
+  total: number
+  succeeded: number[]
+  failed: BatchSetCredentialGroupFailure[]
+}
+
+export interface BatchSetOverageResponse {
   total: number
   succeeded: number[]
   failed: BatchSetCredentialGroupFailure[]

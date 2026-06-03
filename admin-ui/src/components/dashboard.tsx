@@ -22,6 +22,7 @@ import {
   Network,
   ArrowUpDown,
   Gauge,
+  CircleDollarSign,
   Power,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
@@ -48,6 +49,7 @@ import {
   useBatchSetPriority,
   useBatchSetRpmLimit,
   useBatchSetDisabled,
+  useBatchSetOverage,
   useDefaultRpmLimit,
   useSetDefaultRpmLimit,
 } from '@/hooks/use-credentials'
@@ -109,6 +111,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [defaultRpmDialogOpen, setDefaultRpmDialogOpen] = useState(false)
   const [defaultRpmValue, setDefaultRpmValue] = useState('')
   const [batchDisabledDialogOpen, setBatchDisabledDialogOpen] = useState(false)
+  const [batchOverageDialogOpen, setBatchOverageDialogOpen] = useState(false)
   const [proxyGroupsOpen, setProxyGroupsOpen] = useState(false)
   const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const
   const [itemsPerPage, setItemsPerPage] = useState<number>(() => {
@@ -166,6 +169,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const batchSetPriorityMutation = useBatchSetPriority()
   const batchSetRpmLimitMutation = useBatchSetRpmLimit()
   const batchSetDisabledMutation = useBatchSetDisabled()
+  const batchSetOverageMutation = useBatchSetOverage()
   const { data: defaultRpmData } = useDefaultRpmLimit()
   const setDefaultRpmMutation = useSetDefaultRpmLimit()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
@@ -551,6 +555,29 @@ export function Dashboard({ onLogout }: DashboardProps) {
           deselectAll()
         },
         onError: err => toast.error('批量调整失败: ' + (err as Error).message),
+      },
+    )
+  }
+
+  const openBatchOverageDialog = () => {
+    if (selectedIds.size === 0) { toast.error('请先选择要调整的凭据'); return }
+    setBatchOverageDialogOpen(true)
+  }
+
+  // 批量切换 overage：后端顺序排队逐个下发，单次请求返回成功/失败汇总。
+  const runBatchOverage = (enabled: boolean) => {
+    const ids = Array.from(selectedIds)
+    batchSetOverageMutation.mutate(
+      { credentialIds: ids, enabled },
+      {
+        onSuccess: res => {
+          const label = enabled ? '开启' : '关闭'
+          if (res.failed.length === 0) toast.success(`已为 ${res.succeeded.length} 个凭据${label}超额`)
+          else toast.warning(`${label}超额：成功 ${res.succeeded.length} 个，失败 ${res.failed.length} 个`)
+          setBatchOverageDialogOpen(false)
+          deselectAll()
+        },
+        onError: err => toast.error('批量切换 overage 失败: ' + (err as Error).message),
       },
     )
   }
@@ -1184,6 +1211,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     RPM
                   </BarAction>
                   <BarAction
+                    onClick={openBatchOverageDialog}
+                    disabled={batchSetOverageMutation.isPending}
+                    icon={<CircleDollarSign className="h-3.5 w-3.5" />}
+                  >
+                    超额
+                  </BarAction>
+                  <BarAction
                     onClick={handleBatchDelete}
                     disabled={selectedDisabledCount === 0}
                     tone="bad"
@@ -1306,6 +1340,40 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Button>
             <Button onClick={handleBatchPrioritySubmit} disabled={batchSetPriorityMutation.isPending}>
               {batchSetPriorityMutation.isPending ? '保存中…' : '保存'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={batchOverageDialogOpen} onOpenChange={setBatchOverageDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>批量切换超额计费</DialogTitle>
+            <DialogDescription>
+              将对选中的 <span className="font-mono tnum font-semibold text-foreground">{selectedIds.size}</span> 个凭据下发 overage 开关。
+              逐个排队向上游提交，请选择方向；处理期间请勿关闭页面。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setBatchOverageDialogOpen(false)}
+              disabled={batchSetOverageMutation.isPending}
+            >
+              取消
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => runBatchOverage(false)}
+              disabled={batchSetOverageMutation.isPending}
+            >
+              {batchSetOverageMutation.isPending ? '处理中…' : '全部关闭'}
+            </Button>
+            <Button
+              onClick={() => runBatchOverage(true)}
+              disabled={batchSetOverageMutation.isPending}
+            >
+              {batchSetOverageMutation.isPending ? '处理中…' : '全部开启'}
             </Button>
           </DialogFooter>
         </DialogContent>

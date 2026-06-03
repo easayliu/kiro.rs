@@ -10,10 +10,11 @@ use super::{
     middleware::{AdminRole, AdminState},
     types::{
         AddCredentialRequest, BatchSetCredentialGroupRequest, BatchSetDisabledRequest,
-        BatchSetPriorityRequest, BatchSetRpmLimitRequest, MeResponse, SetCacheSkipRateRequest,
+        BatchSetOverageRequest, BatchSetPriorityRequest, BatchSetRpmLimitRequest, MeResponse,
+        SetCacheSkipRateRequest,
         SetCredentialGroupRequest, SetDefaultRpmLimitRequest, SetDisabledRequest,
-        SetGlobalCacheRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SetRpmLimitRequest,
-        SuccessResponse, UpsertProxyGroupRequest,
+        SetGlobalCacheRequest, SetLoadBalancingModeRequest, SetOverageRequest, SetPriorityRequest,
+        SetRpmLimitRequest, SuccessResponse, UpsertProxyGroupRequest,
     },
 };
 
@@ -77,6 +78,36 @@ pub async fn set_credential_rpm_limit(
             Some(n) => format!("凭据 #{} RPM 上限已设置为 {} 次/分钟", id, n),
         }))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/overage
+/// 切换凭据的 overage（超额计费）开关
+pub async fn set_credential_overage(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetOverageRequest>,
+) -> impl IntoResponse {
+    match state.service.set_overage(id, payload.enabled).await {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "凭据 #{} overage 已切换为 {}",
+            id,
+            if payload.enabled { "ENABLED" } else { "DISABLED" }
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/overage/batch
+/// 批量切换 overage（超额计费）开关（顺序排队处理）
+pub async fn batch_set_overage(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchSetOverageRequest>,
+) -> impl IntoResponse {
+    match state.service.batch_set_overage(payload).await {
+        Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

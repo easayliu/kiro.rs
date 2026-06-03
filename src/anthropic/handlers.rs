@@ -189,7 +189,7 @@ fn map_provider_error(err: Error) -> Response {
 ///
 /// 返回可用的模型列表
 pub async fn get_models() -> impl IntoResponse {
-    tracing::info!("Received GET /v1/models request");
+    tracing::debug!("Received GET /v1/models request");
 
     let models = vec![
         Model {
@@ -270,7 +270,7 @@ pub async fn post_messages(
     State(state): State<AppState>,
     JsonExtractor(payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
-    tracing::info!(
+    tracing::debug!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
@@ -718,9 +718,12 @@ fn create_sse_stream(
                                 tracing::info!(
                                     model = %ctx.model,
                                     elapsed_secs = stats.start.elapsed().as_secs_f64(),
+                                    output_tokens = ctx.output_tokens,
+                                    "请求完成"
+                                );
+                                tracing::debug!(
                                     bytes = stats.bytes,
                                     frames = stats.frames,
-                                    output_tokens = ctx.output_tokens,
                                     "上游流正常结束（EOF）"
                                 );
                             }
@@ -937,6 +940,13 @@ async fn handle_non_stream_request(
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
+    tracing::info!(
+        model = %model,
+        input_tokens = cache_context.uncached_input_tokens.max(1),
+        output_tokens,
+        "请求完成（非流式）"
+    );
+
     // 构建 Anthropic 响应
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
@@ -967,7 +977,7 @@ async fn handle_non_stream_request(
 pub async fn count_tokens(
     JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
 ) -> impl IntoResponse {
-    tracing::info!(
+    tracing::debug!(
         model = %payload.model,
         message_count = %payload.messages.len(),
         "Received POST /v1/messages/count_tokens request"
@@ -994,7 +1004,7 @@ pub async fn post_messages_cc(
     State(state): State<AppState>,
     JsonExtractor(payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
-    tracing::info!(
+    tracing::debug!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
@@ -1373,9 +1383,12 @@ fn create_buffered_sse_stream(
                                     tracing::info!(
                                         model = %ctx.model(),
                                         elapsed_secs = stats.start.elapsed().as_secs_f64(),
+                                        output_tokens = ctx.output_tokens(),
+                                        "请求完成（缓冲模式）"
+                                    );
+                                    tracing::debug!(
                                         bytes = stats.bytes,
                                         frames = stats.frames,
-                                        output_tokens = ctx.output_tokens(),
                                         "上游流正常结束（EOF，缓冲模式）"
                                     );
                                 }
