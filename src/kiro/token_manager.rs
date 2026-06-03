@@ -13,6 +13,7 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -713,8 +714,13 @@ pub struct MultiTokenManager {
     entries: Mutex<Vec<CredentialEntry>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
-    /// Token 刷新锁，确保同一时间只有一个刷新操作
-    refresh_lock: TokioMutex<()>,
+    /// Token 刷新锁表（按凭据 id 分桶）
+    ///
+    /// 每个凭据一把锁：同一凭据的并发刷新被串行化并去重，
+    /// 不同凭据的刷新可并行进行，避免一把全局锁把所有凭据的刷新串成队列。
+    /// 外层 `Mutex<HashMap>` 仅用于取/插入桶（短临界区、无 IO）；
+    /// 真正跨网络刷新持有的是桶内的 `TokioMutex`。
+    refresh_locks: Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
     /// 是否为多凭据格式（数组格式才回写）
@@ -931,7 +937,7 @@ impl MultiTokenManager {
             proxy,
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
-            refresh_lock: TokioMutex::new(()),
+            refresh_locks: Mutex::new(HashMap::new()),
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
@@ -1347,9 +1353,22 @@ impl MultiTokenManager {
         }
     }
 
+    /// 取指定凭据的刷新锁（不存在则创建）
+    ///
+    /// 返回 `Arc<TokioMutex>`，调用方需先绑定到局部变量再 `.lock().await`，
+    /// 以保证锁对象在 guard 存活期间不被释放。不同 id 返回不同的锁，
+    /// 因此不同凭据的刷新互不阻塞。
+    fn refresh_lock_for(&self, id: u64) -> Arc<TokioMutex<()>> {
+        self.refresh_locks
+            .lock()
+            .entry(id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
+    }
+
     /// 尝试使用指定凭据获取有效 Token
     ///
-    /// 使用双重检查锁定模式，确保同一时间只有一个刷新操作
+    /// 使用双重检查锁定模式，确保同一凭据同一时间只有一个刷新操作
     ///
     /// # Arguments
     /// * `id` - 凭据 ID，用于更新正确的条目
@@ -1377,7 +1396,8 @@ impl MultiTokenManager {
 
         let creds = if needs_refresh {
             // 获取刷新锁，确保同一时间只有一个刷新操作
-            let _guard = self.refresh_lock.lock().await;
+            let refresh_lock = self.refresh_lock_for(id);
+            let _guard = refresh_lock.lock().await;
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
             let current_creds = {
@@ -2391,7 +2411,8 @@ impl MultiTokenManager {
                 is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
 
             if needs_refresh {
-                let _guard = self.refresh_lock.lock().await;
+                let refresh_lock = self.refresh_lock_for(id);
+                let _guard = refresh_lock.lock().await;
                 let current_creds = {
                     let entries = self.entries.lock();
                     entries
@@ -2675,6 +2696,9 @@ impl MultiTokenManager {
             was_current
         };
 
+        // 清理该凭据的刷新锁桶，避免锁表残留空条目
+        self.refresh_locks.lock().remove(&id);
+
         // 如果删除的是当前凭据，切换到优先级最高的可用凭据
         if was_current {
             self.select_highest_priority();
@@ -2715,7 +2739,8 @@ impl MultiTokenManager {
         };
 
         // 获取刷新锁防止并发刷新
-        let _guard = self.refresh_lock.lock().await;
+        let refresh_lock = self.refresh_lock_for(id);
+        let _guard = refresh_lock.lock().await;
 
         // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref(), &self.proxy_groups.read());
@@ -2768,7 +2793,8 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"));
         }
 
-        let _guard = self.refresh_lock.lock().await;
+        let refresh_lock = self.refresh_lock_for(id);
+        let _guard = refresh_lock.lock().await;
         let current_creds = {
             let entries = self.entries.lock();
             entries

@@ -14,6 +14,7 @@ import {
   Network,
   Gauge,
   CircleDollarSign,
+  X,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { RelativeTime } from '@/components/relative-time'
@@ -392,40 +393,43 @@ export function CredentialCard({
         </div>
 
         {/* ─── BODY: usage + meta ─── */}
-        <dl className="space-y-2.5 px-4 pb-4">
-          {/* Usage row */}
+        <div className="space-y-2 px-4 pb-4">
+          {/* Usage line: percent + overage tag (left) · used/limit (right) */}
           <div>
-            <div className="mb-1.5 flex items-center justify-between text-xs">
-              <dt className="font-medium text-muted-foreground">用量</dt>
-              <dd className="tnum font-mono">
+            <div className="mb-1.5 flex items-baseline justify-between gap-2">
+              <div className="flex min-w-0 items-baseline gap-1.5">
                 {loadingBalance ? (
-                  <span className="flex items-center gap-1 text-muted-foreground">
+                  <span className="flex items-center gap-1 text-xs text-muted-foreground">
                     <Loader2 className="h-3 w-3 animate-spin" /> 加载中
                   </span>
                 ) : balance ? (
                   <>
-                    {isOverageBilling && (
-                      <span className="mr-1.5 inline-flex items-center gap-0.5 text-warn" title="用量已越过额度，正在按超额计费">
-                        <CircleDollarSign className="h-3 w-3" />
-                        超额计费中
-                      </span>
-                    )}
                     <span
                       className={cn(
-                        'font-semibold',
+                        'tnum text-sm font-bold leading-none',
                         isOverageBilling ? 'text-warn' : isOverLimit ? 'text-bad' : 'text-foreground',
                       )}
                     >
                       {(isOverageBilling ? rawUsagePercent : balance.usagePercentage).toFixed(1)}%
                     </span>
-                    <span className="ml-1.5 text-muted-foreground">
-                      {balance.currentUsage.toFixed(2)}/{balance.usageLimit.toFixed(2)}
-                    </span>
+                    {isOverageBilling && (
+                      <span
+                        className="text-2xs font-medium text-warn"
+                        title="用量已越过额度，正在按超额计费"
+                      >
+                        超额计费中
+                      </span>
+                    )}
                   </>
                 ) : (
-                  <span className="text-muted-foreground">—</span>
+                  <span className="text-xs text-muted-foreground">—</span>
                 )}
-              </dd>
+              </div>
+              {balance && (
+                <span className="tnum shrink-0 font-mono text-2xs text-muted-foreground">
+                  {balance.currentUsage.toFixed(2)}/{balance.usageLimit.toFixed(2)}
+                </span>
+              )}
             </div>
             <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
               <div
@@ -433,102 +437,106 @@ export function CredentialCard({
                 style={{ width: balance ? `${usedPercent}%` : '0%' }}
               />
             </div>
-            {balance && hasActualOverage && (
-              <div className="mt-1 flex items-center justify-between text-[11px] text-warn">
-                <span>
-                  超额 {balance.currentOverages.toFixed(2)}
-                  {balance.overageCap > 0 && (
-                    <span className="text-muted-foreground">/{balance.overageCap.toFixed(0)}</span>
-                  )}
-                </span>
-                <span className="tnum font-mono">
-                  {balance.overageCharges.toFixed(2)} {balance.currency ?? ''}
-                  {balance.overageRate > 0 && (
-                    <span className="text-muted-foreground">
-                      {' '}
-                      (@{balance.overageRate}/次)
-                    </span>
-                  )}
-                </span>
-              </div>
-            )}
-          </div>
-
-          {/* Meta key-values — definition-list style grid */}
-          <div className="grid grid-cols-3 gap-2 text-xs">
-            <MetaCell label="优先级">
-              {readOnly ? (
-                <span className="tnum font-mono font-semibold text-foreground">
-                  {credential.priority}
-                </span>
-              ) : editingPriority ? (
-                <div className="flex items-center gap-0.5">
-                  <Input
-                    type="number"
-                    value={priorityValue}
-                    onChange={e => setPriorityValue(e.target.value)}
-                    onKeyDown={e => {
-                      if (e.key === 'Enter') handlePriorityChange()
-                      if (e.key === 'Escape') {
-                        setEditingPriority(false)
-                        setPriorityValue(String(credential.priority))
-                      }
-                    }}
-                    className="h-6 w-10 rounded-md border-primary px-1 text-center font-mono text-xs"
-                    min="0"
-                    autoFocus
-                  />
-                  <button
-                    onClick={handlePriorityChange}
-                    disabled={setPriority.isPending}
-                    className="flex h-6 w-5 cursor-pointer items-center justify-center rounded text-ok hover:bg-ok-soft"
-                    aria-label="确认"
-                  >
-                    <Check className="h-3 w-3" />
-                  </button>
-                </div>
-              ) : (
-                <button
-                  onClick={() => setEditingPriority(true)}
-                  className="group/p inline-flex items-center gap-1 tnum font-mono font-semibold text-foreground hover:text-primary"
-                  title="点击编辑优先级"
+            {/* 超额行固定占位：无超额时也保留高度，保证各卡片元信息行垂直对齐 */}
+            <div className="mt-1 flex h-4 items-center gap-1.5 text-[11px] text-warn">
+              {balance && hasActualOverage && (
+                <span
+                  className="flex items-center gap-1.5"
+                  title={balance.overageRate > 0 ? `超额计费 @${balance.overageRate}/次` : undefined}
                 >
-                  {credential.priority}
-                  <Pencil className="h-2.5 w-2.5 opacity-0 transition-opacity group-hover/p:opacity-60" />
-                </button>
-              )}
-            </MetaCell>
-            <MetaCell label="成功/失败">
-              <span className="tnum font-mono">
-                <span className="text-foreground">{credential.successCount}</span>
-                <span className="text-muted-foreground/60"> / </span>
-                <span className={cn(hasFailures ? 'text-bad font-medium' : 'text-muted-foreground')}>
-                  {credential.failureCount}
+                  <span className="tnum font-mono font-medium">
+                    超额 +{balance.overageCharges.toFixed(2)} {balance.currency ?? ''}
+                  </span>
+                  <span className="text-muted-foreground/40">·</span>
+                  <span className="tnum font-mono text-muted-foreground">
+                    {balance.currentOverages.toFixed(2)}
+                    {balance.overageCap > 0 && `/${balance.overageCap.toFixed(0)}`}
+                  </span>
                 </span>
-              </span>
-            </MetaCell>
-            <MetaCell label="最近">
-              <span className="tnum font-mono text-foreground">
-                <RelativeTime value={credential.lastUsedAt} />
-              </span>
-            </MetaCell>
-          </div>
-
-          {/* RPM 滑动窗口指示器：仅在生效限流时显示，便于运维直观感知 */}
-          {rpmActive && (
-            <div className="flex items-center gap-1.5 text-2xs">
-              <Gauge className={cn('h-3 w-3 shrink-0', rpmColorClass)} />
-              <span className="font-medium text-muted-foreground">RPM</span>
-              <span className={cn('tnum font-mono', rpmColorClass)}>
-                {rpmCurrent}/{effectiveRpm}
-              </span>
-              <span className="text-muted-foreground/60">· 60s 窗口</span>
-              {typeof credential.rpmLimit !== 'number' && (
-                <span className="text-muted-foreground/60">（默认）</span>
               )}
             </div>
-          )}
-        </dl>
+          </div>
+
+          {/* Meta — single inline stat row: priority · success/fail · last used · RPM */}
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+            {/* 优先级（可编辑） */}
+            {readOnly ? (
+              <span className="inline-flex items-center gap-0.5 tnum font-mono" title="优先级">
+                <span className="text-muted-foreground/60">P</span>
+                <span className="font-semibold text-foreground">{credential.priority}</span>
+              </span>
+            ) : editingPriority ? (
+              <div className="flex items-center gap-0.5">
+                <Input
+                  type="number"
+                  value={priorityValue}
+                  onChange={e => setPriorityValue(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') handlePriorityChange()
+                    if (e.key === 'Escape') {
+                      setEditingPriority(false)
+                      setPriorityValue(String(credential.priority))
+                    }
+                  }}
+                  className="h-6 w-10 rounded-md border-primary px-1 text-center font-mono text-xs"
+                  min="0"
+                  autoFocus
+                />
+                <button
+                  onClick={handlePriorityChange}
+                  disabled={setPriority.isPending}
+                  className="flex h-6 w-5 cursor-pointer items-center justify-center rounded text-ok hover:bg-ok-soft"
+                  aria-label="确认"
+                >
+                  <Check className="h-3 w-3" />
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setEditingPriority(true)}
+                className="group/p inline-flex items-center gap-0.5 tnum font-mono hover:text-primary"
+                title="点击编辑优先级"
+              >
+                <span className="text-muted-foreground/60">P</span>
+                <span className="font-semibold text-foreground">{credential.priority}</span>
+                <Pencil className="h-2.5 w-2.5 opacity-0 transition-opacity group-hover/p:opacity-60" />
+              </button>
+            )}
+
+            <span className="text-muted-foreground/40">·</span>
+
+            {/* 成功/失败 */}
+            <span className="inline-flex items-center gap-1 tnum font-mono" title="成功 / 失败">
+              <Check className="h-3 w-3 text-ok" />
+              <span className="text-foreground">{credential.successCount}</span>
+              <X className={cn('h-3 w-3', hasFailures ? 'text-bad' : 'text-muted-foreground/50')} />
+              <span className={cn(hasFailures ? 'font-medium text-bad' : 'text-muted-foreground')}>
+                {credential.failureCount}
+              </span>
+            </span>
+
+            <span className="text-muted-foreground/40">·</span>
+
+            {/* 最近使用 */}
+            <span className="tnum font-mono text-muted-foreground" title="最近使用">
+              <RelativeTime value={credential.lastUsedAt} />
+            </span>
+
+            {/* RPM 滑动窗口指示器：仅在生效限流时显示 */}
+            {rpmActive && (
+              <>
+                <span className="text-muted-foreground/40">·</span>
+                <span
+                  className={cn('inline-flex items-center gap-1 tnum font-mono', rpmColorClass)}
+                  title={`RPM ${rpmCurrent}/${effectiveRpm} · 60s 窗口${typeof credential.rpmLimit !== 'number' ? '（默认）' : ''}`}
+                >
+                  <Gauge className="h-3 w-3" />
+                  {rpmCurrent}/{effectiveRpm}
+                </span>
+              </>
+            )}
+          </div>
+        </div>
 
         {/* ─── FOOTER: divided action cells ─── */}
         <div className={cn('mt-auto grid divide-x divide-border border-t border-border', readOnly ? 'grid-cols-1' : 'grid-cols-3')}>
@@ -717,15 +725,6 @@ export function CredentialCard({
 }
 
 // ─── Primitives ───
-
-function MetaCell({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="flex flex-col gap-0.5">
-      <dt className="label-eyebrow text-[0.625rem]">{label}</dt>
-      <dd>{children}</dd>
-    </div>
-  )
-}
 
 function FooterAction({
   onClick, disabled, icon, label, title,
