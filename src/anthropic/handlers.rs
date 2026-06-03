@@ -620,6 +620,15 @@ fn create_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
+                            // [TTFT 埋点] 首个 body chunk：从“上游响应头到达”到“上游首字节”的间隔。
+                            // stats.start 在 create_sse_stream 构造时（即拿到响应头后）起算。
+                            // 配合 provider 的 acquire/send 即可拼出完整首字耗时分解。
+                            if stats.bytes == 0 {
+                                tracing::info!(
+                                    "[TTFT] 上游首字节: header→first_byte={}ms",
+                                    stats.start.elapsed().as_millis()
+                                );
+                            }
                             stats.bytes += chunk.len();
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {

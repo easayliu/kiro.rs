@@ -7,7 +7,7 @@
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -540,7 +540,9 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             // 仅首轮使用粘性绑定凭据；后续轮次 fallback 走默认选择
             let preferred = if attempt == 0 { preferred_credential } else { None };
-            // 获取调用上下文（绑定 index、credentials、token）
+            // [TTFT 埋点] 计 acquire：凭据选择 + 可能的内联 token 刷新（含落盘）。
+            // 若这一段大，说明首字慢在“凭据准备/刷新”，而非上游。
+            let acquire_start = Instant::now();
             let ctx = match self
                 .token_manager
                 .acquire_context(model.as_deref(), preferred)
@@ -552,6 +554,7 @@ impl KiroProvider {
                     continue;
                 }
             };
+            let acquire_ms = acquire_start.elapsed().as_millis();
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config)
@@ -590,6 +593,9 @@ impl KiroProvider {
                 request = request.header("tokentype", "API_KEY");
             }
 
+            // [TTFT 埋点] 计 send：从发出请求到上游返回响应头（流式下约等于上游开始吐字）。
+            // 与 acquire_ms 对比即可定位首字慢在“本地凭据准备”还是“上游响应”。
+            let send_start = Instant::now();
             let response = match request
                 .send()
                 .await
@@ -613,6 +619,21 @@ impl KiroProvider {
             };
 
             let status = response.status();
+            let send_ms = send_start.elapsed().as_millis();
+
+            // [TTFT 埋点] 一行分段：acquire(凭据准备/刷新) vs send(上游响应头)。
+            // acquire 大 → 卡在本地刷新；send 大 → 卡在上游。这两段不含流式后续吐字。
+            // 凭据数量变化时对比 acquire 即可验证“凭证多→首字高”。
+            tracing::info!(
+                "[TTFT] 凭据 #{} {} attempt={}/{} status={} acquire={}ms send={}ms",
+                ctx.id,
+                api_type,
+                attempt + 1,
+                max_retries,
+                status.as_u16(),
+                acquire_ms,
+                send_ms
+            );
 
             // 成功响应
             if status.is_success() {

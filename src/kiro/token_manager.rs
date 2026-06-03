@@ -135,7 +135,10 @@ async fn refresh_social_token(
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<KiroCredentials> {
-    tracing::info!("正在刷新 Social Token...");
+    tracing::info!(
+        "正在刷新 Social Token... (凭据 #{})",
+        credentials.id.map(|i| i.to_string()).unwrap_or_else(|| "?".to_string())
+    );
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
     // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
@@ -229,7 +232,10 @@ async fn refresh_idc_token(
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<KiroCredentials> {
-    tracing::info!("正在刷新 IdC Token...");
+    tracing::info!(
+        "正在刷新 IdC Token... (凭据 #{})",
+        credentials.id.map(|i| i.to_string()).unwrap_or_else(|| "?".to_string())
+    );
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
     let client_id = credentials
@@ -1395,9 +1401,12 @@ impl MultiTokenManager {
         let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
 
         let creds = if needs_refresh {
-            // 获取刷新锁，确保同一时间只有一个刷新操作
+            // [TTFT 埋点] 获取刷新锁，确保同一时间只有一个刷新操作。
+            // 计 lock_wait：若同一凭据有其它请求正在刷新，这里会排队，能反映锁竞争。
             let refresh_lock = self.refresh_lock_for(id);
+            let lock_wait_start = Instant::now();
             let _guard = refresh_lock.lock().await;
+            let lock_wait_ms = lock_wait_start.elapsed().as_millis();
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
             let current_creds = {
@@ -1412,8 +1421,12 @@ impl MultiTokenManager {
             if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
                 // 确实需要刷新
                 let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref(), &self.proxy_groups.read());
+
+                // [TTFT 埋点] 计 refresh：上游刷新网络往返（IdC 还含 ListAvailableProfiles 探测）
+                let refresh_start = Instant::now();
                 let new_creds =
                     refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                let refresh_ms = refresh_start.elapsed().as_millis();
 
                 if is_token_expired(&new_creds) {
                     anyhow::bail!("刷新后的 Token 仍然无效或已过期");
@@ -1427,15 +1440,29 @@ impl MultiTokenManager {
                     }
                 }
 
-                // 回写凭据到文件（仅多凭据格式），失败只记录警告
+                // [TTFT 埋点] 计 persist：整文件 O(N) 序列化 + 同步写盘（在请求关键路径上 await）
+                let persist_start = Instant::now();
                 if let Err(e) = self.persist_credentials() {
                     tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
                 }
+                let persist_ms = persist_start.elapsed().as_millis();
+
+                tracing::info!(
+                    "[TTFT] 凭据 #{} 内联刷新 access token: lock_wait={}ms refresh={}ms persist={}ms",
+                    id,
+                    lock_wait_ms,
+                    refresh_ms,
+                    persist_ms
+                );
 
                 new_creds
             } else {
                 // 其他请求已经完成刷新，直接使用新凭据
-                tracing::debug!("Token 已被其他请求刷新，跳过刷新");
+                tracing::info!(
+                    "[TTFT] 凭据 #{} 等刷新锁后命中他人已刷新: lock_wait={}ms",
+                    id,
+                    lock_wait_ms
+                );
                 current_creds
             }
         } else {
