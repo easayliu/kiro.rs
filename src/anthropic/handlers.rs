@@ -624,7 +624,7 @@ fn create_sse_stream(
                             // stats.start 在 create_sse_stream 构造时（即拿到响应头后）起算。
                             // 配合 provider 的 acquire/send 即可拼出完整首字耗时分解。
                             if stats.bytes == 0 {
-                                tracing::info!(
+                                tracing::debug!(
                                     "[TTFT] 上游首字节: header→first_byte={}ms",
                                     stats.start.elapsed().as_millis()
                                 );

@@ -632,7 +632,7 @@ impl KiroProvider {
                     .and_then(|u| u.host_str().map(str::to_string))
                     .unwrap_or_else(|| "直连".to_string())
             };
-            tracing::info!(
+            tracing::debug!(
                 "[TTFT] 凭据 #{} {} model={} attempt={}/{} status={} acquire={}ms send={}ms host={} proxy={}",
                 ctx.id,
                 api_type,

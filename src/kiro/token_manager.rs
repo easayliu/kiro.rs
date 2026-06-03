@@ -1447,7 +1447,7 @@ impl MultiTokenManager {
                 }
                 let persist_ms = persist_start.elapsed().as_millis();
 
-                tracing::info!(
+                tracing::debug!(
                     "[TTFT] 凭据 #{} 内联刷新 access token: lock_wait={}ms refresh={}ms persist={}ms",
                     id,
                     lock_wait_ms,
@@ -1458,7 +1458,7 @@ impl MultiTokenManager {
                 new_creds
             } else {
                 // 其他请求已经完成刷新，直接使用新凭据
-                tracing::info!(
+                tracing::debug!(
                     "[TTFT] 凭据 #{} 等刷新锁后命中他人已刷新: lock_wait={}ms",
                     id,
                     lock_wait_ms
