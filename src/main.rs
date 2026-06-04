@@ -146,6 +146,11 @@ async fn main() {
     let token_manager = Arc::new(token_manager);
     let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone());
 
+    // 初始化计费累计统计持久化：落盘到凭据缓存同目录的 billing_stats.json。
+    if let Some(dir) = token_manager.cache_dir() {
+        anthropic::init_billing_stats(dir.join("billing_stats.json"));
+    }
+
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
         api_url: config.count_tokens_api_url.clone(),

@@ -24,6 +24,12 @@ pub async fn get_me(Extension(role): Extension<AdminRole>) -> impl IntoResponse 
     Json(MeResponse { role: role.as_str() })
 }
 
+/// GET /api/admin/billing-stats
+/// 返回进程维度累计的实际成本 / 官方折算价 / 毛利汇总
+pub async fn get_billing_stats() -> impl IntoResponse {
+    Json(crate::anthropic::billing_stats().snapshot())
+}
+
 /// GET /api/admin/credentials
 /// 获取所有凭据状态
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {

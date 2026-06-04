@@ -1008,6 +1008,9 @@ async fn handle_non_stream_request(
         billing.cache_creation_1h_input_tokens,
         output_tokens,
     );
+    let margin = ((official - actual) * 1_000_000.0).round() / 1_000_000.0;
+    // 进程维度累计实际成本/官方价/毛利，供 admin 只读接口查询（无锁原子，零热路径开销）。
+    super::billing_stats().record(actual, official, margin);
     tracing::info!(
         model = %model,
         input_tokens = billed_input_tokens,
@@ -1020,7 +1023,7 @@ async fn handle_non_stream_request(
         upstream_credit = upstream_credit.unwrap_or(0.0),
         actual_cost_usd = actual,
         official_price_usd = official,
-        margin_usd = ((official - actual) * 1_000_000.0).round() / 1_000_000.0,
+        margin_usd = margin,
         elapsed_secs = request_start.elapsed().as_secs_f64(),
         "请求完成（非流式）"
     );
