@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde_json::json;
 use uuid::Uuid;
@@ -635,6 +636,8 @@ pub struct StreamContext {
     billing_writeback: Option<(Arc<CacheTracker>, CacheWriteback)>,
     /// meteringEvent 给出的上游真实扣费（单位 credit），用于成本对账 / 诊断。
     upstream_credit: Option<f64>,
+    /// StreamContext 创建时刻，用于在计费汇总日志里输出请求耗时。
+    start: Instant,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -675,6 +678,7 @@ impl StreamContext {
             cache_read_billed: None,
             billing_writeback: None,
             upstream_credit: None,
+            start: Instant::now(),
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -1306,7 +1310,11 @@ impl StreamContext {
             cache_read = billing.cache_read_input_tokens,
             cache_creation = billing.cache_creation_input_tokens,
             output_tokens = self.output_tokens,
+            total_tokens = billing.cache_read_input_tokens
+                + billing.cache_creation_input_tokens
+                + billing.uncached_input_tokens,
             upstream_credit = self.upstream_credit.unwrap_or(0.0),
+            elapsed_secs = self.start.elapsed().as_secs_f64(),
             "请求完成（流式）"
         );
 

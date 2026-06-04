@@ -730,11 +730,13 @@ fn create_sse_stream(
                                     "疑似静默截断：流以 EOF 正常结束但缺少收尾信号（残留半帧或未收到 meteringEvent），客户端会看到半截回复"
                                 );
                             } else {
-                                tracing::info!(
+                                // 计费汇总由 generate_final_events 的「请求完成（流式）」承担；
+                                // 此处仅记 transport 层 EOF/耗时，降级 debug 避免每请求双 info 行。
+                                tracing::debug!(
                                     model = %ctx.model,
                                     elapsed_secs = stats.start.elapsed().as_secs_f64(),
                                     output_tokens = ctx.output_tokens,
-                                    "请求完成"
+                                    "上游流正常结束（EOF）"
                                 );
                                 tracing::debug!(
                                     bytes = stats.bytes,
@@ -782,6 +784,7 @@ async fn handle_non_stream_request(
     binding_key: Option<u64>,
     preferred: Option<u64>,
 ) -> Response {
+    let request_start = Instant::now();
     // 调用 Kiro API 并缓冲完整响应体（支持多凭据故障转移；body 中途被上游 RST/EOF
     // 时会重新发起整轮调用并换凭据，见 call_api_buffered）
     let api_result = match provider.call_api_buffered(request_body, preferred).await {
@@ -999,8 +1002,14 @@ async fn handle_non_stream_request(
     tracing::info!(
         model = %model,
         input_tokens = billed_input_tokens,
+        cache_read = billing.cache_read_input_tokens,
+        cache_creation = billing.cache_creation_input_tokens,
         output_tokens,
+        total_tokens = billing.cache_read_input_tokens
+            + billing.cache_creation_input_tokens
+            + billing.uncached_input_tokens,
         upstream_credit = upstream_credit.unwrap_or(0.0),
+        elapsed_secs = request_start.elapsed().as_secs_f64(),
         "请求完成（非流式）"
     );
 
@@ -1441,11 +1450,13 @@ fn create_buffered_sse_stream(
                                         "疑似静默截断（缓冲模式）：流以 EOF 正常结束但缺少收尾信号（残留半帧或未收到 meteringEvent）"
                                     );
                                 } else {
-                                    tracing::info!(
+                                    // 计费汇总由 inner 的「请求完成（流式）」承担；此处仅记
+                                    // transport 层 EOF/耗时，降级 debug 避免每请求双 info 行。
+                                    tracing::debug!(
                                         model = %ctx.model(),
                                         elapsed_secs = stats.start.elapsed().as_secs_f64(),
                                         output_tokens = ctx.output_tokens(),
-                                        "请求完成（缓冲模式）"
+                                        "上游流正常结束（EOF，缓冲模式）"
                                     );
                                     tracing::debug!(
                                         bytes = stats.bytes,
