@@ -169,9 +169,15 @@ pub struct CacheTracker {
     max_supported_ttl: Duration,
     /// 分桶模式（运行时可切换）。用 AtomicU8 编码 CacheScope。
     scope: AtomicU8,
-    /// 缓存查找跳过率（0.0-1.0）。对每个有 breakpoint 的请求，以此概率
-    /// 跳过 cache 查找（当作首次请求，cache_read = 0），但仍正常写入 checkpoint；
-    /// 用于在自然命中率偏高时整体降低可观察到的缓存命中率。
+    /// 缓存查找跳过率（0.0-1.0）。以此概率跳过 cache 查找（当作首次请求，
+    /// cache_read = 0），但仍正常写入 checkpoint；用于在自然命中率偏高时整体
+    /// 降低可观察到的缓存命中率。
+    ///
+    /// 跳过判定是**会话维度确定性**的：按 `identity_key`（含 session_id）的 hash
+    /// 与 rate 比较，使同一会话整段一致冷/热，避免会话内忽冷忽热的账单跳变；
+    /// 聚合命中率仍按 rate 下降，且分布天然双峰（部分会话全冷、部分全热），
+    /// 贴近真实 prompt cache 的冷启动行为。无 identity（无 metadata）时退回
+    /// per-request 随机。
     cache_skip_rate: Mutex<Option<f32>>,
 }
 
@@ -220,8 +226,12 @@ impl CacheTracker {
         *self.cache_skip_rate.lock() = rate.map(clamp_skip_rate);
     }
 
-    /// 按配置的跳过率掷骰子，决定本次请求是否跳过 cache 查找
-    fn should_skip_lookup(&self) -> bool {
+    /// 按配置的跳过率决定本次请求是否跳过 cache 查找。
+    ///
+    /// 会话维度确定性：用 `identity_key`（含 session_id）的加盐 hash 映射到 [0,1)
+    /// 分位与 rate 比较，使同一会话整段一致跳过/不跳过，避免会话内忽冷忽热；
+    /// 无 identity 时退回 per-request 随机。
+    fn should_skip_lookup(&self, profile: &CacheProfile) -> bool {
         let Some(rate) = self.cache_skip_rate() else {
             return false;
         };
@@ -231,7 +241,10 @@ impl CacheTracker {
         if rate >= 1.0 {
             return true;
         }
-        fastrand::f32() < rate
+        match profile.identity_key {
+            Some(id) => session_skip_unit(id) < rate,
+            None => fastrand::f32() < rate,
+        }
     }
 
     fn effective_bucket_key(&self, credential_id: u64, profile: &CacheProfile) -> u64 {
@@ -402,7 +415,7 @@ impl CacheTracker {
         let mut matched_block_index: Option<usize> = None;
         // 命中条目持久化的上游计费口径累计 token（W），供计费时钉住 cache_read。
         let mut matched_billed: Option<i32> = None;
-        let skipped_lookup = self.should_skip_lookup();
+        let skipped_lookup = self.should_skip_lookup(profile);
 
         if skipped_lookup {
             tracing::debug!(
@@ -959,6 +972,21 @@ fn hash_to_u64(s: String) -> u64 {
     u64::from_be_bytes([
         hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
     ])
+}
+
+/// 跳过判定专用盐值，使 `session_skip_unit` 与分桶 hash（`effective_bucket_key`）
+/// 去相关——否则"是否跳过"会与"落到哪个 bucket"耦合，造成系统性偏置。
+const SKIP_UNIT_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// 把会话身份 hash 确定性地映射到 [0,1) 分位，用于会话维度跳过判定。
+/// 同一 `identity_key` 永远得到同一分位，故同一会话整段一致冷/热。
+fn session_skip_unit(identity_key: u64) -> f32 {
+    let mut hasher = Sha256::new();
+    hasher.update(SKIP_UNIT_SALT.to_be_bytes());
+    hasher.update(identity_key.to_be_bytes());
+    let h: [u8; 32] = hasher.finalize().into();
+    let v = u32::from_be_bytes([h[0], h[1], h[2], h[3]]);
+    (v as f64 / (u32::MAX as f64 + 1.0)) as f32
 }
 
 fn mix_fingerprint(content: &[u8; 32], extras: &[u8; 32]) -> [u8; 32] {
@@ -1810,5 +1838,77 @@ mod tests {
             r.cache_read_input_tokens, 0,
             "按凭据隔离模式下 credential 2 应看不到 credential 1 的缓存"
         );
+    }
+
+    /// 会话维度确定性跳过：同一会话（identity）重复"本应命中"的请求，
+    /// 跳过与否完全一致，不出现 per-request 抖动（旧 per-request 随机会忽冷忽热）。
+    #[test]
+    fn session_deterministic_skip_is_stable_within_session() {
+        let tracker = CacheTracker::new(DEFAULT_CACHE_TTL, CacheScope::Global, Some(0.5));
+        let sys = large_text("S ", LARGE_SYSTEM_CHARS);
+        let meta = make_metadata("dev-stable", "acct-stable", "sess-stable");
+        let req = build_request_with_metadata(
+            &sys,
+            vec![user_message(vec![json!({
+                "type": "text",
+                "text": "hi",
+                "cache_control": ephemeral_5m(),
+            })])],
+            meta,
+        );
+
+        // 先建缓存并回写 billed（首轮 read 必为 0，无论是否跳过）。
+        let p0 = tracker.build_profile(&req, 10_000);
+        let (_r0, wb0) = tracker.compute_and_update(1, &p0);
+        tracker.apply_billing_writeback(&wb0, 0, 5_000);
+
+        // 同一会话重复"本应命中"的请求多次，cache_read 结果应完全一致
+        // （要么稳定命中、要么稳定跳过），不会逐请求抖动。
+        let mut reads = Vec::new();
+        for _ in 0..8 {
+            let p = tracker.build_profile(&req, 10_000);
+            let (r, _) = tracker.compute_and_update(1, &p);
+            reads.push(r.cache_read_input_tokens);
+        }
+        assert!(
+            reads.iter().all(|&x| x == reads[0]),
+            "同一会话跳过决策应稳定一致，got={:?}",
+            reads
+        );
+    }
+
+    /// 跨大量会话，跳过比例应近似 rate（确定性分位整体均匀）。
+    #[test]
+    fn session_skip_unit_distribution_approximates_rate() {
+        let rate = 0.3f32;
+        let n = 5_000;
+        let skipped = (0..n)
+            .filter(|i| session_skip_unit(hash_to_u64(format!("session-{i}"))) < rate)
+            .count();
+        let frac = skipped as f64 / n as f64;
+        assert!(
+            (frac - rate as f64).abs() < 0.03,
+            "跨会话跳过比例应≈rate(0.3)，got={frac}"
+        );
+    }
+
+    /// rate=1.0 强制跳过：回访会话也命中不到（短路在 identity 判定之前）。
+    #[test]
+    fn skip_rate_one_forces_miss_for_returning_session() {
+        let tracker = CacheTracker::new(DEFAULT_CACHE_TTL, CacheScope::Global, Some(1.0));
+        let sys = large_text("S ", LARGE_SYSTEM_CHARS);
+        let req = build_request(
+            &sys,
+            vec![user_message(vec![json!({
+                "type": "text",
+                "text": "hi",
+                "cache_control": ephemeral_5m(),
+            })])],
+        );
+        let p1 = tracker.build_profile(&req, 10_000);
+        tracker.compute_and_update(1, &p1);
+        let p2 = tracker.build_profile(&req, 10_000);
+        let (r2, _) = tracker.compute_and_update(1, &p2);
+        assert_eq!(r2.cache_read_input_tokens, 0, "rate=1.0 应强制跳过查找");
     }
 }
