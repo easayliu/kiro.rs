@@ -201,6 +201,54 @@ pub fn get_context_window_size(model: &str) -> i32 {
     window_size_for(model, &dynamic_model_windows().read())
 }
 
+/// 1 credit 折算的 USD（上游 Kiro 计价单价）。如折扣/套餐变化在此调整。
+pub const CREDIT_TO_USD: f64 = 0.04;
+
+/// 上游 meteringEvent 的 credit 折算为实际 USD 成本（最终折扣价）。
+/// 四舍五入到 6 位小数（微美元）。
+pub fn credit_to_usd(credit: f64) -> f64 {
+    ((credit.max(0.0) * CREDIT_TO_USD) * 1_000_000.0).round() / 1_000_000.0
+}
+
+/// 模型官方价（USD / MTok）：`(base_input, output)`。
+///
+/// 数据来自 Anthropic 官方 pricing（platform.claude.com/docs ... pricing）。
+/// cache 价由固定倍率派生：5m 写 = 1.25× base input，1h 写 = 2×，cache 读 = 0.1×。
+/// 1M 上下文为标准价无溢价。未知模型按 Sonnet 兜底。
+fn model_price_per_mtok(model: &str) -> (f64, f64) {
+    match map_model(model).as_deref() {
+        Some("claude-opus-4.8")
+        | Some("claude-opus-4.7")
+        | Some("claude-opus-4.6")
+        | Some("claude-opus-4.5") => (5.0, 25.0),
+        Some("claude-sonnet-4.6") | Some("claude-sonnet-4.5") => (3.0, 15.0),
+        Some("claude-haiku-4.5") => (1.0, 5.0),
+        _ => (3.0, 15.0),
+    }
+}
+
+/// 按 Anthropic 官方价折算本次请求的 USD 成本（用于和上游 credit 对比）。
+///
+/// 各计费类目套用官方倍率：uncached input = 1×、cache 读 = 0.1×、5m 写 = 1.25×、
+/// 1h 写 = 2×（均相对 base input），output 用 output 价。结果四舍五入到 6 位小数（微美元）。
+pub fn official_price_usd(
+    model: &str,
+    uncached_input: i32,
+    cache_read: i32,
+    cache_creation_5m: i32,
+    cache_creation_1h: i32,
+    output: i32,
+) -> f64 {
+    let (input_rate, output_rate) = model_price_per_mtok(model);
+    let cost = uncached_input.max(0) as f64 * input_rate
+        + cache_read.max(0) as f64 * input_rate * 0.1
+        + cache_creation_5m.max(0) as f64 * input_rate * 1.25
+        + cache_creation_1h.max(0) as f64 * input_rate * 2.0
+        + output.max(0) as f64 * output_rate;
+    let usd = cost / 1_000_000.0;
+    (usd * 1_000_000.0).round() / 1_000_000.0
+}
+
 /// `get_context_window_size` 的纯逻辑：先查动态窗口表，再回退硬编码常量。
 /// 抽出来便于单测（不依赖全局态）。
 fn window_size_for(model: &str, dynamic: &HashMap<String, i32>) -> i32 {
@@ -1695,6 +1743,28 @@ mod tests {
     fn test_context_window_opus_4_7_4_8() {
         assert_eq!(get_context_window_size("claude-opus-4-7"), 1_000_000);
         assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
+    }
+
+    /// 官方价折算：对齐 Anthropic 文档的 worked example
+    /// （Opus 4.8：10k uncached + 40k cache 读 + 15k output，仅 token 部分 = $0.445）。
+    #[test]
+    fn official_price_matches_anthropic_worked_example() {
+        // 0.05(uncached) + 0.02(cache读) + 0.375(output) = 0.445
+        let p = official_price_usd("claude-opus-4-8", 10_000, 40_000, 0, 0, 15_000);
+        assert!((p - 0.445).abs() < 1e-9, "got {p}");
+    }
+
+    /// 各模型档位与 cache 倍率正确（5m=1.25×、1h=2×、读=0.1×）。
+    #[test]
+    fn official_price_tiers_and_cache_multipliers() {
+        // Sonnet-4.6 input $3：100 万 uncached input = $3。
+        assert!((official_price_usd("claude-sonnet-4-6", 1_000_000, 0, 0, 0, 0) - 3.0).abs() < 1e-9);
+        // Opus 5m 写 = 1.25 × $5 = $6.25 / MTok。
+        assert!((official_price_usd("claude-opus-4-8", 0, 0, 1_000_000, 0, 0) - 6.25).abs() < 1e-9);
+        // Opus 1h 写 = 2 × $5 = $10 / MTok。
+        assert!((official_price_usd("claude-opus-4-8", 0, 0, 0, 1_000_000, 0) - 10.0).abs() < 1e-9);
+        // Haiku cache 读 = 0.1 × $1 = $0.10 / MTok。
+        assert!((official_price_usd("claude-haiku-4-5", 0, 1_000_000, 0, 0, 0) - 0.10).abs() < 1e-9);
     }
 
     /// 动态窗口表存在时优先用上游 maxInputTokens（按 map_model 归一化匹配），

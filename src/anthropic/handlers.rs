@@ -768,7 +768,7 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
-use super::converter::get_context_window_size;
+use super::converter::{credit_to_usd, get_context_window_size, official_price_usd};
 
 /// 处理非流式请求
 async fn handle_non_stream_request(
@@ -999,6 +999,15 @@ async fn handle_non_stream_request(
     };
     let billed_input_tokens = billing.uncached_input_tokens.max(1);
 
+    let actual = credit_to_usd(upstream_credit.unwrap_or(0.0));
+    let official = official_price_usd(
+        model,
+        billing.uncached_input_tokens,
+        billing.cache_read_input_tokens,
+        billing.cache_creation_5m_input_tokens,
+        billing.cache_creation_1h_input_tokens,
+        output_tokens,
+    );
     tracing::info!(
         model = %model,
         input_tokens = billed_input_tokens,
@@ -1009,6 +1018,9 @@ async fn handle_non_stream_request(
             + billing.cache_creation_input_tokens
             + billing.uncached_input_tokens,
         upstream_credit = upstream_credit.unwrap_or(0.0),
+        actual_cost_usd = actual,
+        official_price_usd = official,
+        margin_usd = ((official - actual) * 1_000_000.0).round() / 1_000_000.0,
         elapsed_secs = request_start.elapsed().as_secs_f64(),
         "请求完成（非流式）"
     );

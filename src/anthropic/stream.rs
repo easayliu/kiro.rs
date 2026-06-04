@@ -607,7 +607,7 @@ impl SseStateManager {
     }
 }
 
-use super::converter::get_context_window_size;
+use super::converter::{credit_to_usd, get_context_window_size, official_price_usd};
 use super::handlers::CacheUsageContext;
 
 /// 流处理上下文
@@ -1304,6 +1304,15 @@ impl StreamContext {
             }
         }
 
+        let actual = credit_to_usd(self.upstream_credit.unwrap_or(0.0));
+        let official = official_price_usd(
+            &self.model,
+            billing.uncached_input_tokens,
+            billing.cache_read_input_tokens,
+            billing.cache_creation_5m_input_tokens,
+            billing.cache_creation_1h_input_tokens,
+            self.output_tokens,
+        );
         tracing::info!(
             model = %self.model,
             input_tokens = billing.uncached_input_tokens.max(1),
@@ -1314,6 +1323,9 @@ impl StreamContext {
                 + billing.cache_creation_input_tokens
                 + billing.uncached_input_tokens,
             upstream_credit = self.upstream_credit.unwrap_or(0.0),
+            actual_cost_usd = actual,
+            official_price_usd = official,
+            margin_usd = ((official - actual) * 1_000_000.0).round() / 1_000_000.0,
             elapsed_secs = self.start.elapsed().as_secs_f64(),
             "请求完成（流式）"
         );
