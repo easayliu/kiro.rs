@@ -171,6 +171,42 @@ async fn main() {
         config.cache_skip_rate,
     );
 
+    // 后台拉取上游 ListAvailableModels，动态校准 contextUsage 反推用的上下文窗口；
+    // 用上游真实 maxInputTokens 取代硬编码常量，失败时静默回退硬编码。每 6 小时刷新。
+    if let Some(provider) = app_state.kiro_provider.clone() {
+        tokio::spawn(async move {
+            const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+            loop {
+                match provider.list_available_models().await {
+                    Ok(models) => {
+                        // 上游 modelId（点号形式）经 map_model 归一化为窗口表 key。
+                        let mut windows = std::collections::HashMap::new();
+                        for (id, max) in &models {
+                            if let Some(mapped) = anthropic::map_model(id) {
+                                windows.insert(mapped, *max);
+                            }
+                        }
+                        let count = windows.len();
+                        // 逐个列出上游真实 maxInputTokens，便于核对硬编码是否准确。
+                        let mut detail: Vec<String> =
+                            windows.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                        detail.sort();
+                        anthropic::set_dynamic_model_windows(windows);
+                        tracing::info!(
+                            "动态窗口已更新：{} 个模型（来自上游 ListAvailableModels）[{}]",
+                            count,
+                            detail.join(", ")
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("拉取 ListAvailableModels 失败，沿用硬编码窗口: {}", e);
+                    }
+                }
+                tokio::time::sleep(REFRESH_INTERVAL).await;
+            }
+        });
+    }
+
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
     // 安全检查：空字符串被视为未配置，防止空 key 绕过认证
     let admin_key_valid = config

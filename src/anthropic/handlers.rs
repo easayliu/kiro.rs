@@ -834,6 +834,8 @@ async fn handle_non_stream_request(
     // contextUsageEvent 算出的上游实际输入 token 总量（含注入的 system prompt）。
     // 用于计费时重算未缓存 token，比基于用户请求的估算更贴近上游真实用量。
     let mut context_input_tokens: Option<i32> = None;
+    // meteringEvent 给出的上游真实扣费（单位 credit），用于成本对账 / 诊断。
+    let mut upstream_credit: Option<f64> = None;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -891,12 +893,13 @@ async fn handle_non_stream_request(
                             }
                         }
                         Event::ContextUsage(context_usage) => {
-                            // 从上下文使用百分比计算实际的 input_tokens
+                            // 从上下文使用百分比反推实际 input_tokens（round 精确还原，
+                            // 上游百分比满精度，截断会丢 ~1 token）。
                             let window_size = get_context_window_size(model);
                             let actual_input_tokens = (context_usage.context_usage_percentage
                                 * (window_size as f64)
                                 / 100.0)
-                                as i32;
+                                .round() as i32;
                             context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
@@ -907,6 +910,9 @@ async fn handle_non_stream_request(
                                 context_usage.context_usage_percentage,
                                 actual_input_tokens
                             );
+                        }
+                        Event::Metering(metering) => {
+                            upstream_credit = Some(metering.usage);
                         }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
@@ -994,6 +1000,7 @@ async fn handle_non_stream_request(
         model = %model,
         input_tokens = billed_input_tokens,
         output_tokens,
+        upstream_credit = upstream_credit.unwrap_or(0.0),
         "请求完成（非流式）"
     );
 

@@ -311,6 +311,71 @@ impl KiroProvider {
             .await
     }
 
+    /// 拉取上游 `ListAvailableModels`，返回 `(modelId, maxInputTokens)` 列表。
+    ///
+    /// 用于动态校准 contextUsage 百分比反推 token 时用的上下文窗口，取代硬编码常量
+    /// （上游 `q.{region}.amazonaws.com` 老端点提供该 API；新 runtime 端点不提供）。
+    /// 任意可用凭据即可拉取（与具体模型无关），失败由调用方回退硬编码窗口。
+    pub async fn list_available_models(&self) -> anyhow::Result<Vec<(String, i32)>> {
+        let ctx = self.token_manager.acquire_context(None, None).await?;
+        let config = self.token_manager.config();
+        let machine_id =
+            machine_id::generate_from_credentials(&ctx.credentials, config).unwrap_or_default();
+        let mode = ctx.credentials.effective_client_mode(config);
+        let region = ctx.credentials.effective_api_region(config).to_string();
+        let url = format!("https://q.{}.amazonaws.com/ListAvailableModels", region);
+        let x_amz_user_agent = config.streaming_x_amz_user_agent(&machine_id, mode);
+        let user_agent = config.streaming_user_agent(&machine_id, mode);
+
+        // ListAvailableModels 用 GET + query 参数（对齐 Kiro IDE：origin=AI_EDITOR，
+        // 带 profileArn 时附上）。
+        let mut params: Vec<(&str, String)> = vec![("origin", "AI_EDITOR".to_string())];
+        if let Some(arn) = ctx.credentials.effective_profile_arn() {
+            params.push(("profileArn", arn));
+        }
+
+        let mut request = self.client_for(&ctx.credentials)?.get(&url).query(&params);
+        if ctx.credentials.is_api_key_credential() {
+            request = request.header("tokentype", "API_KEY");
+        }
+        let response = request
+            .header("x-amz-user-agent", &x_amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", format!("q.{}.amazonaws.com", region))
+            .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+            .header("Authorization", format!("Bearer {}", ctx.token))
+            .header("Connection", "close")
+            .send()
+            .await?;
+
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            let snippet: String = body.chars().take(200).collect();
+            anyhow::bail!("ListAvailableModels HTTP {}: {}", status, snippet);
+        }
+
+        let json: serde_json::Value = serde_json::from_str(&body)?;
+        let Some(models) = json.get("models").and_then(|m| m.as_array()) else {
+            anyhow::bail!("ListAvailableModels 响应缺少 models 数组");
+        };
+        let mut out = Vec::new();
+        for m in models {
+            let Some(id) = m.get("modelId").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let max = m
+                .get("tokenLimits")
+                .and_then(|t| t.get("maxInputTokens"))
+                .and_then(|v| v.as_i64())
+                .filter(|&x| x > 0);
+            if let Some(max) = max {
+                out.push((id.to_string(), max as i32));
+            }
+        }
+        Ok(out)
+    }
+
     /// 发送 MCP API 请求
     ///
     /// 用于 WebSearch 等工具调用

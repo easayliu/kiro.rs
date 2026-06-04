@@ -3,8 +3,10 @@
 //! 负责将 Anthropic API 请求格式转换为 Kiro API 请求格式
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use base64::Engine;
+use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -172,20 +174,51 @@ pub fn map_model(model: &str) -> Option<String> {
     }
 }
 
+/// 上游 `ListAvailableModels` 拉取到的动态窗口表：`map_model 归一化 id → maxInputTokens`。
+///
+/// 优先于硬编码常量，用于 contextUsage 百分比反推 token 时拿到上游**真实**上下文窗口，
+/// 规避「硬编码窗口与上游实际不符 → 反推总量被等比缩放错」的风险。为空（未拉取/拉取失败）
+/// 时回退硬编码。由 main 启动的后台任务定期用 [`set_dynamic_model_windows`] 整体刷新。
+static DYNAMIC_MODEL_WINDOWS: OnceLock<RwLock<HashMap<String, i32>>> = OnceLock::new();
+
+fn dynamic_model_windows() -> &'static RwLock<HashMap<String, i32>> {
+    DYNAMIC_MODEL_WINDOWS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// 用上游 `ListAvailableModels` 的结果整体替换动态窗口表。
+///
+/// key 必须是 `map_model` 归一化后的 id（如 `"claude-opus-4.8"`），调用方负责归一化。
+pub fn set_dynamic_model_windows(windows: HashMap<String, i32>) {
+    *dynamic_model_windows().write() = windows;
+}
+
 /// 根据模型名称返回对应的上下文窗口大小
 ///
-/// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
+/// 优先用上游 `ListAvailableModels` 的真实 `maxInputTokens`（按 `map_model` 归一化匹配）；
+/// 缺失时回退硬编码常量。复用 `map_model` 的映射逻辑，确保与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文，Opus 4.7/4.8 同样支持 1M。
 pub fn get_context_window_size(model: &str) -> i32 {
-    match map_model(model) {
-        Some(mapped)
-            if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8" =>
-        {
-            1_000_000
+    window_size_for(model, &dynamic_model_windows().read())
+}
+
+/// `get_context_window_size` 的纯逻辑：先查动态窗口表，再回退硬编码常量。
+/// 抽出来便于单测（不依赖全局态）。
+fn window_size_for(model: &str, dynamic: &HashMap<String, i32>) -> i32 {
+    let mapped = map_model(model);
+    // 优先：上游真实 maxInputTokens
+    if let Some(ref m) = mapped {
+        if let Some(&w) = dynamic.get(m) {
+            if w > 0 {
+                return w;
+            }
         }
+    }
+    // 回退：硬编码常量
+    match mapped.as_deref() {
+        Some("claude-sonnet-4.6")
+        | Some("claude-opus-4.6")
+        | Some("claude-opus-4.7")
+        | Some("claude-opus-4.8") => 1_000_000,
         _ => 200_000,
     }
 }
@@ -1662,6 +1695,25 @@ mod tests {
     fn test_context_window_opus_4_7_4_8() {
         assert_eq!(get_context_window_size("claude-opus-4-7"), 1_000_000);
         assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
+    }
+
+    /// 动态窗口表存在时优先用上游 maxInputTokens（按 map_model 归一化匹配），
+    /// 缺失/为 0 时回退硬编码常量。用纯函数 window_size_for 测，避免全局态 flaky。
+    #[test]
+    fn dynamic_window_overrides_then_falls_back() {
+        let mut dynamic = HashMap::new();
+        dynamic.insert("claude-opus-4.8".to_string(), 700_000); // 上游真实窗口
+        dynamic.insert("claude-sonnet-4.6".to_string(), 0); // 非法值应被忽略
+
+        // 命中动态值（注意传入的是客户端命名 opus-4-8，内部 map_model 归一化匹配）。
+        assert_eq!(window_size_for("claude-opus-4-8", &dynamic), 700_000);
+        // 动态值非法（0）→ 回退硬编码 1M。
+        assert_eq!(window_size_for("claude-sonnet-4-6", &dynamic), 1_000_000);
+        // 动态表无此模型 → 回退硬编码 200K。
+        assert_eq!(window_size_for("claude-opus-4-5", &dynamic), 200_000);
+        // 空表 → 全部回退硬编码。
+        let empty = HashMap::new();
+        assert_eq!(window_size_for("claude-opus-4-8", &empty), 1_000_000);
     }
 
     #[test]

@@ -633,6 +633,8 @@ pub struct StreamContext {
     /// 计费完成后的回写句柄：(tracker, writeback)。收到 contextUsageEvent 时，
     /// 在 generate_final_events 里把缩放后的 billed 累计回写到缓存条目。
     billing_writeback: Option<(Arc<CacheTracker>, CacheWriteback)>,
+    /// meteringEvent 给出的上游真实扣费（单位 credit），用于成本对账 / 诊断。
+    upstream_credit: Option<f64>,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -672,6 +674,7 @@ impl StreamContext {
             cache_usage: CacheUsage::default(),
             cache_read_billed: None,
             billing_writeback: None,
+            upstream_credit: None,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -773,11 +776,14 @@ impl StreamContext {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
-                // 从上下文使用百分比计算实际的 input_tokens
+                // 从上下文使用百分比反推实际 input_tokens。
+                // 用 round 而非截断：上游百分比是满精度的，round 能精确还原其真实
+                // token 整数（例如 1.8410999774932861% × 1_000_000 = 18410.9998 → 18411）。
                 let window_size = get_context_window_size(&self.model);
                 let actual_input_tokens = (context_usage.context_usage_percentage
                     * (window_size as f64)
-                    / 100.0) as i32;
+                    / 100.0)
+                    .round() as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
                 // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                 if context_usage.context_usage_percentage >= 100.0 {
@@ -789,6 +795,10 @@ impl StreamContext {
                     context_usage.context_usage_percentage,
                     actual_input_tokens
                 );
+                Vec::new()
+            }
+            Event::Metering(metering) => {
+                self.upstream_credit = Some(metering.usage);
                 Vec::new()
             }
             Event::Error {
@@ -1289,6 +1299,16 @@ impl StreamContext {
                 );
             }
         }
+
+        tracing::info!(
+            model = %self.model,
+            input_tokens = billing.uncached_input_tokens.max(1),
+            cache_read = billing.cache_read_input_tokens,
+            cache_creation = billing.cache_creation_input_tokens,
+            output_tokens = self.output_tokens,
+            upstream_credit = self.upstream_credit.unwrap_or(0.0),
+            "请求完成（流式）"
+        );
 
         // 把 cache usage 透传给 state_manager，让 message_delta 输出 cache_* 字段
         self.state_manager.set_final_usage(billing);

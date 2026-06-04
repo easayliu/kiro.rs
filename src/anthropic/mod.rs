@@ -32,4 +32,5 @@ pub mod types;
 mod websearch;
 
 pub use cache_tracker::{CacheScope, CacheTracker};
+pub use converter::{map_model, set_dynamic_model_windows};
 pub use router::create_router_with_provider;
