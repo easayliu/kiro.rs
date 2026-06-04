@@ -42,6 +42,8 @@ pub(crate) struct CacheUsageContext {
     pub cache_creation_1h_input_tokens: i32,
     /// 最后 breakpoint 之后的未缓存 tokens，对应 Anthropic 返回的 input_tokens
     pub uncached_input_tokens: i32,
+    /// 命中条目持久化的「上游计费口径」累计 token（W），计费时钉住 cache_read 以守恒。
+    pub cache_read_billed: Option<i32>,
 }
 
 /// 粘性绑定解析：返回本次请求应优先使用的凭证 id。
@@ -491,18 +493,22 @@ async fn handle_stream_request(
     );
 
     // 原子地计算缓存命中并更新 checkpoint 表
-    let cache_result = cache_tracker.compute_and_update(api_result.credential_id, &cache_profile);
+    let (cache_result, cache_writeback) =
+        cache_tracker.compute_and_update(api_result.credential_id, &cache_profile);
     let cache_context = CacheUsageContext {
         cache_creation_input_tokens: cache_result.cache_creation_input_tokens,
         cache_read_input_tokens: cache_result.cache_read_input_tokens,
         cache_creation_5m_input_tokens: cache_result.cache_creation_5m_input_tokens,
         cache_creation_1h_input_tokens: cache_result.cache_creation_1h_input_tokens,
         uncached_input_tokens: cache_result.uncached_input_tokens,
+        cache_read_billed: cache_result.cache_read_billed,
     };
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
     ctx.set_cache_usage(cache_context);
+    // 计费完成后（流末尾 contextUsageEvent）把缩放后的 billed 累计回写缓存，供下次命中守恒。
+    ctx.set_billing_writeback(cache_tracker.clone(), cache_writeback);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -802,13 +808,15 @@ async fn handle_non_stream_request(
     );
 
     // 原子地计算缓存命中并更新 checkpoint 表
-    let cache_result = cache_tracker.compute_and_update(api_result.credential_id, &cache_profile);
+    let (cache_result, cache_writeback) =
+        cache_tracker.compute_and_update(api_result.credential_id, &cache_profile);
     let cache_context = CacheUsageContext {
         cache_creation_input_tokens: cache_result.cache_creation_input_tokens,
         cache_read_input_tokens: cache_result.cache_read_input_tokens,
         cache_creation_5m_input_tokens: cache_result.cache_creation_5m_input_tokens,
         cache_creation_1h_input_tokens: cache_result.cache_creation_1h_input_tokens,
         uncached_input_tokens: cache_result.uncached_input_tokens,
+        cache_read_billed: cache_result.cache_read_billed,
     };
 
     let body_bytes = api_result.body;
@@ -965,7 +973,18 @@ async fn handle_non_stream_request(
     };
     let billing = match context_input_tokens {
         Some(context_total) => {
-            estimated_usage.scaled_to_upstream(estimated_input_tokens, context_total)
+            let billed = estimated_usage.billed_split(
+                estimated_input_tokens,
+                context_total,
+                cache_context.cache_read_billed,
+            );
+            // 计费完成后把缩放后的 billed 累计回写缓存，供下次命中实现读写守恒。
+            cache_tracker.apply_billing_writeback(
+                &cache_writeback,
+                billed.cache_read_input_tokens,
+                billed.cache_creation_input_tokens,
+            );
+            billed
         }
         None => estimated_usage,
     };
@@ -1260,18 +1279,22 @@ async fn handle_stream_request_buffered(
     );
 
     // 原子地计算缓存命中并更新 checkpoint 表
-    let cache_result = cache_tracker.compute_and_update(api_result.credential_id, &cache_profile);
+    let (cache_result, cache_writeback) =
+        cache_tracker.compute_and_update(api_result.credential_id, &cache_profile);
     let cache_context = CacheUsageContext {
         cache_creation_input_tokens: cache_result.cache_creation_input_tokens,
         cache_read_input_tokens: cache_result.cache_read_input_tokens,
         cache_creation_5m_input_tokens: cache_result.cache_creation_5m_input_tokens,
         cache_creation_1h_input_tokens: cache_result.cache_creation_1h_input_tokens,
         uncached_input_tokens: cache_result.uncached_input_tokens,
+        cache_read_billed: cache_result.cache_read_billed,
     };
 
     // 创建缓冲流处理上下文
     let mut ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
     ctx.set_cache_usage(cache_context);
+    // 计费完成后（流末尾 contextUsageEvent）把缩放后的 billed 累计回写缓存，供下次命中守恒。
+    ctx.set_billing_writeback(cache_tracker.clone(), cache_writeback);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(api_result.response, ctx);

@@ -132,8 +132,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
     | 'group'
     | 'last-used-desc'
     | 'last-used-asc'
+    | 'added-desc'
+    | 'added-asc'
+    | 'usage-desc'
+    | 'usage-asc'
   const SORT_OPTIONS: { key: SortKey; label: string }[] = [
     { key: 'default', label: '默认（优先级）' },
+    { key: 'added-desc', label: '添加顺序 · 新→旧' },
+    { key: 'added-asc', label: '添加顺序 · 旧→新' },
+    { key: 'usage-desc', label: '已用量 · 多→少' },
+    { key: 'usage-asc', label: '已用量 · 少→多' },
     { key: 'plan-desc', label: '订阅等级 · 高→低' },
     { key: 'plan-asc', label: '订阅等级 · 低→高' },
     { key: 'last-used-desc', label: '最近使用 · 最新→最旧' },
@@ -222,6 +230,32 @@ export function Dashboard({ onLogout }: DashboardProps) {
           if (!gb) return -1
           return ga.localeCompare(gb)
         }
+        if (a.priority !== b.priority) return a.priority - b.priority
+        return a.id - b.id
+      })
+    }
+
+    if (sortKey === 'added-desc' || sortKey === 'added-asc') {
+      // id 在添加凭据时自增分配（max+1），故 id 序即添加顺序：
+      // 升序 = 旧→新，降序 = 新→旧。
+      const desc = sortKey === 'added-desc'
+      return [...filtered].sort((a, b) => (desc ? b.id - a.id : a.id - b.id))
+    }
+
+    if (sortKey === 'usage-desc' || sortKey === 'usage-asc') {
+      // 按已用 credits 绝对值（currentUsage）排序。用量数据仅对查询过余额的
+      // 凭证可用，未查询的（balanceMap 无记录）无论升降序都排到末尾。
+      const desc = sortKey === 'usage-desc'
+      return [...filtered].sort((a, b) => {
+        const ua = balanceMap.get(a.id)?.currentUsage
+        const ub = balanceMap.get(b.id)?.currentUsage
+        if (ua == null && ub == null) {
+          if (a.priority !== b.priority) return a.priority - b.priority
+          return a.id - b.id
+        }
+        if (ua == null) return 1
+        if (ub == null) return -1
+        if (ua !== ub) return desc ? ub - ua : ua - ub
         if (a.priority !== b.priority) return a.priority - b.priority
         return a.id - b.id
       })

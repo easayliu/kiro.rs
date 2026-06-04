@@ -3,10 +3,12 @@
 //! 实现 Kiro → Anthropic 流式响应转换和 SSE 状态管理
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::json;
 use uuid::Uuid;
 
+use super::cache_tracker::{CacheTracker, CacheWriteback};
 use crate::kiro::model::events::Event;
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
@@ -280,34 +282,60 @@ pub struct CacheUsage {
 }
 
 impl CacheUsage {
-    /// 把基于本地估算口径的缓存拆分，按上游实际总量（contextUsageEvent）
-    /// 等比缩放到上游计量体系，使 cache_read / cache_creation / uncached 三者
-    /// 之和等于上游实际总量。
+    /// 计费口径拆分：在「总量精确」的前提下尽量做到「读写守恒」。
     ///
-    /// 本地 tokenizer（尤其中文）与上游 Claude tokenizer 计量不同，直接用上游
-    /// 实际总量减去本地估算的缓存量，会把这部分计量差额错算进 uncached（表现为
-    /// 即便完全命中缓存，uncached 仍有一大块固定值）。等比缩放后三者同处上游
-    /// 计量体系，避免该偏差。
+    /// 与 [`Self::scaled_to_upstream`] 的区别：cache_read **不再独立缩放**，而是钉到
+    /// `billed_read`（W：这段前缀上一次被计费时的 read+creation 之和，由命中条目持久化）。
+    /// 形式化：给定上游真实总量 `T`，输出 `(r, c, u)` 满足
+    /// - 总量精确：`r + c + u == T`（恒成立，c/u 由减法导出）
+    /// - 读写守恒：`r == W`（当 `W <= T`，即正常情况）
     ///
+    /// 唯一无法同时满足的退化情形是 `W > T`（前缀上次计费量比本次整个上游总量还大，
+    /// 只可能源于跨请求计量抖动）：此时 `r = min(W, T)` 截断，保总量精确、守恒尽力而为。
+    ///
+    /// `billed_read = None`（首次命中 / 前序计费未回写）时退回缩放本地 cache_read。
     /// `estimated_total <= 0` 或 `context_total <= 0` 时原样返回（无可用比例）。
-    pub(crate) fn scaled_to_upstream(&self, estimated_total: i32, context_total: i32) -> Self {
+    pub(crate) fn billed_split(
+        &self,
+        estimated_total: i32,
+        context_total: i32,
+        billed_read: Option<i32>,
+    ) -> Self {
         if estimated_total <= 0 || context_total <= 0 {
             return *self;
         }
         let scale = context_total as f64 / estimated_total as f64;
         let scale_one = |v: i32| ((v as f64 * scale).round() as i32).max(0);
 
-        let cache_read = scale_one(self.cache_read_input_tokens);
-        let cache_5m = scale_one(self.cache_creation_5m_input_tokens);
-        let cache_1h = scale_one(self.cache_creation_1h_input_tokens);
-        // cache_creation 以细分之和为准，保证 5m + 1h == cache_creation 不变量；
-        // 细分缺失但总量存在时（理论不会发生）退回直接缩放总量兜底。
-        let mut cache_creation = cache_5m + cache_1h;
-        if cache_creation == 0 && self.cache_creation_input_tokens > 0 {
-            cache_creation = scale_one(self.cache_creation_input_tokens);
-        }
-        // uncached 用减法兜底吸收 rounding 误差，确保三者之和恰为 context_total。
-        let uncached = (context_total - cache_read - cache_creation).max(0);
+        // r：钉到历史 billed 值（守恒）；无历史值时退回缩放本地估算。封顶到 T。
+        let cache_read = billed_read
+            .unwrap_or_else(|| scale_one(self.cache_read_input_tokens))
+            .clamp(0, context_total);
+
+        // 剩余 R = T - r 是「上游眼里的新增」，按本地 creation/uncached 比例劈分。
+        let remainder = context_total - cache_read;
+        let local_creation = self.cache_creation_input_tokens.max(0);
+        let local_uncached = self.uncached_input_tokens.max(0);
+        let split = |part: i32, denom: i32, total: i32| -> i32 {
+            if denom <= 0 {
+                return 0;
+            }
+            (((total as f64) * (part as f64) / (denom as f64)).round() as i32).clamp(0, total)
+        };
+        let cache_creation = split(local_creation, local_creation + local_uncached, remainder);
+        // uncached 减法兜底，确保三者之和恰为 context_total。
+        let uncached = remainder - cache_creation;
+
+        // creation 内部按本地 5m/1h 比例二次劈分（减法兜底保证 5m + 1h == creation）。
+        let local_5m = self.cache_creation_5m_input_tokens.max(0);
+        let local_1h = self.cache_creation_1h_input_tokens.max(0);
+        let cache_5m = if local_5m + local_1h > 0 {
+            split(local_5m, local_5m + local_1h, cache_creation)
+        } else {
+            // 细分缺失但 creation 存在（理论不会发生）：全部归 5m，与历史兜底一致。
+            cache_creation
+        };
+        let cache_1h = cache_creation - cache_5m;
 
         Self {
             cache_creation_input_tokens: cache_creation,
@@ -599,6 +627,12 @@ pub struct StreamContext {
     pub output_tokens: i32,
     /// Prompt caching 使用细分（由 handler 在 API 调用返回后注入）
     pub cache_usage: CacheUsage,
+    /// 命中条目持久化的「上游计费口径」累计 token（W）。计费时把 cache_read
+    /// 钉到该值以保证读写守恒；`None` 时回退到缩放本地估算。
+    cache_read_billed: Option<i32>,
+    /// 计费完成后的回写句柄：(tracker, writeback)。收到 contextUsageEvent 时，
+    /// 在 generate_final_events 里把缩放后的 billed 累计回写到缓存条目。
+    billing_writeback: Option<(Arc<CacheTracker>, CacheWriteback)>,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -636,6 +670,8 @@ impl StreamContext {
             context_input_tokens: None,
             output_tokens: 0,
             cache_usage: CacheUsage::default(),
+            cache_read_billed: None,
+            billing_writeback: None,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -657,6 +693,13 @@ impl StreamContext {
             cache_creation_1h_input_tokens: ctx.cache_creation_1h_input_tokens,
             uncached_input_tokens: ctx.uncached_input_tokens,
         };
+        self.cache_read_billed = ctx.cache_read_billed;
+    }
+
+    /// 注入计费完成后的回写句柄。收到 contextUsageEvent 时，generate_final_events
+    /// 会把缩放后的 billed 累计回写到缓存条目，供下次命中实现读写守恒。
+    pub fn set_billing_writeback(&mut self, tracker: Arc<CacheTracker>, writeback: CacheWriteback) {
+        self.billing_writeback = Some((tracker, writeback));
     }
 
     /// 生成 message_start 事件
@@ -1147,9 +1190,11 @@ impl StreamContext {
     /// 算出的本地拆分。
     fn billing_cache_usage(&self) -> CacheUsage {
         match self.context_input_tokens {
-            Some(context_total) => self
-                .cache_usage
-                .scaled_to_upstream(self.input_tokens, context_total),
+            Some(context_total) => self.cache_usage.billed_split(
+                self.input_tokens,
+                context_total,
+                self.cache_read_billed,
+            ),
             None => self.cache_usage,
         }
     }
@@ -1230,9 +1275,20 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
-        // 计费口径：有 contextUsageEvent 时把缓存拆分按上游实际总量等比缩放，
-        // 使 cache_* 与 uncached 同处上游计量体系；否则用本地估算拆分。
+        // 计费口径：有 contextUsageEvent 时钉住 cache_read 到历史 billed 值（守恒）、
+        // 剩余按本地比例劈给 creation/uncached（保总量精确）；否则用本地估算拆分。
         let billing = self.billing_cache_usage();
+
+        // 计费完成后回写 billed 累计到缓存条目（仅有上游真实总量时），供下次命中守恒。
+        if self.context_input_tokens.is_some() {
+            if let Some((tracker, writeback)) = &self.billing_writeback {
+                tracker.apply_billing_writeback(
+                    writeback,
+                    billing.cache_read_input_tokens,
+                    billing.cache_creation_input_tokens,
+                );
+            }
+        }
 
         // 把 cache usage 透传给 state_manager，让 message_delta 输出 cache_* 字段
         self.state_manager.set_final_usage(billing);
@@ -1286,6 +1342,11 @@ impl BufferedStreamContext {
     /// 注入 prompt caching 结果（透传到内部 StreamContext）
     pub fn set_cache_usage(&mut self, ctx: CacheUsageContext) {
         self.inner.set_cache_usage(ctx);
+    }
+
+    /// 注入计费回写句柄（透传到内部 StreamContext）
+    pub fn set_billing_writeback(&mut self, tracker: Arc<CacheTracker>, writeback: CacheWriteback) {
+        self.inner.set_billing_writeback(tracker, writeback);
     }
 
     /// 请求的模型名称（仅用于诊断日志）
@@ -2129,10 +2190,10 @@ mod tests {
         );
     }
 
-    /// scaled_to_upstream 纯函数：按上游实际总量等比缩放，三者之和 = 上游总量，
-    /// 且保留 5m/1h 细分与 cache_creation 的一致性。
+    /// billed_split：无历史 billed 值（None）时回退到缩放本地 cache_read，
+    /// 剩余按本地 creation/uncached 比例劈分，三者之和恰为上游总量。
     #[test]
-    fn scaled_to_upstream_scales_split_into_upstream_units() {
+    fn billed_split_falls_back_to_scaled_read_when_no_billed() {
         let estimated = CacheUsage {
             cache_creation_input_tokens: 300,
             cache_read_input_tokens: 200,
@@ -2140,38 +2201,94 @@ mod tests {
             cache_creation_1h_input_tokens: 0,
             uncached_input_tokens: 500,
         };
-        // 估算总量 1000，上游实际 2000 → scale = 2。
-        let scaled = estimated.scaled_to_upstream(1000, 2000);
-        assert_eq!(scaled.cache_read_input_tokens, 400);
-        assert_eq!(scaled.cache_creation_input_tokens, 600);
-        assert_eq!(scaled.cache_creation_5m_input_tokens, 600);
-        assert_eq!(scaled.cache_creation_1h_input_tokens, 0);
-        assert_eq!(scaled.uncached_input_tokens, 1000);
-        // 三者之和恰为上游实际总量。
+        // 估算总量 1000，上游实际 2000 → scale = 2，read 缩放为 400。
+        let split = estimated.billed_split(1000, 2000, None);
+        assert_eq!(split.cache_read_input_tokens, 400, "无 billed 值时缩放本地 read");
+        // 剩余 1600 按本地 creation:uncached = 300:500 劈分 → creation=600, uncached=1000。
+        assert_eq!(split.cache_creation_input_tokens, 600);
+        assert_eq!(split.uncached_input_tokens, 1000);
+        // 总量精确。
         assert_eq!(
-            scaled.cache_read_input_tokens
-                + scaled.cache_creation_input_tokens
-                + scaled.uncached_input_tokens,
+            split.cache_read_input_tokens
+                + split.cache_creation_input_tokens
+                + split.uncached_input_tokens,
             2000
         );
         // 5m + 1h == cache_creation 不变量。
         assert_eq!(
-            scaled.cache_creation_5m_input_tokens + scaled.cache_creation_1h_input_tokens,
-            scaled.cache_creation_input_tokens
+            split.cache_creation_5m_input_tokens + split.cache_creation_1h_input_tokens,
+            split.cache_creation_input_tokens
+        );
+    }
+
+    /// billed_split 核心：钉住 cache_read 到历史 billed 值（W），实现读写守恒，
+    /// 同时三者之和仍恰为上游实际总量。
+    #[test]
+    fn billed_split_pins_read_to_billed_and_preserves_total() {
+        let estimated = CacheUsage {
+            cache_creation_input_tokens: 300,
+            cache_read_input_tokens: 180, // 本地估算的 read（与历史 billed 不同）
+            cache_creation_5m_input_tokens: 300,
+            cache_creation_1h_input_tokens: 0,
+            uncached_input_tokens: 500,
+        };
+        // 上一次该前缀被计费为 W=450（上游口径），本次上游总量 T=2000。
+        let split = estimated.billed_split(1000, 2000, Some(450));
+        assert_eq!(
+            split.cache_read_input_tokens, 450,
+            "cache_read 必须原样钉到历史 billed 值（读写守恒）"
+        );
+        // 剩余 T-W = 1550 按 creation:uncached = 300:500 劈分。
+        assert_eq!(split.cache_creation_input_tokens + split.uncached_input_tokens, 1550);
+        // 总量精确：r + c + u == T。
+        assert_eq!(
+            split.cache_read_input_tokens
+                + split.cache_creation_input_tokens
+                + split.uncached_input_tokens,
+            2000
+        );
+        assert_eq!(
+            split.cache_creation_5m_input_tokens + split.cache_creation_1h_input_tokens,
+            split.cache_creation_input_tokens
+        );
+    }
+
+    /// billed_split 退化边界：W > T 时截断 r=min(W,T)=T，creation/uncached 归零，
+    /// 总量仍精确（守恒尽力而为）。
+    #[test]
+    fn billed_split_caps_read_when_billed_exceeds_total() {
+        let estimated = CacheUsage {
+            cache_creation_input_tokens: 100,
+            cache_read_input_tokens: 100,
+            cache_creation_5m_input_tokens: 100,
+            uncached_input_tokens: 50,
+            ..Default::default()
+        };
+        // 历史 billed W=3000 比本次上游总量 T=2000 还大。
+        let split = estimated.billed_split(1000, 2000, Some(3000));
+        assert_eq!(split.cache_read_input_tokens, 2000, "r 截断到 T");
+        assert_eq!(split.cache_creation_input_tokens, 0);
+        assert_eq!(split.uncached_input_tokens, 0);
+        assert_eq!(
+            split.cache_read_input_tokens
+                + split.cache_creation_input_tokens
+                + split.uncached_input_tokens,
+            2000,
+            "总量仍精确"
         );
     }
 
     /// estimated_total/context_total 非法（<=0）时原样返回。
     #[test]
-    fn scaled_to_upstream_noops_on_invalid_totals() {
+    fn billed_split_noops_on_invalid_totals() {
         let est = CacheUsage {
             cache_creation_input_tokens: 10,
             cache_read_input_tokens: 20,
             uncached_input_tokens: 30,
             ..Default::default()
         };
-        assert_eq!(est.scaled_to_upstream(0, 2000).uncached_input_tokens, 30);
-        assert_eq!(est.scaled_to_upstream(1000, 0).cache_read_input_tokens, 20);
+        assert_eq!(est.billed_split(0, 2000, Some(5)).uncached_input_tokens, 30);
+        assert_eq!(est.billed_split(1000, 0, Some(5)).cache_read_input_tokens, 20);
     }
 
     /// 无 contextUsageEvent 时，计费口径回退到 cache_tracker 的本地估算拆分。
@@ -2300,7 +2417,7 @@ mod tests {
             cache_creation_1h_input_tokens: 0,
             uncached_input_tokens: 500,
         }
-        .scaled_to_upstream(estimated_total, context_total);
+        .billed_split(estimated_total, context_total, None);
 
         let events = ctx.finish_and_get_all_events();
         let start = events

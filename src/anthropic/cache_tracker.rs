@@ -47,6 +47,28 @@ pub struct CacheResult {
     pub cache_creation_1h_input_tokens: i32,
     /// 最后 breakpoint 之后的未缓存 tokens，对应 Anthropic 返回的 input_tokens
     pub uncached_input_tokens: i32,
+    /// 命中条目里持久化的「上游计费口径」累计 token（即 W：这段前缀**上一次**
+    /// 被计费时的 read+creation 之和）。计费时应把 cache_read 直接钉到该值以保证
+    /// 读写守恒（不再二次缩放）；`None` 表示首次命中或前序请求计费尚未回写，
+    /// 回退到「缩放本地估算」。
+    pub cache_read_billed: Option<i32>,
+}
+
+/// `compute_and_update` 返回的回写句柄。
+///
+/// 计费要等 `contextUsageEvent`（响应阶段）才知道上游真实总量，因此本次写入的
+/// breakpoint 先只占位、不带 billed 值；待计费算完后用 [`CacheTracker::apply_billing_writeback`]
+/// 把缩放后的「上游计费口径累计 token」回写到对应条目，供下次命中原样读取（W）。
+#[derive(Debug, Clone, Default)]
+pub struct CacheWriteback {
+    /// 分桶 key（与写入时一致）
+    bucket_key: u64,
+    /// 本次写入的 breakpoint：(prefix_fingerprint, 本地累计 token)
+    written: Vec<([u8; 32], i32)>,
+    /// 本次命中的本地累计 token（matched_local）
+    matched_local: i32,
+    /// 最后一个可缓存 breakpoint 的本地累计 token
+    last_breakpoint_local: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +113,11 @@ struct CacheBreakpoint {
 struct CacheEntry {
     #[allow(dead_code)]
     token_count: i32,
+    /// 「上游计费口径」的累计 token（W）：本条目这段前缀上一次被计费时的
+    /// read+creation 之和。计费完成后由 [`CacheTracker::apply_billing_writeback`]
+    /// 回写；命中时原样返回作为 cache_read，保证读写守恒。`None` 表示尚未回写
+    /// （首次写入、或前序请求无 contextUsageEvent / 计费未完成）。
+    billed_cumulative: Option<i32>,
     ttl: Duration,
     expires_at: Instant,
     /// 命中或写入时刷新；容量淘汰按此字段升序删最久未用的 entry。
@@ -335,7 +362,11 @@ impl CacheTracker {
     /// 位置建立（写入），但下次请求无论 breakpoint 打在哪，都能从
     /// 之前建立的缓存位置命中 —— 对应到本实现里即从本次请求的所有
     /// block 前缀指纹（倒序扫描，取最长匹配）中找命中。
-    pub fn compute_and_update(&self, credential_id: u64, profile: &CacheProfile) -> CacheResult {
+    pub fn compute_and_update(
+        &self,
+        credential_id: u64,
+        profile: &CacheProfile,
+    ) -> (CacheResult, CacheWriteback) {
         let effective_id = self.effective_bucket_key(credential_id, profile);
         let breakpoints_info: Vec<(usize, i32)> = profile
             .cacheable_breakpoints()
@@ -351,10 +382,13 @@ impl CacheTracker {
                 total_input_tokens = profile.total_input_tokens,
                 "缓存分析：无可缓存 breakpoint，整段未缓存"
             );
-            return CacheResult {
-                uncached_input_tokens: profile.total_input_tokens,
-                ..Default::default()
-            };
+            return (
+                CacheResult {
+                    uncached_input_tokens: profile.total_input_tokens,
+                    ..Default::default()
+                },
+                CacheWriteback::default(),
+            );
         };
         let last_breakpoint_tokens = last_breakpoint
             .cumulative_tokens
@@ -366,6 +400,8 @@ impl CacheTracker {
 
         let mut matched_tokens = 0;
         let mut matched_block_index: Option<usize> = None;
+        // 命中条目持久化的上游计费口径累计 token（W），供计费时钉住 cache_read。
+        let mut matched_billed: Option<i32> = None;
         let skipped_lookup = self.should_skip_lookup();
 
         if skipped_lookup {
@@ -421,6 +457,7 @@ impl CacheTracker {
                 if let Some(entry) = bucket.get_mut(&fingerprint) {
                     entry.expires_at = now + entry.ttl;
                     entry.last_used_at = now;
+                    matched_billed = entry.billed_cumulative;
                 }
                 matched_tokens = cum_tokens;
                 matched_block_index = Some(idx);
@@ -431,10 +468,14 @@ impl CacheTracker {
 
         // 更新 checkpoint 表（在同一个锁范围内）。
         // 同位置重复写入时直接覆盖 ttl / expires_at，支持 1h → 5m 的 downgrade。
+        // 同时收集本次写入的 (fingerprint, 本地累计 token)，供计费完成后回写 billed_cumulative。
+        let mut written: Vec<([u8; 32], i32)> = Vec::new();
         let bucket = all_entries.entry(effective_id).or_default();
         for breakpoint in profile.cacheable_breakpoints() {
             let block = &profile.blocks[breakpoint.block_index];
             let next_expiry = now + breakpoint.ttl;
+            let cum_local = block.cumulative_tokens.min(profile.total_input_tokens);
+            written.push((block.prefix_fingerprint, cum_local));
 
             match bucket.get_mut(&block.prefix_fingerprint) {
                 Some(existing) => {
@@ -442,12 +483,15 @@ impl CacheTracker {
                     existing.ttl = breakpoint.ttl;
                     existing.expires_at = next_expiry;
                     existing.last_used_at = now;
+                    // billed_cumulative 保留已有值（由后续 apply_billing_writeback 更新）。
                 }
                 None => {
                     bucket.insert(
                         block.prefix_fingerprint,
                         CacheEntry {
                             token_count: block.cumulative_tokens,
+                            // 计费尚未发生，先占位；apply_billing_writeback 回写。
+                            billed_cumulative: None,
                             ttl: breakpoint.ttl,
                             expires_at: next_expiry,
                             last_used_at: now,
@@ -498,12 +542,74 @@ impl CacheTracker {
             "缓存计算结果"
         );
 
-        CacheResult {
-            cache_read_input_tokens: cache_read,
-            cache_creation_input_tokens: cache_creation,
-            cache_creation_5m_input_tokens: cache_5m,
-            cache_creation_1h_input_tokens: cache_1h,
-            uncached_input_tokens: uncached,
+        (
+            CacheResult {
+                cache_read_input_tokens: cache_read,
+                cache_creation_input_tokens: cache_creation,
+                cache_creation_5m_input_tokens: cache_5m,
+                cache_creation_1h_input_tokens: cache_1h,
+                uncached_input_tokens: uncached,
+                cache_read_billed: matched_billed,
+            },
+            CacheWriteback {
+                bucket_key: effective_id,
+                written,
+                matched_local: cache_read,
+                last_breakpoint_local: last_breakpoint_tokens,
+            },
+        )
+    }
+
+    /// 计费完成后，把缩放到「上游计费口径」的累计 token 回写到本次写入的条目，
+    /// 供下次命中原样读取（W），实现读写守恒。
+    ///
+    /// 采用**加法构建**而非整体重缩放：每个 breakpoint 的 billed 累计 =
+    /// `本次 billed_read`（命中前缀，沿用其历史 billed 值）+ `本次 billed_creation`
+    /// 按本地 token 占比分摊到该 breakpoint 的部分。这样长对话链里已缓存段始终保持
+    /// 它被创建那次的 billed 值，不会因后续请求 scale 变化被反复换算引入二阶漂移。
+    ///
+    /// 写入用 `existing.max(new)` 单调更新，保证幂等重写/TTL downgrade 不回退。
+    /// 仅在收到 `contextUsageEvent`（有上游真实总量）时调用；无 metering 的请求不回写，
+    /// 让对应前缀维持 `None` 并在下次命中时回退到缩放本地估算。
+    pub fn apply_billing_writeback(
+        &self,
+        writeback: &CacheWriteback,
+        billed_read: i32,
+        billed_creation: i32,
+    ) {
+        if writeback.written.is_empty() {
+            return;
+        }
+        let billed_read = billed_read.max(0);
+        let billed_creation = billed_creation.max(0);
+        let matched_local = writeback.matched_local.max(0);
+        let creation_span = (writeback.last_breakpoint_local - matched_local).max(0);
+
+        let mut all_entries = self.entries.lock();
+        let Some(bucket) = all_entries.get_mut(&writeback.bucket_key) else {
+            return;
+        };
+        for (fingerprint, cum_local) in &writeback.written {
+            let Some(entry) = bucket.get_mut(fingerprint) else {
+                continue;
+            };
+            let cum_local = *cum_local;
+            let new_billed = if cum_local > matched_local && creation_span > 0 {
+                // creation 区间：billed_read + 该 bp 覆盖的新增 token 按本地占比分摊 billed_creation。
+                let span = (cum_local.min(writeback.last_breakpoint_local) - matched_local).max(0);
+                let share = (billed_creation as f64) * (span as f64) / (creation_span as f64);
+                billed_read + share.round() as i32
+            } else if matched_local > 0 {
+                // matched 前缀内：按本地占比分摊 billed_read（与历史值取 max 后基本一致）。
+                let v = (billed_read as f64) * (cum_local as f64) / (matched_local as f64);
+                v.round() as i32
+            } else {
+                billed_read
+            };
+            entry.billed_cumulative = Some(match entry.billed_cumulative {
+                Some(existing) => existing.max(new_billed),
+                None => new_billed,
+            });
         }
     }
 }
@@ -1049,7 +1155,7 @@ mod tests {
         let req1 = build_request(&system, vec![turn1_user.clone()]);
         // 第一轮：token 数随便给个覆盖 min_cacheable（由内部重新估算）
         let profile1 = tracker.build_profile(&req1, 10_000);
-        let r1 = tracker.compute_and_update(credential_id, &profile1);
+        let (r1, _) = tracker.compute_and_update(credential_id, &profile1);
         assert_eq!(r1.cache_read_input_tokens, 0, "第一轮应全部 creation");
         assert!(
             r1.cache_creation_input_tokens > 0,
@@ -1071,7 +1177,7 @@ mod tests {
             vec![turn1_user, assistant, turn2_user],
         );
         let profile2 = tracker.build_profile(&req2, 12_000);
-        let r2 = tracker.compute_and_update(credential_id, &profile2);
+        let (r2, _) = tracker.compute_and_update(credential_id, &profile2);
 
         assert!(
             r2.cache_read_input_tokens > 0,
@@ -1102,7 +1208,7 @@ mod tests {
             })])],
         );
         let profile = tracker.build_profile(&req, 5_000);
-        let r = tracker.compute_and_update(7, &profile);
+        let (r, _) = tracker.compute_and_update(7, &profile);
         assert_eq!(r.cache_read_input_tokens, 0);
         assert_eq!(r.cache_creation_input_tokens, 0);
         assert_eq!(r.uncached_input_tokens, 5_000);
@@ -1122,18 +1228,101 @@ mod tests {
         let req = build_request(&system, vec![user]);
 
         let p1 = tracker.build_profile(&req, 10_000);
-        let r1 = tracker.compute_and_update(cred, &p1);
+        let (r1, _) = tracker.compute_and_update(cred, &p1);
         assert_eq!(r1.cache_read_input_tokens, 0);
         let creation = r1.cache_creation_input_tokens;
         assert!(creation > 0);
 
         let p2 = tracker.build_profile(&req, 10_000);
-        let r2 = tracker.compute_and_update(cred, &p2);
+        let (r2, _) = tracker.compute_and_update(cred, &p2);
         assert_eq!(
             r2.cache_read_input_tokens, creation,
             "完全相同的请求第二次应命中全部前缀"
         );
         assert_eq!(r2.cache_creation_input_tokens, 0);
+    }
+
+    /// 读写守恒核心：第一轮计费回写 billed_creation 后，第二轮命中时
+    /// cache_read_billed 应原样等于上一轮的 billed creation（与本地估算/缩放无关）。
+    #[test]
+    fn billed_writeback_makes_read_equal_previous_creation() {
+        let tracker = tracker();
+        let cred = 1;
+        let system = large_text("S ", LARGE_SYSTEM_CHARS);
+        let user = user_message(vec![json!({
+            "type": "text",
+            "text": "same text",
+            "cache_control": ephemeral_5m(),
+        })]);
+        let req = build_request(&system, vec![user]);
+
+        // Turn 1：首次请求，全部 creation，无命中、无历史 billed。
+        let p1 = tracker.build_profile(&req, 10_000);
+        let (r1, wb1) = tracker.compute_and_update(cred, &p1);
+        assert_eq!(r1.cache_read_input_tokens, 0);
+        assert_eq!(r1.cache_read_billed, None, "首轮无历史 billed");
+        assert!(r1.cache_creation_input_tokens > 0);
+
+        // 模拟计费：上游把这段前缀计为 billed_creation=7777（上游口径，read=0）后回写。
+        let billed_creation = 7777;
+        tracker.apply_billing_writeback(&wb1, 0, billed_creation);
+
+        // Turn 2：完全相同请求 → 命中，cache_read 的 billed 值应原样等于上一轮 creation。
+        let p2 = tracker.build_profile(&req, 12_000);
+        let (r2, _wb2) = tracker.compute_and_update(cred, &p2);
+        assert!(r2.cache_read_input_tokens > 0, "第二轮应命中");
+        assert_eq!(
+            r2.cache_read_billed,
+            Some(billed_creation),
+            "cache_read 的 billed 值应原样等于上一轮计费的 creation（读写守恒）"
+        );
+    }
+
+    /// 多轮链式守恒：turn2 命中 turn1 前缀并创建新段，billed 加法累积；
+    /// turn3 读整段时 cache_read_billed = turn1_read + turn2_creation（沿用历史 billed）。
+    #[test]
+    fn billed_writeback_accumulates_additively_across_turns() {
+        let tracker = tracker();
+        let cred = 1;
+        let system = large_text("SYS ", LARGE_SYSTEM_CHARS);
+        let turn1_user = user_message(vec![json!({
+            "type": "text",
+            "text": "first",
+            "cache_control": ephemeral_5m(),
+        })]);
+
+        // Turn 1：建立前缀，计费 creation=1000。
+        let req1 = build_request(&system, vec![turn1_user.clone()]);
+        let p1 = tracker.build_profile(&req1, 10_000);
+        let (_r1, wb1) = tracker.compute_and_update(cred, &p1);
+        tracker.apply_billing_writeback(&wb1, 0, 1000);
+
+        // Turn 2：命中 turn1 前缀（read），再追加新 user 打新 breakpoint（creation）。
+        let assistant = assistant_text("reply");
+        let turn2_user = user_message(vec![json!({
+            "type": "text",
+            "text": "second",
+            "cache_control": ephemeral_5m(),
+        })]);
+        let req2 = build_request(&system, vec![turn1_user, assistant, turn2_user]);
+        let p2 = tracker.build_profile(&req2, 12_000);
+        let (r2, wb2) = tracker.compute_and_update(cred, &p2);
+        assert_eq!(
+            r2.cache_read_billed,
+            Some(1000),
+            "turn2 读到的 billed = turn1 计费的 creation"
+        );
+        // turn2 计费：read=1000（钉住），新增 creation 计为 500。回写加法累积。
+        tracker.apply_billing_writeback(&wb2, 1000, 500);
+
+        // Turn 3：完全重复 turn2 → 整段命中，billed = 1000 + 500 = 1500。
+        let p3 = tracker.build_profile(&req2, 12_000);
+        let (r3, _wb3) = tracker.compute_and_update(cred, &p3);
+        assert_eq!(
+            r3.cache_read_billed,
+            Some(1500),
+            "turn3 读整段的 billed = turn1_read(1000) + turn2_creation(500)，加法累积无漂移"
+        );
     }
 
     /// 全局模式：不同 credential 共享缓存。
@@ -1150,11 +1339,11 @@ mod tests {
             })])],
         );
         let p = tracker.build_profile(&req, 10_000);
-        let r1 = tracker.compute_and_update(1, &p);
+        let (r1, _) = tracker.compute_and_update(1, &p);
         assert!(r1.cache_creation_input_tokens > 0);
 
         let p2 = tracker.build_profile(&req, 10_000);
-        let r2 = tracker.compute_and_update(2, &p2);
+        let (r2, _) = tracker.compute_and_update(2, &p2);
         assert_eq!(
             r2.cache_read_input_tokens, r1.cache_creation_input_tokens,
             "全局模式下 credential 2 应能命中 credential 1 建立的缓存"
@@ -1198,7 +1387,7 @@ mod tests {
         };
 
         let profile = tracker.build_profile(&req, 20_000);
-        let r = tracker.compute_and_update(1, &profile);
+        let (r, _) = tracker.compute_and_update(1, &profile);
 
         assert!(
             r.cache_creation_1h_input_tokens > 0,
@@ -1247,7 +1436,7 @@ mod tests {
         };
 
         let profile = tracker.build_profile(&req, 15_000);
-        let r = tracker.compute_and_update(1, &profile);
+        let (r, _) = tracker.compute_and_update(1, &profile);
         assert_eq!(r.cache_read_input_tokens, 0);
         assert_eq!(r.cache_creation_input_tokens, 0);
         assert_eq!(r.uncached_input_tokens, 15_000);
@@ -1284,12 +1473,12 @@ mod tests {
 
         let req1 = build(json!({"type": "auto"}));
         let p1 = tracker.build_profile(&req1, 10_000);
-        let r1 = tracker.compute_and_update(credential_id, &p1);
+        let (r1, _) = tracker.compute_and_update(credential_id, &p1);
         assert!(r1.cache_creation_input_tokens > 0);
 
         let req2 = build(json!({"type": "any"}));
         let p2 = tracker.build_profile(&req2, 10_000);
-        let r2 = tracker.compute_and_update(credential_id, &p2);
+        let (r2, _) = tracker.compute_and_update(credential_id, &p2);
         assert_eq!(
             r2.cache_read_input_tokens, 0,
             "tool_choice 变化应让 messages 段 breakpoint 完全未命中: {:?}",
@@ -1326,11 +1515,11 @@ mod tests {
         };
 
         let p1 = tracker.build_profile(&build(json!({"type": "auto"})), 6_000);
-        let r1 = tracker.compute_and_update(credential_id, &p1);
+        let (r1, _) = tracker.compute_and_update(credential_id, &p1);
         assert!(r1.cache_creation_input_tokens > 0);
 
         let p2 = tracker.build_profile(&build(json!({"type": "any"})), 6_000);
-        let r2 = tracker.compute_and_update(credential_id, &p2);
+        let (r2, _) = tracker.compute_and_update(credential_id, &p2);
         assert_eq!(
             r2.cache_read_input_tokens, r1.cache_creation_input_tokens,
             "tool_choice 变化不应失效 tools 段: {:?}",
@@ -1353,7 +1542,7 @@ mod tests {
         );
 
         let profile = tracker.build_profile(&req, 10_000);
-        let r = tracker.compute_and_update(1, &profile);
+        let (r, _) = tracker.compute_and_update(1, &profile);
         assert_eq!(r.cache_read_input_tokens, 0);
         assert_eq!(r.cache_creation_input_tokens, 0);
         assert_eq!(
@@ -1395,7 +1584,7 @@ mod tests {
         };
 
         let profile = tracker.build_profile(&req, 15_000);
-        let r = tracker.compute_and_update(1, &profile);
+        let (r, _) = tracker.compute_and_update(1, &profile);
         assert_eq!(r.cache_read_input_tokens, 0);
         assert_eq!(r.cache_creation_input_tokens, 0);
         assert_eq!(r.uncached_input_tokens, 15_000);
@@ -1425,11 +1614,11 @@ mod tests {
         };
 
         let p1 = tracker.build_profile(&build(true), 10_000);
-        let r1 = tracker.compute_and_update(1, &p1);
+        let (r1, _) = tracker.compute_and_update(1, &p1);
         assert!(r1.cache_creation_1h_input_tokens > 0, "首轮应写入 1h 桶");
 
         let p2 = tracker.build_profile(&build(false), 10_000);
-        let r2 = tracker.compute_and_update(1, &p2);
+        let (r2, _) = tracker.compute_and_update(1, &p2);
         assert!(
             r2.cache_read_input_tokens > 0,
             "覆盖写入时仍能命中之前的 entry"
@@ -1461,11 +1650,11 @@ mod tests {
         );
 
         let p1 = tracker.build_profile(&req, 10_000);
-        let r1 = tracker.compute_and_update(7, &p1);
+        let (r1, _) = tracker.compute_and_update(7, &p1);
         assert!(r1.cache_creation_input_tokens > 0);
 
         let p2 = tracker.build_profile(&req, 10_000);
-        let r2 = tracker.compute_and_update(99, &p2);
+        let (r2, _) = tracker.compute_and_update(99, &p2);
         assert_eq!(
             r2.cache_read_input_tokens, r1.cache_creation_input_tokens,
             "同一用户身份跨 credential 应共享 cache: {:?}",
@@ -1486,12 +1675,12 @@ mod tests {
 
         let req_a = build_request_with_metadata(&sys, user.clone(), make_metadata("dev-alice", "acct-a", "sess-a"));
         let p_a = tracker.build_profile(&req_a, 10_000);
-        let r_a = tracker.compute_and_update(1, &p_a);
+        let (r_a, _) = tracker.compute_and_update(1, &p_a);
         assert!(r_a.cache_creation_input_tokens > 0);
 
         let req_b = build_request_with_metadata(&sys, user, make_metadata("dev-bob", "acct-b", "sess-b"));
         let p_b = tracker.build_profile(&req_b, 10_000);
-        let r_b = tracker.compute_and_update(1, &p_b);
+        let (r_b, _) = tracker.compute_and_update(1, &p_b);
         assert_eq!(
             r_b.cache_read_input_tokens, 0,
             "不同用户身份应相互隔离: {:?}",
@@ -1516,11 +1705,11 @@ mod tests {
         );
 
         let p1 = tracker.build_profile(&req, 10_000);
-        let r1 = tracker.compute_and_update(1, &p1);
+        let (r1, _) = tracker.compute_and_update(1, &p1);
         assert!(r1.cache_creation_input_tokens > 0);
 
         let p2 = tracker.build_profile(&req, 10_000);
-        let r2 = tracker.compute_and_update(2, &p2);
+        let (r2, _) = tracker.compute_and_update(2, &p2);
         assert_eq!(
             r2.cache_read_input_tokens, 0,
             "PerCredential 模式下即使同一用户身份也按 credential 隔离: {:?}",
@@ -1554,7 +1743,7 @@ mod tests {
             metadata: None,
         };
         let p1 = tracker.build_profile(&req1, 10_000);
-        let r1 = tracker.compute_and_update(credential_id, &p1);
+        let (r1, _) = tracker.compute_and_update(credential_id, &p1);
         assert!(
             r1.cache_creation_input_tokens > 0,
             "turn 1 应为 system 建立缓存"
@@ -1590,7 +1779,7 @@ mod tests {
             metadata: None,
         };
         let p2 = tracker.build_profile(&req2, 15_000);
-        let r2 = tracker.compute_and_update(credential_id, &p2);
+        let (r2, _) = tracker.compute_and_update(credential_id, &p2);
 
         assert_eq!(
             r2.cache_read_input_tokens, system_tokens,
@@ -1616,7 +1805,7 @@ mod tests {
         tracker.compute_and_update(1, &p);
 
         let p2 = tracker.build_profile(&req, 10_000);
-        let r = tracker.compute_and_update(2, &p2);
+        let (r, _) = tracker.compute_and_update(2, &p2);
         assert_eq!(
             r.cache_read_input_tokens, 0,
             "按凭据隔离模式下 credential 2 应看不到 credential 1 的缓存"
