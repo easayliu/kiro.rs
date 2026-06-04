@@ -18,6 +18,7 @@ import type {
   BatchSetOverageResponse,
   DefaultRpmLimitResponse,
   MeResponse,
+  BillingStatsResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -282,5 +283,11 @@ export async function getDefaultRpmLimit(): Promise<DefaultRpmLimitResponse> {
 
 export async function setDefaultRpmLimit(rpmLimit: number | null): Promise<DefaultRpmLimitResponse> {
   const { data } = await api.put<DefaultRpmLimitResponse>('/config/default-rpm-limit', { rpmLimit })
+  return data
+}
+
+// 获取计费累计统计
+export async function getBillingStats(): Promise<BillingStatsResponse> {
+  const { data } = await api.get<BillingStatsResponse>('/billing-stats')
   return data
 }

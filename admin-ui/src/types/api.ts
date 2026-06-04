@@ -192,3 +192,15 @@ export interface DefaultRpmLimitResponse {
   /** 全局默认 RPM（null=未配置；0=显式不限流；正整数=限制） */
   rpmLimit: number | null
 }
+
+// 计费累计统计（进程维度，落盘到 billing_stats.json）
+export interface BillingStatsResponse {
+  /** 累计请求数 */
+  requests: number
+  /** 累计实际成本（USD，上游折扣后真实成本） */
+  actual_cost_usd: number
+  /** 累计官方折算价（USD，Anthropic 零售价） */
+  official_price_usd: number
+  /** 累计毛利（USD，official − actual，可为负） */
+  margin_usd: number
+}

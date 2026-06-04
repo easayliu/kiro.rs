@@ -30,6 +30,7 @@ import {
   batchSetDisabled,
   getDefaultRpmLimit,
   setDefaultRpmLimit,
+  getBillingStats,
 } from '@/api/credentials'
 import type { AddCredentialRequest, UpsertProxyGroupRequest } from '@/types/api'
 
@@ -352,5 +353,14 @@ export function useSetDefaultRpmLimit() {
       queryClient.invalidateQueries({ queryKey: ['default-rpm-limit'] })
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
+  })
+}
+
+// 计费累计统计（每 30 秒轮询刷新）
+export function useBillingStats() {
+  return useQuery({
+    queryKey: ['billing-stats'],
+    queryFn: getBillingStats,
+    refetchInterval: 30000,
   })
 }

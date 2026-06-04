@@ -52,6 +52,7 @@ import {
   useBatchSetOverage,
   useDefaultRpmLimit,
   useSetDefaultRpmLimit,
+  useBillingStats,
 } from '@/hooks/use-credentials'
 import type { CacheScope } from '@/api/credentials'
 import {
@@ -180,6 +181,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const batchSetOverageMutation = useBatchSetOverage()
   const { data: defaultRpmData } = useDefaultRpmLimit()
   const setDefaultRpmMutation = useSetDefaultRpmLimit()
+  const { data: billingStats } = useBillingStats()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const { data: cacheScopeData, isLoading: isLoadingCacheScope } = useCacheScope()
@@ -878,6 +880,38 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </button>
             </div>
           </section>
+
+          {/* ━━━━━━━━━━━━ BILLING SUMMARY ━━━━━━━━━━━━ */}
+          {billingStats && (
+            <section className="mb-5 sm:mb-6">
+              <div className="grid grid-cols-2 gap-2.5 sm:gap-3 lg:grid-cols-4">
+                <BillingStatCard
+                  label="累计请求"
+                  value={billingStats.requests.toLocaleString('en-US')}
+                />
+                <BillingStatCard
+                  label="实际成本"
+                  value={formatUsd(billingStats.actual_cost_usd)}
+                  hint="上游折扣后真实成本"
+                />
+                <BillingStatCard
+                  label="官方折算"
+                  value={formatUsd(billingStats.official_price_usd)}
+                  hint="Anthropic 零售价"
+                />
+                <BillingStatCard
+                  label="累计毛利"
+                  value={formatUsd(billingStats.margin_usd)}
+                  hint={
+                    billingStats.official_price_usd > 0
+                      ? `毛利率 ${((billingStats.margin_usd / billingStats.official_price_usd) * 100).toFixed(1)}%`
+                      : undefined
+                  }
+                  emphasis={billingStats.margin_usd >= 0 ? 'good' : 'bad'}
+                />
+              </div>
+            </section>
+          )}
 
           {/* ━━━━━━━━━━━━ CONTENT ━━━━━━━━━━━━ */}
           <section>
@@ -1593,6 +1627,43 @@ export function Dashboard({ onLogout }: DashboardProps) {
 }
 
 // ─── Primitives ───
+
+// 格式化 USD 金额：自适应小数位（小额保留更多位以免显示为 $0.00）
+function formatUsd(usd: number): string {
+  const abs = Math.abs(usd)
+  const digits = abs >= 100 ? 2 : abs >= 1 ? 3 : 4
+  const sign = usd < 0 ? '-' : ''
+  return `${sign}$${abs.toLocaleString('en-US', {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  })}`
+}
+
+// 计费汇总卡片
+function BillingStatCard({
+  label, value, hint, emphasis = 'default',
+}: {
+  label: string
+  value: string
+  hint?: string
+  emphasis?: 'default' | 'good' | 'bad'
+}) {
+  const valueColor =
+    emphasis === 'good' ? 'text-ok' : emphasis === 'bad' ? 'text-bad' : 'text-foreground'
+  return (
+    <div className="rounded-xl border border-border bg-card px-3.5 py-3 sm:px-4 sm:py-3.5">
+      <div className="text-2xs font-medium uppercase tracking-wider text-muted-foreground">
+        {label}
+      </div>
+      <div className={cn('tnum mt-1 text-lg font-semibold tracking-tight sm:text-xl', valueColor)}>
+        {value}
+      </div>
+      {hint && (
+        <div className="mt-0.5 truncate font-mono text-2xs text-muted-foreground/70">{hint}</div>
+      )}
+    </div>
+  )
+}
 
 function MobileIconBtn({
   children, onClick, label, title,
