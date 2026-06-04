@@ -279,6 +279,46 @@ pub struct CacheUsage {
     pub uncached_input_tokens: i32,
 }
 
+impl CacheUsage {
+    /// 把基于本地估算口径的缓存拆分，按上游实际总量（contextUsageEvent）
+    /// 等比缩放到上游计量体系，使 cache_read / cache_creation / uncached 三者
+    /// 之和等于上游实际总量。
+    ///
+    /// 本地 tokenizer（尤其中文）与上游 Claude tokenizer 计量不同，直接用上游
+    /// 实际总量减去本地估算的缓存量，会把这部分计量差额错算进 uncached（表现为
+    /// 即便完全命中缓存，uncached 仍有一大块固定值）。等比缩放后三者同处上游
+    /// 计量体系，避免该偏差。
+    ///
+    /// `estimated_total <= 0` 或 `context_total <= 0` 时原样返回（无可用比例）。
+    pub(crate) fn scaled_to_upstream(&self, estimated_total: i32, context_total: i32) -> Self {
+        if estimated_total <= 0 || context_total <= 0 {
+            return *self;
+        }
+        let scale = context_total as f64 / estimated_total as f64;
+        let scale_one = |v: i32| ((v as f64 * scale).round() as i32).max(0);
+
+        let cache_read = scale_one(self.cache_read_input_tokens);
+        let cache_5m = scale_one(self.cache_creation_5m_input_tokens);
+        let cache_1h = scale_one(self.cache_creation_1h_input_tokens);
+        // cache_creation 以细分之和为准，保证 5m + 1h == cache_creation 不变量；
+        // 细分缺失但总量存在时（理论不会发生）退回直接缩放总量兜底。
+        let mut cache_creation = cache_5m + cache_1h;
+        if cache_creation == 0 && self.cache_creation_input_tokens > 0 {
+            cache_creation = scale_one(self.cache_creation_input_tokens);
+        }
+        // uncached 用减法兜底吸收 rounding 误差，确保三者之和恰为 context_total。
+        let uncached = (context_total - cache_read - cache_creation).max(0);
+
+        Self {
+            cache_creation_input_tokens: cache_creation,
+            cache_read_input_tokens: cache_read,
+            cache_creation_5m_input_tokens: cache_5m,
+            cache_creation_1h_input_tokens: cache_1h,
+            uncached_input_tokens: uncached,
+        }
+    }
+}
+
 /// SSE 状态管理器
 ///
 /// 确保 SSE 事件序列符合 Claude API 规范：
@@ -1099,6 +1139,21 @@ impl StreamContext {
     }
 
     /// 生成最终事件序列
+    /// 计费口径的缓存使用量。
+    ///
+    /// 有 contextUsageEvent 时，把本地估算的缓存拆分按上游实际总量等比缩放，
+    /// 使 cache_* 与 uncached 全部落在上游计量体系（见
+    /// [`CacheUsage::scaled_to_upstream`]）；否则用 cache_tracker 基于请求估算
+    /// 算出的本地拆分。
+    fn billing_cache_usage(&self) -> CacheUsage {
+        match self.context_input_tokens {
+            Some(context_total) => self
+                .cache_usage
+                .scaled_to_upstream(self.input_tokens, context_total),
+            None => self.cache_usage,
+        }
+    }
+
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -1175,13 +1230,17 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
-        // 把 cache usage 透传给 state_manager，让 message_delta 输出 cache_* 字段
-        self.state_manager.set_final_usage(self.cache_usage);
+        // 计费口径：有 contextUsageEvent 时把缓存拆分按上游实际总量等比缩放，
+        // 使 cache_* 与 uncached 同处上游计量体系；否则用本地估算拆分。
+        let billing = self.billing_cache_usage();
 
-        // 生成最终事件（input_tokens 使用 uncached_input_tokens，对齐 Anthropic
+        // 把 cache usage 透传给 state_manager，让 message_delta 输出 cache_* 字段
+        self.state_manager.set_final_usage(billing);
+
+        // 生成最终事件（input_tokens 用计费口径的 uncached；对齐 Anthropic
         // 行为保底 1：即使 breakpoint 之后无新内容，官方也不会返回 0）
         events.extend(self.state_manager.generate_final_events(
-            self.cache_usage.uncached_input_tokens.max(1),
+            billing.uncached_input_tokens.max(1),
             self.output_tokens,
         ));
         events
@@ -1269,12 +1328,38 @@ impl BufferedStreamContext {
             self.initial_events_generated = true;
         }
 
-        // 生成最终事件
+        // 生成最终事件（message_delta 已在内部用计费值生成）
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        // uncached_input_tokens 已由 cache_tracker 在 build_profile 阶段计算好，
-        // message_start 中的 input_tokens 已经是正确的 uncached 值，无需更正。
+        // message_start 是流开始时用本地估算口径缓冲的；若收到 contextUsageEvent，
+        // 用计费口径（按上游实际总量缩放后的 cache_* 与 uncached）整体回填其 usage，
+        // 使 message_start 与 message_delta 一致。
+        let billing = self.inner.billing_cache_usage();
+        for event in &mut self.event_buffer {
+            if event.event != "message_start" {
+                continue;
+            }
+            if let Some(message) = event
+                .data
+                .get_mut("message")
+                .and_then(|message| message.as_object_mut())
+            {
+                message.insert(
+                    "usage".to_string(),
+                    serde_json::json!({
+                        "input_tokens": billing.uncached_input_tokens.max(1),
+                        "output_tokens": 1,
+                        "cache_creation_input_tokens": billing.cache_creation_input_tokens,
+                        "cache_read_input_tokens": billing.cache_read_input_tokens,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": billing.cache_creation_5m_input_tokens,
+                            "ephemeral_1h_input_tokens": billing.cache_creation_1h_input_tokens,
+                        }
+                    }),
+                );
+            }
+        }
 
         std::mem::take(&mut self.event_buffer)
     }
@@ -2041,6 +2126,210 @@ mod tests {
         assert_eq!(
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
+        );
+    }
+
+    /// scaled_to_upstream 纯函数：按上游实际总量等比缩放，三者之和 = 上游总量，
+    /// 且保留 5m/1h 细分与 cache_creation 的一致性。
+    #[test]
+    fn scaled_to_upstream_scales_split_into_upstream_units() {
+        let estimated = CacheUsage {
+            cache_creation_input_tokens: 300,
+            cache_read_input_tokens: 200,
+            cache_creation_5m_input_tokens: 300,
+            cache_creation_1h_input_tokens: 0,
+            uncached_input_tokens: 500,
+        };
+        // 估算总量 1000，上游实际 2000 → scale = 2。
+        let scaled = estimated.scaled_to_upstream(1000, 2000);
+        assert_eq!(scaled.cache_read_input_tokens, 400);
+        assert_eq!(scaled.cache_creation_input_tokens, 600);
+        assert_eq!(scaled.cache_creation_5m_input_tokens, 600);
+        assert_eq!(scaled.cache_creation_1h_input_tokens, 0);
+        assert_eq!(scaled.uncached_input_tokens, 1000);
+        // 三者之和恰为上游实际总量。
+        assert_eq!(
+            scaled.cache_read_input_tokens
+                + scaled.cache_creation_input_tokens
+                + scaled.uncached_input_tokens,
+            2000
+        );
+        // 5m + 1h == cache_creation 不变量。
+        assert_eq!(
+            scaled.cache_creation_5m_input_tokens + scaled.cache_creation_1h_input_tokens,
+            scaled.cache_creation_input_tokens
+        );
+    }
+
+    /// estimated_total/context_total 非法（<=0）时原样返回。
+    #[test]
+    fn scaled_to_upstream_noops_on_invalid_totals() {
+        let est = CacheUsage {
+            cache_creation_input_tokens: 10,
+            cache_read_input_tokens: 20,
+            uncached_input_tokens: 30,
+            ..Default::default()
+        };
+        assert_eq!(est.scaled_to_upstream(0, 2000).uncached_input_tokens, 30);
+        assert_eq!(est.scaled_to_upstream(1000, 0).cache_read_input_tokens, 20);
+    }
+
+    /// 无 contextUsageEvent 时，计费口径回退到 cache_tracker 的本地估算拆分。
+    #[test]
+    fn billing_falls_back_to_estimated_split_without_context_event() {
+        use super::super::handlers::CacheUsageContext;
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1000, false, HashMap::new());
+        ctx.set_cache_usage(CacheUsageContext {
+            cache_creation_input_tokens: 300,
+            cache_read_input_tokens: 200,
+            cache_creation_5m_input_tokens: 300,
+            uncached_input_tokens: 500,
+            ..Default::default()
+        });
+
+        let billing = ctx.billing_cache_usage();
+        assert_eq!(billing.uncached_input_tokens, 500);
+        assert_eq!(billing.cache_read_input_tokens, 200);
+        assert_eq!(billing.cache_creation_input_tokens, 300);
+
+        let _ = ctx.generate_initial_events();
+        let events = ctx.generate_final_events();
+        let message_delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta");
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 500);
+        assert_eq!(message_delta.data["usage"]["cache_read_input_tokens"], 200);
+    }
+
+    /// 有 contextUsageEvent 时，message_delta 的 usage 用上游实际计量（等比缩放）。
+    #[test]
+    fn billing_scales_split_to_upstream_when_event_present() {
+        use super::super::handlers::CacheUsageContext;
+
+        // 估算总量 1000；上游实际 2000 → scale = 2。
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1000, false, HashMap::new());
+        ctx.set_cache_usage(CacheUsageContext {
+            cache_creation_input_tokens: 300,
+            cache_read_input_tokens: 200,
+            cache_creation_5m_input_tokens: 300,
+            uncached_input_tokens: 500,
+            ..Default::default()
+        });
+        ctx.context_input_tokens = Some(2000);
+
+        let billing = ctx.billing_cache_usage();
+        assert_eq!(billing.uncached_input_tokens, 1000);
+        assert_eq!(billing.cache_read_input_tokens, 400);
+        assert_eq!(billing.cache_creation_input_tokens, 600);
+
+        let _ = ctx.generate_initial_events();
+        let events = ctx.generate_final_events();
+        let message_delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta");
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 1000);
+        assert_eq!(message_delta.data["usage"]["cache_read_input_tokens"], 400);
+        assert_eq!(
+            message_delta.data["usage"]["cache_creation_input_tokens"],
+            600
+        );
+    }
+
+    /// 全部内容都命中缓存（估算 uncached=0）时，缩放后 uncached=0，message_delta 保底 1。
+    #[test]
+    fn billing_floors_reported_uncached_at_one_when_fully_cached() {
+        use super::super::handlers::CacheUsageContext;
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1000, false, HashMap::new());
+        ctx.set_cache_usage(CacheUsageContext {
+            cache_creation_input_tokens: 500,
+            cache_read_input_tokens: 500,
+            cache_creation_5m_input_tokens: 500,
+            uncached_input_tokens: 0,
+            ..Default::default()
+        });
+        ctx.context_input_tokens = Some(2000);
+
+        // 缩放后 uncached 仍为 0（全部是缓存）。
+        assert_eq!(ctx.billing_cache_usage().uncached_input_tokens, 0);
+
+        let _ = ctx.generate_initial_events();
+        let events = ctx.generate_final_events();
+        let message_delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta");
+        // 对外报告保底 1（对齐 Anthropic：不返回 0）。
+        assert_eq!(message_delta.data["usage"]["input_tokens"], 1);
+    }
+
+    /// 缓冲流：收到 contextUsageEvent 后，message_start 与 message_delta 的
+    /// 整个 usage（input_tokens + cache_*）都用上游计量且彼此一致。
+    #[test]
+    fn buffered_stream_rewrites_message_start_with_scaled_usage() {
+        use super::super::handlers::CacheUsageContext;
+
+        let estimated_total = 1000;
+        let mut ctx =
+            BufferedStreamContext::new("test-model", estimated_total, false, HashMap::new());
+        ctx.set_cache_usage(CacheUsageContext {
+            cache_creation_input_tokens: 300,
+            cache_read_input_tokens: 200,
+            cache_creation_5m_input_tokens: 300,
+            uncached_input_tokens: 500,
+            ..Default::default()
+        });
+
+        // 首个事件即触发 message_start 缓冲；喂入 contextUsageEvent 提供上游总量。
+        ctx.process_and_buffer(&Event::ContextUsage(
+            crate::kiro::model::events::ContextUsageEvent {
+                context_usage_percentage: 50.0,
+            },
+        ));
+
+        let window = super::super::converter::get_context_window_size("test-model");
+        let context_total = (50.0 * window as f64 / 100.0) as i32;
+        // 用相同公式算期望值，避免硬编码窗口大小。
+        let expected = CacheUsage {
+            cache_creation_input_tokens: 300,
+            cache_read_input_tokens: 200,
+            cache_creation_5m_input_tokens: 300,
+            cache_creation_1h_input_tokens: 0,
+            uncached_input_tokens: 500,
+        }
+        .scaled_to_upstream(estimated_total, context_total);
+
+        let events = ctx.finish_and_get_all_events();
+        let start = events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .expect("should have message_start");
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta");
+
+        let start_usage = &start.data["message"]["usage"];
+        assert_eq!(
+            start_usage["input_tokens"],
+            expected.uncached_input_tokens.max(1)
+        );
+        assert_eq!(
+            start_usage["cache_read_input_tokens"],
+            expected.cache_read_input_tokens
+        );
+        assert_eq!(
+            start_usage["cache_creation_input_tokens"],
+            expected.cache_creation_input_tokens
+        );
+        // message_start 与 message_delta 的 input_tokens 一致。
+        assert_eq!(start_usage["input_tokens"], delta.data["usage"]["input_tokens"]);
+        assert_eq!(
+            delta.data["usage"]["cache_read_input_tokens"],
+            expected.cache_read_input_tokens
         );
     }
 }

@@ -27,7 +27,7 @@ use std::sync::Arc;
 use super::cache_tracker::{CacheProfile, CacheTracker};
 use super::converter::{ConversionError, KIRO_MAX_REQUEST_BYTES, convert_request};
 use super::middleware::AppState;
-use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
+use super::stream::{BufferedStreamContext, CacheUsage, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse};
 use super::websearch;
 use crate::kiro::binding::BindingTable;
@@ -767,7 +767,7 @@ async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
-    _input_tokens: i32,
+    estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     cache_tracker: Arc<CacheTracker>,
@@ -823,6 +823,9 @@ async fn handle_non_stream_request(
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
+    // contextUsageEvent 算出的上游实际输入 token 总量（含注入的 system prompt）。
+    // 用于计费时重算未缓存 token，比基于用户请求的估算更贴近上游真实用量。
+    let mut context_input_tokens: Option<i32> = None;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -886,6 +889,7 @@ async fn handle_non_stream_request(
                                 * (window_size as f64)
                                 / 100.0)
                                 as i32;
+                            context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
@@ -949,9 +953,27 @@ async fn handle_non_stream_request(
     // 估算输出 tokens
     let output_tokens = token::estimate_output_tokens(&content);
 
+    // 计费口径的缓存使用量：有 contextUsageEvent 时把本地估算的缓存拆分按上游
+    // 实际总量等比缩放，使 cache_* 与 uncached 全部落在上游计量体系（三者之和
+    // = 上游实际总量）；否则用 cache_tracker 基于请求估算算出的本地拆分。
+    let estimated_usage = CacheUsage {
+        cache_creation_input_tokens: cache_context.cache_creation_input_tokens,
+        cache_read_input_tokens: cache_context.cache_read_input_tokens,
+        cache_creation_5m_input_tokens: cache_context.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: cache_context.cache_creation_1h_input_tokens,
+        uncached_input_tokens: cache_context.uncached_input_tokens,
+    };
+    let billing = match context_input_tokens {
+        Some(context_total) => {
+            estimated_usage.scaled_to_upstream(estimated_input_tokens, context_total)
+        }
+        None => estimated_usage,
+    };
+    let billed_input_tokens = billing.uncached_input_tokens.max(1);
+
     tracing::info!(
         model = %model,
-        input_tokens = cache_context.uncached_input_tokens.max(1),
+        input_tokens = billed_input_tokens,
         output_tokens,
         "请求完成（非流式）"
     );
@@ -966,13 +988,13 @@ async fn handle_non_stream_request(
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
-            "input_tokens": cache_context.uncached_input_tokens.max(1),
+            "input_tokens": billed_input_tokens,
             "output_tokens": output_tokens,
-            "cache_creation_input_tokens": cache_context.cache_creation_input_tokens,
-            "cache_read_input_tokens": cache_context.cache_read_input_tokens,
+            "cache_creation_input_tokens": billing.cache_creation_input_tokens,
+            "cache_read_input_tokens": billing.cache_read_input_tokens,
             "cache_creation": {
-                "ephemeral_5m_input_tokens": cache_context.cache_creation_5m_input_tokens,
-                "ephemeral_1h_input_tokens": cache_context.cache_creation_1h_input_tokens,
+                "ephemeral_5m_input_tokens": billing.cache_creation_5m_input_tokens,
+                "ephemeral_1h_input_tokens": billing.cache_creation_1h_input_tokens,
             }
         }
     });
