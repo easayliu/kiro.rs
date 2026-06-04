@@ -153,13 +153,6 @@ impl BillingStats {
         }
     }
 
-    /// 强制落盘（用于进程退出前 flush，忽略 debounce）。
-    pub fn flush(&self) {
-        if self.dirty.load(Ordering::Relaxed) {
-            self.save();
-        }
-    }
-
     /// 读取当前累计快照（用于查询接口）。
     pub fn snapshot(&self) -> BillingStatsSnapshot {
         let actual_micro = self.actual_cost_micro.load(Ordering::Relaxed);
