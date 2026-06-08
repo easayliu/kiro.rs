@@ -1183,6 +1183,57 @@ impl MultiTokenManager {
         Some(result)
     }
 
+    /// 是否存在至少一个"鲜活"凭据（未禁用、未冷却、RPM 未耗尽、支持目标模型）。
+    ///
+    /// 用于 429 退避决策：刚被限流的凭据已由 `report_throttled` 打上
+    /// `throttled_until`，本方法会自然把它排除。若仍有其它鲜活凭据可立即切换，
+    /// 则当前请求无需在首字（TTFT）关键路径上做退避 sleep，直接换号重试即可——
+    /// 退避只对"无替补、只能等同一账号冷却结束"的情形才有意义。
+    ///
+    /// 鲜活性判定与 `select_next_credential` 的 `best_fresh` 分支保持一致。
+    pub fn has_fresh_credential(&self, model: Option<&str>) -> bool {
+        let entries = self.entries.lock();
+
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+
+        let now = Utc::now();
+        let rpm_active = self.rpm_feature_enabled.load(Ordering::Relaxed);
+        let rpm_cutoff = now - Duration::seconds(RPM_WINDOW_SECS);
+        // 锁顺序与 select_next_credential 一致：entries → default_rpm_limit
+        let default_rpm = if rpm_active {
+            *self.default_rpm_limit.lock()
+        } else {
+            None
+        };
+
+        entries.iter().any(|entry| {
+            if entry.disabled {
+                return false;
+            }
+            if is_opus && !entry.credentials.supports_opus() {
+                return false;
+            }
+            if entry.throttled_until.is_some_and(|until| until > now) {
+                return false;
+            }
+            if rpm_active {
+                if let Some(limit) = effective_rpm_limit(&entry.credentials, default_rpm) {
+                    let count = entry
+                        .rpm_window
+                        .iter()
+                        .filter(|t| **t > rpm_cutoff)
+                        .count();
+                    if count >= limit as usize {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文

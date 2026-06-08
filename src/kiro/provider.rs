@@ -883,7 +883,16 @@ impl KiroProvider {
                     api_type: api_type.to_string(),
                 }));
                 if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt)).await;
+                    // 429 退避只在"没有其它鲜活凭据、只能等同一账号冷却"时才付出。
+                    // 刚被限流的凭据已打 throttled_until，若仍有其它未冷却凭据可立即
+                    // 切换，则跳过 sleep 直接换号重试，避免把退避时间叠加进流式首字
+                    // （TTFT）关键路径。408/5xx 多为上游整体瞬态，换号未必有用且退避
+                    // 能避免连环打爆上游，故仍保留退避。
+                    let skip_backoff = status.as_u16() == 429
+                        && self.token_manager.has_fresh_credential(model.as_deref());
+                    if !skip_backoff {
+                        sleep(Self::retry_delay(attempt)).await;
+                    }
                 }
                 continue;
             }
