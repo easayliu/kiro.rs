@@ -859,13 +859,6 @@ impl KiroProvider {
             // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
             // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
-                tracing::warn!(
-                    "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
-                    attempt + 1,
-                    max_retries,
-                    status,
-                    body
-                );
                 // 429 被限流时打 throttle 冷却（指数退避），冷却期间该凭据
                 // 不参与 balanced 轮转；最高优先级档全部冷却时自然降级到下一档
                 if status.as_u16() == 429 {
@@ -877,22 +870,42 @@ impl KiroProvider {
                         self.token_manager.report_throttled(ctx.id);
                     }
                 }
+                // 退避决策：429 退避只在"没有其它鲜活凭据、只能等同一账号冷却"时才付出。
+                // 刚被限流的凭据已打 throttled_until，若仍有其它未冷却凭据可立即切换，
+                // 则跳过 sleep 直接换号重试，避免把退避时间叠加进流式首字（TTFT）关键
+                // 路径。408/5xx 多为上游整体瞬态，换号未必有用且退避能避免连环打爆上游，
+                // 故仍保留退避。
+                let will_retry = attempt + 1 < max_retries;
+                let skip_backoff = will_retry
+                    && status.as_u16() == 429
+                    && self.token_manager.has_fresh_credential(model.as_deref());
+                // 决策结果直接打进 WARN，生产可观测：是否换号、是否退避、用哪个凭据。
+                // 连续 attempt 的凭据 # 若变化即说明已换号；"跳过退避换号"说明优化生效。
+                let decision = if !will_retry {
+                    "不再重试"
+                } else if skip_backoff {
+                    "有鲜活凭据→跳过退避直接换号"
+                } else if status.as_u16() == 429 {
+                    "无鲜活凭据→退避后重试"
+                } else {
+                    "退避后重试"
+                };
+                tracing::warn!(
+                    "API 请求失败（上游瞬态错误，凭据 #{}，尝试 {}/{}，{}）: {} {}",
+                    ctx.id,
+                    attempt + 1,
+                    max_retries,
+                    decision,
+                    status,
+                    body
+                );
                 last_error = Some(anyhow::Error::new(UpstreamHttpError {
                     status: status.as_u16(),
                     body,
                     api_type: api_type.to_string(),
                 }));
-                if attempt + 1 < max_retries {
-                    // 429 退避只在"没有其它鲜活凭据、只能等同一账号冷却"时才付出。
-                    // 刚被限流的凭据已打 throttled_until，若仍有其它未冷却凭据可立即
-                    // 切换，则跳过 sleep 直接换号重试，避免把退避时间叠加进流式首字
-                    // （TTFT）关键路径。408/5xx 多为上游整体瞬态，换号未必有用且退避
-                    // 能避免连环打爆上游，故仍保留退避。
-                    let skip_backoff = status.as_u16() == 429
-                        && self.token_manager.has_fresh_credential(model.as_deref());
-                    if !skip_backoff {
-                        sleep(Self::retry_delay(attempt)).await;
-                    }
+                if will_retry && !skip_backoff {
+                    sleep(Self::retry_delay(attempt)).await;
                 }
                 continue;
             }
