@@ -143,8 +143,8 @@ Complete all chunked operations without commentary.";
 /// 按照用户要求：
 /// - sonnet 4.6/4-6 → claude-sonnet-4.6
 /// - 其他 sonnet → claude-sonnet-4.5
-/// - opus 4.8/4-8 → claude-opus-4.8
-/// - opus 4.7/4-7 → claude-opus-4.7
+/// - opus 4.8/4-8 → claude-opus-4.6（兜底，上游暂不可用）
+/// - opus 4.7/4-7 → claude-opus-4.6（兜底，上游暂不可用）
 /// - opus 4.5/4-5 → claude-opus-4.5
 /// - 其他 opus → claude-opus-4.6
 /// - 所有 haiku → claude-haiku-4.5
@@ -158,10 +158,13 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-sonnet-4.5".to_string())
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-opus-4.8".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
+        // opus 4.8 / 4.7 兜底到 4.6
+        if model_lower.contains("4-8")
+            || model_lower.contains("4.8")
+            || model_lower.contains("4-7")
+            || model_lower.contains("4.7")
+        {
+            Some("claude-opus-4.6".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-opus-4.5".to_string())
         } else {
@@ -1717,25 +1720,27 @@ mod tests {
 
     #[test]
     fn test_map_model_opus_4_7() {
+        // 4.7 兜底到 4.6
         assert_eq!(
             map_model("claude-opus-4-7"),
-            Some("claude-opus-4.7".to_string())
+            Some("claude-opus-4.6".to_string())
         );
         assert_eq!(
             map_model("claude-opus-4-7-thinking"),
-            Some("claude-opus-4.7".to_string())
+            Some("claude-opus-4.6".to_string())
         );
     }
 
     #[test]
     fn test_map_model_opus_4_8() {
+        // 4.8 兜底到 4.6
         assert_eq!(
             map_model("claude-opus-4-8"),
-            Some("claude-opus-4.8".to_string())
+            Some("claude-opus-4.6".to_string())
         );
         assert_eq!(
             map_model("claude-opus-4-8-thinking"),
-            Some("claude-opus-4.8".to_string())
+            Some("claude-opus-4.6".to_string())
         );
     }
 
@@ -1772,10 +1777,10 @@ mod tests {
     #[test]
     fn dynamic_window_overrides_then_falls_back() {
         let mut dynamic = HashMap::new();
-        dynamic.insert("claude-opus-4.8".to_string(), 700_000); // 上游真实窗口
+        dynamic.insert("claude-opus-4.6".to_string(), 700_000); // 上游真实窗口
         dynamic.insert("claude-sonnet-4.6".to_string(), 0); // 非法值应被忽略
 
-        // 命中动态值（注意传入的是客户端命名 opus-4-8，内部 map_model 归一化匹配）。
+        // 命中动态值（注意传入的是客户端命名 opus-4-8，map_model 兜底归一化到 4.6 匹配）。
         assert_eq!(window_size_for("claude-opus-4-8", &dynamic), 700_000);
         // 动态值非法（0）→ 回退硬编码 1M。
         assert_eq!(window_size_for("claude-sonnet-4-6", &dynamic), 1_000_000);
