@@ -1315,7 +1315,9 @@ impl StreamContext {
         );
         let margin = ((official - actual) * 1_000_000.0).round() / 1_000_000.0;
         // 进程维度累计实际成本/官方价/毛利，供 admin 只读接口查询（无锁原子，零热路径开销）。
-        super::billing_stats().record(actual, official, margin);
+        let stop_reason = self.state_manager.get_stop_reason();
+        let truncated = stop_reason == "max_tokens";
+        super::billing_stats().record(actual, official, margin, truncated);
         tracing::info!(
             model = %self.model,
             input_tokens = billing.uncached_input_tokens.max(1),
@@ -1329,6 +1331,7 @@ impl StreamContext {
             actual_cost_usd = actual,
             official_price_usd = official,
             margin_usd = margin,
+            stop_reason = %stop_reason,
             elapsed_secs = self.start.elapsed().as_secs_f64(),
             "请求完成（流式）"
         );

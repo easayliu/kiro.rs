@@ -32,6 +32,9 @@ pub struct BillingStats {
     official_price_micro: AtomicI64,
     /// 累计毛利（微美元，可为负）。
     margin_micro: AtomicI64,
+    /// 累计 stop_reason == "max_tokens" 的请求数（输出被截断/思考预算耗尽）。
+    /// 与 requests 之比即「截断命中率」，用于判断上游默认输出上限是否偏低。
+    max_tokens_truncated: AtomicU64,
 
     /// 落盘文件路径（未配置时不持久化，仅进程内累计）。
     path: Mutex<Option<PathBuf>>,
@@ -68,6 +71,9 @@ struct PersistedStats {
     actual_cost_micro: i64,
     official_price_micro: i64,
     margin_micro: i64,
+    /// 旧缓存文件无此字段，缺失时默认 0。
+    #[serde(default)]
+    max_tokens_truncated: u64,
 }
 
 impl BillingStats {
@@ -82,6 +88,8 @@ impl BillingStats {
                     self.official_price_micro
                         .store(p.official_price_micro, Ordering::Relaxed);
                     self.margin_micro.store(p.margin_micro, Ordering::Relaxed);
+                    self.max_tokens_truncated
+                        .store(p.max_tokens_truncated, Ordering::Relaxed);
                     tracing::info!(
                         requests = p.requests,
                         margin_usd = p.margin_micro as f64 / 1_000_000.0,
@@ -97,7 +105,9 @@ impl BillingStats {
     }
 
     /// 记录一次请求的计费结果。在每请求收尾路径调用一次。
-    pub fn record(&self, actual_usd: f64, official_usd: f64, margin_usd: f64) {
+    ///
+    /// `truncated`：本次 stop_reason 是否为 `max_tokens`（输出被截断 / 思考预算耗尽）。
+    pub fn record(&self, actual_usd: f64, official_usd: f64, margin_usd: f64, truncated: bool) {
         self.requests.fetch_add(1, Ordering::Relaxed);
         self.actual_cost_micro
             .fetch_add(to_micro(actual_usd), Ordering::Relaxed);
@@ -105,6 +115,9 @@ impl BillingStats {
             .fetch_add(to_micro(official_usd), Ordering::Relaxed);
         self.margin_micro
             .fetch_add(to_micro(margin_usd), Ordering::Relaxed);
+        if truncated {
+            self.max_tokens_truncated.fetch_add(1, Ordering::Relaxed);
+        }
         self.save_debounced();
     }
 
@@ -138,6 +151,7 @@ impl BillingStats {
             actual_cost_micro: self.actual_cost_micro.load(Ordering::Relaxed),
             official_price_micro: self.official_price_micro.load(Ordering::Relaxed),
             margin_micro: self.margin_micro.load(Ordering::Relaxed),
+            max_tokens_truncated: self.max_tokens_truncated.load(Ordering::Relaxed),
         };
 
         match serde_json::to_string_pretty(&persisted) {
@@ -158,11 +172,19 @@ impl BillingStats {
         let actual_micro = self.actual_cost_micro.load(Ordering::Relaxed);
         let official_micro = self.official_price_micro.load(Ordering::Relaxed);
         let margin_micro = self.margin_micro.load(Ordering::Relaxed);
+        let requests = self.requests.load(Ordering::Relaxed);
+        let truncated = self.max_tokens_truncated.load(Ordering::Relaxed);
         BillingStatsSnapshot {
-            requests: self.requests.load(Ordering::Relaxed),
+            requests,
             actual_cost_usd: actual_micro as f64 / 1_000_000.0,
             official_price_usd: official_micro as f64 / 1_000_000.0,
             margin_usd: margin_micro as f64 / 1_000_000.0,
+            max_tokens_truncated: truncated,
+            max_tokens_truncated_rate: if requests > 0 {
+                truncated as f64 / requests as f64
+            } else {
+                0.0
+            },
         }
     }
 }
@@ -178,4 +200,8 @@ pub struct BillingStatsSnapshot {
     pub official_price_usd: f64,
     /// 累计毛利（USD，可为负）。
     pub margin_usd: f64,
+    /// 累计 stop_reason == "max_tokens" 的请求数（输出被截断）。
+    pub max_tokens_truncated: u64,
+    /// 截断命中率 = max_tokens_truncated / requests（无请求时为 0）。
+    pub max_tokens_truncated_rate: f64,
 }

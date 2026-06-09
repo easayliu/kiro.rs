@@ -744,12 +744,20 @@ fn create_sse_stream(
                                     "上游流正常结束（EOF）"
                                 );
                             }
-                            // 流结束，发送最终事件
-                            let final_events = ctx.generate_final_events();
-                            let bytes: Vec<Result<Bytes, Infallible>> = final_events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
+                            // 输出中断处理：pending>0（解码器残留半帧）是流被切在帧中间的
+                            // 铁证 = 真·输出中断。此时发 error 事件让客户端重试，**不**补
+                            // message_stop——否则客户端会把半截回复当成正常 end_turn 收下、
+                            // 不重试，用户静默拿到残缺答案。与 read-error 分支(likely_complete
+                            // =false)行为一致。仅 !saw_metering(pending==0) 是弱信号（可能正常
+                            // 完成但未带 metering），不据此报错以免误杀、放大重试加剧上游限速。
+                            let bytes: Vec<Result<Bytes, Infallible>> = if pending > 0 {
+                                vec![Ok(create_truncation_error_sse())]
+                            } else {
+                                ctx.generate_final_events()
+                                    .into_iter()
+                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .collect()
+                            };
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, stats)))
                         }
                     }
@@ -1010,7 +1018,8 @@ async fn handle_non_stream_request(
     );
     let margin = ((official - actual) * 1_000_000.0).round() / 1_000_000.0;
     // 进程维度累计实际成本/官方价/毛利，供 admin 只读接口查询（无锁原子，零热路径开销）。
-    super::billing_stats().record(actual, official, margin);
+    let truncated = stop_reason == "max_tokens";
+    super::billing_stats().record(actual, official, margin, truncated);
     tracing::info!(
         model = %model,
         input_tokens = billed_input_tokens,
@@ -1024,6 +1033,7 @@ async fn handle_non_stream_request(
         actual_cost_usd = actual,
         official_price_usd = official,
         margin_usd = margin,
+        stop_reason = %stop_reason,
         elapsed_secs = request_start.elapsed().as_secs_f64(),
         "请求完成（非流式）"
     );
@@ -1479,12 +1489,19 @@ fn create_buffered_sse_stream(
                                         "上游流正常结束（EOF，缓冲模式）"
                                     );
                                 }
-                                // 流结束，完成处理并返回所有事件（已更正 input_tokens）
-                                let all_events = ctx.finish_and_get_all_events();
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
+                                // 输出中断处理（缓冲模式）：pending>0 = 流被切在帧中间 =
+                                // 真·输出中断。缓冲模式全程只发过 ping、尚未交付任何内容，
+                                // 此时直接发 error 事件让客户端重试，而非把残缺内容当正常收尾
+                                // 一次性 flush。与 read-error 分支(likely_complete=false)一致。
+                                // 仅 !saw_metering(pending==0) 是弱信号，不据此报错以免误杀。
+                                let bytes: Vec<Result<Bytes, Infallible>> = if pending > 0 {
+                                    vec![Ok(create_truncation_error_sse())]
+                                } else {
+                                    ctx.finish_and_get_all_events()
+                                        .into_iter()
+                                        .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                        .collect()
+                                };
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, stats)));
                             }
                         }
