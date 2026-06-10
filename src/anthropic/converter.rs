@@ -141,6 +141,7 @@ Complete all chunked operations without commentary.";
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
+/// - fable → claude-opus-4.8（兜底，上游暂无 fable 系列，2026-06-10 实测 opus-4.8 可用）
 /// - sonnet 4.6/4-6 → claude-sonnet-4.6
 /// - 其他 sonnet → claude-sonnet-4.5
 /// - opus 4.8/4-8 → claude-opus-4.6（兜底，上游暂不可用）
@@ -151,7 +152,9 @@ Complete all chunked operations without commentary.";
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
-    if model_lower.contains("sonnet") {
+    if model_lower.contains("fable") {
+        Some("claude-opus-4.8".to_string())
+    } else if model_lower.contains("sonnet") {
         if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
         } else {
@@ -1748,6 +1751,21 @@ mod tests {
     fn test_context_window_opus_4_7_4_8() {
         assert_eq!(get_context_window_size("claude-opus-4-7"), 1_000_000);
         assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
+    }
+
+    #[test]
+    fn test_map_model_fable_5() {
+        // fable 系列兜底到上游 claude-opus-4.8（上游暂无 fable，实测 opus-4.8 可用）
+        assert_eq!(
+            map_model("claude-fable-5"),
+            Some("claude-opus-4.8".to_string())
+        );
+        assert_eq!(
+            map_model("claude-fable-5-thinking"),
+            Some("claude-opus-4.8".to_string())
+        );
+        // 兜底到 opus-4.8 后享受 1M 上下文窗口与 opus 价档
+        assert_eq!(get_context_window_size("claude-fable-5"), 1_000_000);
     }
 
     /// 官方价折算：对齐 Anthropic 文档的 worked example
