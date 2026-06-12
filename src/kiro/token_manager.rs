@@ -226,15 +226,109 @@ async fn refresh_social_token(
     Ok(new_credentials)
 }
 
+/// IdC 刷新 HTTP 错误（非 2xx），携带状态码供 region 兜底重试判断
+#[derive(Debug)]
+struct IdcRefreshHttpError {
+    status: u16,
+    message: String,
+}
+
+impl fmt::Display for IdcRefreshHttpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for IdcRefreshHttpError {}
+
+/// Kiro / CodeWhisperer Q 实际提供 `ListAvailableProfiles` / `getUsageLimits` 服务的 region。
+///
+/// 实测仅 us-east-1、eu-central-1 两地有 `q.{region}.amazonaws.com` 端点（其余 region 连接即
+/// EOF）。企业 IdC 的 profile 可能开在其中任意一地，而 SSO 认证 region 未必与之相同，故探测
+/// profileArn 时需逐个 region 尝试。顺序：us-east-1 优先（最常见），再 eu-central-1。
+const KIRO_PROFILE_REGIONS: [&str; 2] = ["us-east-1", "eu-central-1"];
+
+/// 探测 profileArn 的候选 region（按尝试顺序，去重）：
+/// 1. 凭据生效 API region（api_region > profileArn 内嵌 > config）——尊重用户/历史显式配置
+/// 2. [`KIRO_PROFILE_REGIONS`] 中其余有服务的 region
+///
+/// 企业 IdC 的 profile 与 SSO 认证 region 经常不在同一地（如认证 us-east-1、profile eu-central-1），
+/// 只探测单一 region 会漏掉 profile，导致 getUsageLimits 因缺 profileArn 失败。
+fn profile_probe_region_candidates(credentials: &KiroCredentials, config: &Config) -> Vec<String> {
+    let mut candidates = vec![credentials.effective_api_region(config).to_string()];
+    for region in KIRO_PROFILE_REGIONS {
+        if !candidates.iter().any(|c| c == region) {
+            candidates.push(region.to_string());
+        }
+    }
+    candidates
+}
+
+/// IdC 刷新候选 auth region（按尝试顺序，去重）：
+/// 1. 凭据生效 auth region（authRegion > region > config）
+/// 2. us-east-1（Kiro IdC / Builder ID 最常见的注册地）
+/// 3. profileArn 内嵌 region
+///
+/// 企业 IdC 的 SSO 认证 region 与 Q API region 经常不同（如目录在 us-east-1、profile 在
+/// eu-central-1），用户照 API 抓包把 region 填成 API region 时，刷新会打错 OIDC 端点，
+/// 返回 400 invalid_request "Invalid token provided"。
+fn idc_refresh_region_candidates(credentials: &KiroCredentials, config: &Config) -> Vec<String> {
+    let mut candidates = vec![credentials.effective_auth_region(config).to_string()];
+    let fallbacks = std::iter::once("us-east-1").chain(credentials.profile_arn_region());
+    for region in fallbacks {
+        if !candidates.iter().any(|c| c == region) {
+            candidates.push(region.to_string());
+        }
+    }
+    candidates
+}
+
 /// 刷新 IdC Token (AWS SSO OIDC)
+///
+/// auth region 配置错误导致的 400 按 [`idc_refresh_region_candidates`] 兜底重试，
+/// 命中后把正确 region 写回凭据 `auth_region`（随凭据持久化，下次刷新直达）。
 async fn refresh_idc_token(
     credentials: &KiroCredentials,
     config: &Config,
     proxy: Option<&ProxyConfig>,
 ) -> anyhow::Result<KiroCredentials> {
+    let candidates = idc_refresh_region_candidates(credentials, config);
+    let last = candidates.len() - 1;
+    for (i, region) in candidates.iter().enumerate() {
+        match refresh_idc_token_at(credentials, config, proxy, region).await {
+            Ok(new_credentials) => return Ok(new_credentials),
+            // refreshToken 永久失效（invalid_grant）：换 region 也救不回来，立即返回
+            Err(e) if e.is::<RefreshTokenInvalidError>() => return Err(e),
+            // 400 多为 region 不匹配（token/client 注册在其他 region），还有候选就继续
+            Err(e)
+                if i < last
+                    && e.downcast_ref::<IdcRefreshHttpError>()
+                        .is_some_and(|he| he.status == 400) =>
+            {
+                tracing::warn!(
+                    "IdC Token 在 region {} 刷新失败（{}），尝试候选 region {}",
+                    region,
+                    e,
+                    candidates[i + 1]
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("候选 region 列表非空，循环内必有返回")
+}
+
+/// 按指定 region 刷新 IdC Token
+async fn refresh_idc_token_at(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+    region: &str,
+) -> anyhow::Result<KiroCredentials> {
     tracing::info!(
-        "正在刷新 IdC Token... (凭据 #{})",
-        credentials.id.map(|i| i.to_string()).unwrap_or_else(|| "?".to_string())
+        "正在刷新 IdC Token... (凭据 #{}, region {})",
+        credentials.id.map(|i| i.to_string()).unwrap_or_else(|| "?".to_string()),
+        region
     );
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
@@ -247,8 +341,6 @@ async fn refresh_idc_token(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("IdC 刷新需要 clientSecret"))?;
 
-    // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
-    let region = credentials.effective_auth_region(config);
     let refresh_url = format!("https://oidc.{}.amazonaws.com/token", region);
     let os_name = &config.system_version;
     let node_version = &config.node_version;
@@ -302,12 +394,26 @@ async fn refresh_idc_token(
             500..=599 => "服务器错误，AWS OIDC 服务暂时不可用",
             _ => "IdC Token 刷新失败",
         };
-        bail!("{}: {} {}", error_msg, status, body_text);
+        return Err(IdcRefreshHttpError {
+            status: status.as_u16(),
+            message: format!("{}: {} {}", error_msg, status, body_text),
+        }
+        .into());
     }
 
     let data: IdcRefreshResponse = response.json().await?;
 
     let mut new_credentials = credentials.clone();
+    // 兜底命中的 region 与凭据原生效 auth region 不同时写回，随凭据持久化，下次刷新直达。
+    // 须在下方 profileArn 探测前完成，让探测也用纠正后的 region。
+    if credentials.effective_auth_region(config) != region {
+        tracing::info!(
+            "IdC auth region 已纠正为 {}（原配置 {}）",
+            region,
+            credentials.effective_auth_region(config)
+        );
+        new_credentials.auth_region = Some(region.to_string());
+    }
     new_credentials.access_token = Some(data.access_token);
 
     if let Some(new_refresh_token) = data.refresh_token {
@@ -327,6 +433,9 @@ async fn refresh_idc_token(
     // 企业 IdC / Builder ID 的 token 不携带 profileArn，但 getUsageLimits / 对话都需要账号自有
     // ARN。对齐真实 Kiro IDE：登录后调用 ListAvailableProfiles 探测并写回 profile_arn，之后随
     // 凭据持久化、后续请求复用。探测失败不阻断刷新（仅记日志，本次拿不到额度但 token 仍有效）。
+    //
+    // profile 可能开在与 SSO 认证 region 不同的地方（如认证 us-east-1、profile eu-central-1），
+    // 故逐个候选 region 探测，命中即止（profileArn 内嵌 region 会驱动后续 getUsageLimits/对话）。
     if new_credentials
         .profile_arn
         .as_deref()
@@ -334,17 +443,38 @@ async fn refresh_idc_token(
         .unwrap_or(true)
         && let Some(access_token) = new_credentials.access_token.as_deref()
     {
-        // 探测用账号 SSO region（cred.region，导入时即 us-east-1）；profileArn 尚未知晓。
-        let probe_region = new_credentials.effective_auth_region(config).to_string();
-        match list_available_profiles(&new_credentials, config, access_token, proxy, &probe_region)
+        let probe_regions = profile_probe_region_candidates(&new_credentials, config);
+        for probe_region in &probe_regions {
+            match list_available_profiles(
+                &new_credentials,
+                config,
+                access_token,
+                proxy,
+                probe_region,
+            )
             .await
-        {
-            Ok(Some(arn)) => {
-                tracing::info!("IdC 账号探测到 profileArn: {}", arn);
-                new_credentials.profile_arn = Some(arn);
+            {
+                Ok(Some(arn)) => {
+                    tracing::info!("IdC 账号在 region {} 探测到 profileArn: {}", probe_region, arn);
+                    new_credentials.profile_arn = Some(arn);
+                    break;
+                }
+                Ok(None) => tracing::debug!(
+                    "IdC 账号在 region {} 无可用 profile，尝试下一候选",
+                    probe_region
+                ),
+                Err(e) => tracing::warn!(
+                    "IdC 账号在 region {} ListAvailableProfiles 探测失败（不阻断刷新）: {}",
+                    probe_region,
+                    e
+                ),
             }
-            Ok(None) => tracing::warn!("IdC 账号 ListAvailableProfiles 未返回可用 profileArn"),
-            Err(e) => tracing::warn!("IdC 账号 ListAvailableProfiles 探测失败（不阻断刷新）: {}", e),
+        }
+        if new_credentials.profile_arn.is_none() {
+            tracing::warn!(
+                "IdC 账号在所有候选 region {:?} 均未探测到 profileArn",
+                probe_regions
+            );
         }
     }
 
@@ -2699,7 +2829,8 @@ impl MultiTokenManager {
         validated_cred.client_id = new_cred.client_id;
         validated_cred.client_secret = new_cred.client_secret;
         validated_cred.region = new_cred.region;
-        validated_cred.auth_region = new_cred.auth_region;
+        // auth_region 不从用户输入回拷：验活刷新可能已兜底纠正（见 refresh_idc_token），
+        // validated_cred 始于 new_cred.clone()，未纠正时本就保留用户输入值
         validated_cred.api_region = new_cred.api_region;
         validated_cred.machine_id = new_cred.machine_id;
         validated_cred.email = new_cred.email;
@@ -3116,6 +3247,92 @@ mod tests {
         credentials.refresh_token = Some("a".repeat(150));
         let result = validate_refresh_token(&credentials);
         assert!(result.is_ok());
+    }
+
+    /// 凭据 region 填成 API region（eu-central-1）时，候选列表应兜底 us-east-1
+    #[test]
+    fn test_idc_refresh_region_candidates_fallback_us_east_1() {
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.region = Some("eu-central-1".to_string());
+        cred.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:111122223333:profile/X".to_string());
+
+        assert_eq!(
+            idc_refresh_region_candidates(&cred, &config),
+            vec!["eu-central-1".to_string(), "us-east-1".to_string()]
+        );
+    }
+
+    /// auth region 已是 us-east-1 时，profileArn 内嵌 region 作为额外候选
+    #[test]
+    fn test_idc_refresh_region_candidates_profile_arn_region() {
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:111122223333:profile/X".to_string());
+
+        // 生效 auth region 回退到 config 默认 us-east-1
+        assert_eq!(
+            idc_refresh_region_candidates(&cred, &config),
+            vec!["us-east-1".to_string(), "eu-central-1".to_string()]
+        );
+    }
+
+    /// 各来源 region 一致时去重，只保留一个候选
+    #[test]
+    fn test_idc_refresh_region_candidates_dedup() {
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.auth_region = Some("us-east-1".to_string());
+        cred.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:111122223333:profile/X".to_string());
+
+        assert_eq!(
+            idc_refresh_region_candidates(&cred, &config),
+            vec!["us-east-1".to_string()]
+        );
+    }
+
+    /// 企业 IdC profile 在 eu-central-1、认证在 us-east-1：候选应同时含两地，先 us-east-1
+    #[test]
+    fn test_profile_probe_candidates_enterprise_cross_region() {
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.region = Some("us-east-1".to_string()); // SSO 认证 region
+        cred.profile_arn = None; // 尚未探测
+
+        // effective_api_region 在 profileArn 为空时回退 config.region=us-east-1
+        assert_eq!(
+            profile_probe_region_candidates(&cred, &config),
+            vec!["us-east-1".to_string(), "eu-central-1".to_string()]
+        );
+    }
+
+    /// 已知 profileArn 在 eu-central-1：eu 优先，再补 us-east-1
+    #[test]
+    fn test_profile_probe_candidates_known_eu_profile() {
+        let config = Config::default();
+        let mut cred = KiroCredentials::default();
+        cred.profile_arn =
+            Some("arn:aws:codewhisperer:eu-central-1:111122223333:profile/X".to_string());
+
+        assert_eq!(
+            profile_probe_region_candidates(&cred, &config),
+            vec!["eu-central-1".to_string(), "us-east-1".to_string()]
+        );
+    }
+
+    /// 生效 region 已是受支持 region 时不重复
+    #[test]
+    fn test_profile_probe_candidates_dedup() {
+        let config = Config::default();
+        let cred = KiroCredentials::default(); // 回退 config.region=us-east-1
+
+        assert_eq!(
+            profile_probe_region_candidates(&cred, &config),
+            vec!["us-east-1".to_string(), "eu-central-1".to_string()]
+        );
     }
 
     #[test]
