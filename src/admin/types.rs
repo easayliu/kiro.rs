@@ -214,8 +214,10 @@ fn default_auth_method() -> String {
 pub struct AddCredentialResponse {
     pub success: bool,
     pub message: String,
-    /// 新添加的凭据 ID
+    /// 新添加的凭据 ID（多条时为首个，兼容旧前端）
     pub credential_id: u64,
+    /// 新添加的全部凭据 ID（企业 IdC 按 profile 拆分时可能多条）
+    pub credential_ids: Vec<u64>,
     /// 用户邮箱（如果获取成功）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
@@ -253,6 +255,18 @@ pub struct BalanceResponse {
     pub overage_cap: f64,
     /// 货币（如 USD）
     pub currency: Option<String>,
+}
+
+// ============ 可用模型查询 ============
+
+/// 凭据可用模型查询响应
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelsResponse {
+    /// 凭据 ID
+    pub id: u64,
+    /// 上游 ListAvailableModels 返回的模型 id 列表（原样透传）
+    pub models: Vec<String>,
 }
 
 // ============ 负载均衡配置 ============

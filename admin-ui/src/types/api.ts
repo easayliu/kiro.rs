@@ -68,6 +68,13 @@ export interface BalanceResponse {
   currency: string | null
 }
 
+// 凭据可用模型响应
+export interface ModelsResponse {
+  id: number
+  /** 上游 ListAvailableModels 返回的模型 id 列表 */
+  models: string[]
+}
+
 // 成功响应
 export interface SuccessResponse {
   success: boolean
@@ -119,6 +126,8 @@ export interface AddCredentialResponse {
   success: boolean
   message: string
   credentialId: number
+  // 企业 IdC 按 profile 拆分时可能返回多条（credentialId 为首个，兼容旧逻辑）
+  credentialIds?: number[]
   email?: string
 }
 

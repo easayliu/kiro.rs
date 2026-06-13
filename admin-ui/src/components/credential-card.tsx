@@ -14,6 +14,7 @@ import {
   Network,
   Gauge,
   CircleDollarSign,
+  Boxes,
   X,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -50,6 +51,7 @@ import {
   useForceRefreshToken,
   useProxyGroups,
   useSetCredentialGroup,
+  useCredentialModels,
   useIsReadOnly,
 } from '@/hooks/use-credentials'
 
@@ -98,6 +100,8 @@ export function CredentialCard({
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const [showRpmDialog, setShowRpmDialog] = useState(false)
   const [rpmInputValue, setRpmInputValue] = useState('')
+  // 懒加载可用模型：仅在"可用模型"子菜单首次展开后才发起请求
+  const [modelsRequested, setModelsRequested] = useState(false)
 
   const readOnly = useIsReadOnly()
   const setDisabled = useSetDisabled()
@@ -109,6 +113,11 @@ export function CredentialCard({
   const forceRefresh = useForceRefreshToken()
   const setCredentialGroup = useSetCredentialGroup()
   const { data: proxyGroupsData } = useProxyGroups()
+  const {
+    data: modelsData,
+    isLoading: loadingModels,
+    isError: modelsError,
+  } = useCredentialModels(credential.id, modelsRequested)
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -640,6 +649,32 @@ export function CredentialCard({
                     <div className="px-2 py-1.5 text-2xs text-muted-foreground">
                       暂无分组，请先在"代理分组"中创建
                     </div>
+                  )}
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+              <DropdownMenuSub onOpenChange={open => { if (open) setModelsRequested(true) }}>
+                <DropdownMenuSubTrigger>
+                  <Boxes /> 可用模型
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent className="max-h-72 w-52 overflow-auto">
+                  {loadingModels ? (
+                    <div className="flex items-center gap-1.5 px-2 py-1.5 text-xs text-muted-foreground">
+                      <Loader2 className="h-3 w-3 animate-spin" /> 加载中
+                    </div>
+                  ) : modelsError ? (
+                    <div className="px-2 py-1.5 text-2xs text-bad">查询失败，请稍后重试</div>
+                  ) : (modelsData?.models || []).length > 0 ? (
+                    modelsData!.models.map(m => (
+                      <div
+                        key={m}
+                        className="truncate px-2 py-1.5 font-mono text-2xs text-foreground"
+                        title={m}
+                      >
+                        {m}
+                      </div>
+                    ))
+                  ) : (
+                    <div className="px-2 py-1.5 text-2xs text-muted-foreground">无可用模型</div>
                   )}
                 </DropdownMenuSubContent>
               </DropdownMenuSub>

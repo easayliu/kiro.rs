@@ -10,6 +10,7 @@ import {
   resetCredentialFailure,
   forceRefreshToken,
   getCredentialBalance,
+  getCredentialModels,
   addCredential,
   deleteCredential,
   getLoadBalancingMode,
@@ -66,6 +67,17 @@ export function useCredentialBalance(id: number | null) {
     queryFn: () => getCredentialBalance(id!),
     enabled: id !== null,
     retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+  })
+}
+
+// 查询凭据上游可用模型列表（懒加载：仅在子菜单打开后才请求）
+export function useCredentialModels(id: number, enabled: boolean) {
+  return useQuery({
+    queryKey: ['credential-models', id],
+    queryFn: () => getCredentialModels(id),
+    enabled,
+    retry: false, // 模型查询失败时不重试（避免重复请求被封禁的账号）
+    staleTime: 10 * 60 * 1000, // 模型列表变化极少，缓存 10 分钟
   })
 }
 

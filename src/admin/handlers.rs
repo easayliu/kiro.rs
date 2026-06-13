@@ -146,6 +146,18 @@ pub async fn get_credential_balance(
     }
 }
 
+/// GET /api/admin/credentials/:id/models
+/// 查询指定凭据上游可用的模型列表
+pub async fn get_credential_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.get_models(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials
 /// 添加新凭据
 pub async fn add_credential(

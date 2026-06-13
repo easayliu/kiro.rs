@@ -20,7 +20,7 @@ use super::types::{
     BatchSetPriorityRequest, BatchSetPriorityResponse, BatchSetRpmLimitRequest,
     BatchSetOverageRequest, BatchSetOverageResponse, BatchSetRpmLimitResponse,
     CacheSkipRateResponse, CredentialStatusItem,
-    CredentialsStatusResponse, DefaultRpmLimitResponse, GlobalCacheResponse,
+    CredentialsStatusResponse, DefaultRpmLimitResponse, GlobalCacheResponse, ModelsResponse,
     LoadBalancingModeResponse, ProxyGroupsResponse, SetCacheSkipRateRequest,
     SetCredentialGroupRequest, SetDefaultRpmLimitRequest, SetGlobalCacheRequest,
     SetLoadBalancingModeRequest, UpsertProxyGroupRequest,
@@ -258,6 +258,19 @@ impl AdminService {
         })
     }
 
+    /// 查询指定凭据上游可用的模型列表
+    ///
+    /// 直接透传上游 `ListAvailableModels` 的 modelId（不缓存，admin 低频操作；
+    /// 前端用 react-query staleTime 做客户端缓存即可）。
+    pub async fn get_models(&self, id: u64) -> Result<ModelsResponse, AdminServiceError> {
+        let models = self
+            .token_manager
+            .get_available_models_for(id)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))?;
+        Ok(ModelsResponse { id, models })
+    }
+
     /// 添加新凭据
     pub async fn add_credential(
         &self,
@@ -292,22 +305,51 @@ impl AdminService {
             overage: None,
         };
 
-        // 调用 token_manager 添加凭据
-        let credential_id = self
-            .token_manager
-            .add_credential(new_cred)
-            .await
-            .map_err(|e| self.classify_add_error(e))?;
+        // 企业 IdC（auth_method == idc）：遍历 us-east-1 / eu-central-1 探测全部 profile，
+        // 每个 profile 各加一条凭据；其余认证方式保持单条添加。
+        let is_enterprise_idc = new_cred
+            .auth_method
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("idc"))
+            .unwrap_or(false);
+
+        let credential_ids = if is_enterprise_idc {
+            self.token_manager
+                .add_idc_credential_per_profile(new_cred)
+                .await
+                .map_err(|e| self.classify_add_error(e))?
+        } else {
+            let id = self
+                .token_manager
+                .add_credential(new_cred)
+                .await
+                .map_err(|e| self.classify_add_error(e))?;
+            vec![id]
+        };
 
         // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
-        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
-            tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
+        for &id in &credential_ids {
+            if let Err(e) = self.token_manager.get_usage_limits_for(id).await {
+                tracing::warn!("添加凭据 #{} 后获取订阅等级失败（不影响凭据添加）: {}", id, e);
+            }
         }
+
+        let credential_id = credential_ids.first().copied().unwrap_or(0);
+        let message = if credential_ids.len() > 1 {
+            format!(
+                "企业 IdC 账号按 profile 拆分添加 {} 条凭据，ID: {:?}",
+                credential_ids.len(),
+                credential_ids
+            )
+        } else {
+            format!("凭据添加成功，ID: {}", credential_id)
+        };
 
         Ok(AddCredentialResponse {
             success: true,
-            message: format!("凭据添加成功，ID: {}", credential_id),
+            message,
             credential_id,
+            credential_ids,
             email,
         })
     }

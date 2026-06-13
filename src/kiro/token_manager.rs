@@ -496,6 +496,23 @@ pub(crate) async fn list_available_profiles(
     proxy: Option<&ProxyConfig>,
     region: &str,
 ) -> anyhow::Result<Option<String>> {
+    Ok(list_all_available_profiles(credentials, config, token, proxy, region)
+        .await?
+        .into_iter()
+        .next())
+}
+
+/// 探测某 region 下账号可用的**全部** profileArn（企业 IdC 一个账号可能在同一/不同 region
+/// 开多个 profile）。请求与 [`list_available_profiles`] 完全一致，仅返回全量而非首个。
+///
+/// 失败（网络/非 2xx）返回 `Ok(vec![])`——探测本身不应打断调用方流程。
+pub(crate) async fn list_all_available_profiles(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+    region: &str,
+) -> anyhow::Result<Vec<String>> {
     let host = format!("q.{}.amazonaws.com", region);
     let url = format!("https://{}/ListAvailableProfiles", host);
     let machine_id = machine_id::generate_from_credentials(credentials, config)
@@ -523,27 +540,32 @@ pub(crate) async fn list_available_profiles(
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         tracing::warn!("ListAvailableProfiles 返回 {}：{}", status, body);
-        return Ok(None);
+        return Ok(vec![]);
     }
 
     let json: serde_json::Value = response.json().await?;
-    Ok(extract_first_profile_arn(&json))
+    Ok(extract_all_profile_arns(&json))
 }
 
-/// 从 ListAvailableProfiles 响应里取第一个 profile 的 ARN（兼容字段名差异）。
-fn extract_first_profile_arn(json: &serde_json::Value) -> Option<String> {
-    let arr = json
+/// 从 ListAvailableProfiles 响应里取**全部** profile 的 ARN（兼容字段名差异，去空白）。
+fn extract_all_profile_arns(json: &serde_json::Value) -> Vec<String> {
+    let Some(arr) = json
         .get("profiles")
         .or_else(|| json.get("availableProfiles"))
-        .and_then(|v| v.as_array())?;
-    arr.iter().find_map(|p| {
-        p.get("arn")
-            .or_else(|| p.get("profileArn"))
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-    })
+        .and_then(|v| v.as_array())
+    else {
+        return vec![];
+    };
+    arr.iter()
+        .filter_map(|p| {
+            p.get("arn")
+                .or_else(|| p.get("profileArn"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+        .collect()
 }
 
 /// 获取使用额度信息。
@@ -679,6 +701,67 @@ pub(crate) async fn set_overage(
         bail!("切换 overage 失败: {} {}", status, body_text);
     }
     Ok(())
+}
+
+/// 拉取指定凭据可用的上游模型列表：GET ListAvailableModels，返回 modelId 列表。
+///
+/// 请求构造对齐 [`crate::kiro::provider::KiroProvider::list_available_models`]
+/// （老端点 `q.{region}` + origin=AI_EDITOR + 可选 profileArn，streaming UA），
+/// 区别仅在凭据/token 由调用方按 id 指定，供 Admin API 按凭据查询其真实可用模型。
+pub(crate) async fn list_available_models(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<Vec<String>> {
+    let region = credentials.effective_api_region(config).to_string();
+    let host = format!("q.{}.amazonaws.com", region);
+    let url = format!("https://{}/ListAvailableModels", host);
+    let machine_id =
+        machine_id::generate_from_credentials(credentials, config).unwrap_or_default();
+    let mode = credentials.effective_client_mode(config);
+
+    // ListAvailableModels 用 GET + query 参数（对齐 Kiro IDE：origin=AI_EDITOR，带 profileArn 时附上）
+    let mut params: Vec<(&str, String)> = vec![("origin", "AI_EDITOR".to_string())];
+    if let Some(arn) = credentials.effective_profile_arn() {
+        params.push(("profileArn", arn));
+    }
+
+    let user_agent = config.streaming_user_agent(&machine_id, mode);
+    let amz_user_agent = config.streaming_x_amz_user_agent(&machine_id, mode);
+
+    let client = build_client(proxy, 30, config.tls_backend)?;
+
+    let mut request = client.get(&url).query(&params);
+    if credentials.is_api_key_credential() {
+        request = request.header("tokentype", "API_KEY");
+    }
+    let response = request
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Connection", "close")
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        let snippet: String = body.chars().take(200).collect();
+        bail!("ListAvailableModels HTTP {}: {}", status, snippet);
+    }
+
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+    let Some(models) = json.get("models").and_then(|m| m.as_array()) else {
+        bail!("ListAvailableModels 响应缺少 models 数组");
+    };
+    Ok(models
+        .iter()
+        .filter_map(|m| m.get("modelId").and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+        .collect())
 }
 
 // ============================================================================
@@ -2864,6 +2947,144 @@ impl MultiTokenManager {
         Ok(new_id)
     }
 
+    /// 企业 IdC 账号添加：遍历 [`KIRO_PROFILE_REGIONS`]（us-east-1 / eu-central-1）探测账号可用
+    /// 的**全部** profileArn，每个 profile 各加一条独立凭据（共用同一 refreshToken，按
+    /// refreshToken+profileArn 去重）。
+    ///
+    /// 企业 IdC 一个目录账号常在多地各开 profile，单条凭据只能绑一个 profileArn；逐 profile 拆条
+    /// 后各自走自己的 api_region（profileArn 内嵌 region 驱动 getUsageLimits/对话），互不影响。
+    /// email 追加 region 后缀以便前端区分，同 region 多 profile 再追加序号。
+    ///
+    /// 探测不到任何 profile 时回退为单条添加（保持与 [`Self::add_credential`] 一致的行为）。
+    /// 返回新增的凭据 id 列表（全部为既有重复时报错）。
+    pub async fn add_idc_credential_per_profile(
+        &self,
+        new_cred: KiroCredentials,
+    ) -> anyhow::Result<Vec<u64>> {
+        validate_refresh_token(&new_cred)?;
+
+        // 1. 验活刷新：拿到有效 access_token、纠正 auth_region（profile_arn 此处先忽略，下方全量重探）
+        let effective_proxy =
+            new_cred.effective_proxy(self.proxy.as_ref(), &self.proxy_groups.read());
+        let validated_base =
+            refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?;
+        let access_token = validated_base
+            .access_token
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("IdC 刷新未返回 accessToken"))?;
+
+        // 2. 遍历两地探测全部 profileArn（按 arn 去重，保留首次出现的探测 region 作 api_region 兜底）
+        let mut profiles: Vec<(String, String)> = Vec::new(); // (arn, probe_region)
+        for region in KIRO_PROFILE_REGIONS {
+            match list_all_available_profiles(
+                &validated_base,
+                &self.config,
+                &access_token,
+                effective_proxy.as_ref(),
+                region,
+            )
+            .await
+            {
+                Ok(arns) => {
+                    for arn in arns {
+                        if !profiles.iter().any(|(existing, _)| existing == &arn) {
+                            tracing::info!("IdC 账号在 region {} 探测到 profile: {}", region, arn);
+                            profiles.push((arn, region.to_string()));
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "IdC 账号在 region {} ListAvailableProfiles 探测失败（不阻断）: {}",
+                    region,
+                    e
+                ),
+            }
+        }
+
+        // 3. 一个 profile 都没探到 → 回退单条添加（profile_arn 留空，行为同 add_credential）
+        if profiles.is_empty() {
+            tracing::warn!(
+                "IdC 账号在 {:?} 均未探测到 profile，按单条凭据添加",
+                KIRO_PROFILE_REGIONS
+            );
+            let id = self.add_credential(new_cred).await?;
+            return Ok(vec![id]);
+        }
+
+        let new_refresh_token_hash = new_cred.refresh_token.as_deref().map(sha256_hex);
+        let base_email = validated_base.email.clone().or_else(|| new_cred.email.clone());
+
+        // 4. 逐 profile 建条：锁内分配 id、去重、push，最后统一持久化
+        let mut added_ids = Vec::new();
+        {
+            let mut entries = self.entries.lock();
+            let mut next_id = entries.iter().map(|e| e.id).max().unwrap_or(0);
+            let mut region_seen: HashMap<String, usize> = HashMap::new();
+
+            for (arn, probe_region) in &profiles {
+                // refreshToken+profileArn 去重：同账号同 profile 已存在则跳过
+                let duplicate = entries.iter().any(|entry| {
+                    entry.credentials.refresh_token.as_deref().map(sha256_hex)
+                        == new_refresh_token_hash
+                        && entry.credentials.profile_arn.as_deref() == Some(arn.as_str())
+                });
+                if duplicate {
+                    tracing::info!("IdC profile 已存在，跳过: {}", arn);
+                    continue;
+                }
+
+                // api_region 以 profileArn 内嵌 region 为准，缺失回退探测 region
+                let api_region = arn
+                    .split(':')
+                    .nth(3)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(probe_region.as_str())
+                    .to_string();
+
+                // email 追加 region 后缀；同 region 多 profile 再追加序号
+                let email = base_email.as_ref().map(|e| {
+                    let n = region_seen.entry(api_region.clone()).or_insert(0);
+                    *n += 1;
+                    if *n > 1 {
+                        format!("{} ({} #{})", e, api_region, n)
+                    } else {
+                        format!("{} ({})", e, api_region)
+                    }
+                });
+
+                next_id += 1;
+                let mut cred = validated_base.clone();
+                cred.id = Some(next_id);
+                cred.profile_arn = Some(arn.clone());
+                cred.api_region = Some(api_region);
+                cred.email = email;
+
+                entries.push(CredentialEntry {
+                    id: next_id,
+                    credentials: cred,
+                    failure_count: 0,
+                    refresh_failure_count: 0,
+                    disabled: false,
+                    disabled_reason: None,
+                    success_count: 0,
+                    last_used_at: None,
+                    throttled_until: None,
+                    throttle_count: 0,
+                    rpm_window: VecDeque::new(),
+                });
+                added_ids.push(next_id);
+            }
+        }
+
+        if added_ids.is_empty() {
+            anyhow::bail!("凭据已存在（该账号的所有 profile 均已添加）");
+        }
+
+        self.persist_credentials()?;
+        tracing::info!("企业 IdC 账号按 profile 拆分添加 {} 条凭据: {:?}", added_ids.len(), added_ids);
+        Ok(added_ids)
+    }
+
     /// 删除凭据（Admin API）
     ///
     /// # 前置条件
@@ -3073,6 +3294,27 @@ impl MultiTokenManager {
             if enabled { "ENABLED" } else { "DISABLED" }
         );
         Ok(())
+    }
+
+    /// 查询指定凭据上游可用的模型 id 列表（Admin API）。
+    ///
+    /// 按需取该凭据的有效 token，调用上游 `ListAvailableModels`（企业 IdC / 不同订阅
+    /// 的账号可用模型可能不同，故按凭据各自查询，而非用全局列表）。
+    pub async fn get_available_models_for(&self, id: u64) -> anyhow::Result<Vec<String>> {
+        let token = self.ensure_valid_token_for(id).await?;
+
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        let effective_proxy =
+            credentials.effective_proxy(self.proxy.as_ref(), &self.proxy_groups.read());
+        list_available_models(&credentials, &self.config, &token, effective_proxy.as_ref()).await
     }
 
     /// 获取负载均衡模式（Admin API）
