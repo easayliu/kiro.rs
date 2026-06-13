@@ -214,10 +214,8 @@ fn default_auth_method() -> String {
 pub struct AddCredentialResponse {
     pub success: bool,
     pub message: String,
-    /// 新添加的凭据 ID（多条时为首个，兼容旧前端）
+    /// 新添加的凭据 ID
     pub credential_id: u64,
-    /// 新添加的全部凭据 ID（企业 IdC 按 profile 拆分时可能多条）
-    pub credential_ids: Vec<u64>,
     /// 用户邮箱（如果获取成功）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,

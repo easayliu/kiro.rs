@@ -126,8 +126,6 @@ export interface AddCredentialResponse {
   success: boolean
   message: string
   credentialId: number
-  // 企业 IdC 按 profile 拆分时可能返回多条（credentialId 为首个，兼容旧逻辑）
-  credentialIds?: number[]
   email?: string
 }
 
