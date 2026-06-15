@@ -870,14 +870,23 @@ impl KiroProvider {
                         self.token_manager.report_throttled(ctx.id);
                     }
                 }
-                // 退避决策：429 退避只在"没有其它鲜活凭据、只能等同一账号冷却"时才付出。
-                // 刚被限流的凭据已打 throttled_until，若仍有其它未冷却凭据可立即切换，
-                // 则跳过 sleep 直接换号重试，避免把退避时间叠加进流式首字（TTFT）关键
-                // 路径。408/5xx 多为上游整体瞬态，换号未必有用且退避能避免连环打爆上游，
-                // 故仍保留退避。
+                // 退避决策：退避只在"没有其它鲜活凭据、只能等同一账号恢复"时才付出。
+                // - 429：刚被限流的凭据已打 throttled_until，换号后 LRU 不会再选回它；
+                // - 5xx：上游对合法请求偶发 500/502/503/504，多为某后端实例瞬态故障，
+                //   换号（落到不同凭据 / 上游不同会话）比在同一号上死等退避更可能立即成功。
+                // 两类都满足：仍有其它未冷却鲜活凭据时跳过 sleep 直接换号重试，
+                // 避免把退避时间叠加进流式首字（TTFT）关键路径。
+                // 408（请求超时）保留退避：换号未必有用，退避能避免连环打爆上游。
+                //
+                // 换号生效性：balanced（默认）模式下选号成功即把 last_used_at 置为 now，
+                // 故刚失败的号在下一轮 LRU 里排最后、自然被避开；priority 模式会优先
+                // current_id（仍是同号），此处 5xx 不打冷却故下一轮可能选回同号、退避重试，
+                // 符合 priority"黏住单号"的语义。
                 let will_retry = attempt + 1 < max_retries;
+                let is_retryable_transient =
+                    status.as_u16() == 429 || status.is_server_error();
                 let skip_backoff = will_retry
-                    && status.as_u16() == 429
+                    && is_retryable_transient
                     && self.token_manager.has_fresh_credential(model.as_deref());
                 // 决策结果直接打进 WARN，生产可观测：是否换号、是否退避、用哪个凭据。
                 // 连续 attempt 的凭据 # 若变化即说明已换号；"跳过退避换号"说明优化生效。
@@ -885,7 +894,7 @@ impl KiroProvider {
                     "不再重试"
                 } else if skip_backoff {
                     "有鲜活凭据→跳过退避直接换号"
-                } else if status.as_u16() == 429 {
+                } else if is_retryable_transient {
                     "无鲜活凭据→退避后重试"
                 } else {
                     "退避后重试"
