@@ -1242,7 +1242,12 @@ fn convert_assistant_message(
                         }
                         "tool_use" => {
                             if let (Some(id), Some(name)) = (block.id, block.name) {
-                                let input = block.input.unwrap_or(serde_json::json!({}));
+                                // Kiro 要求 input 必须是 JSON object；客户端偶发传 ""/null/字符串化 JSON，
+                                // 非 object 一律归一为 {}，避免上游 REQUEST_BODY_INVALID
+                                let input = match block.input {
+                                    Some(v @ serde_json::Value::Object(_)) => v,
+                                    _ => serde_json::json!({}),
+                                };
                                 let mapped_name = map_tool_name(&name, tool_name_map);
                                 let mapped_id = map_tool_use_id(&id);
                                 tool_uses.push(ToolUseEntry::new(mapped_id, mapped_name).with_input(input));
