@@ -146,19 +146,33 @@ impl BindingTable {
         Some(picked)
     }
 
-    /// 清理长时间未活跃的绑定。定期由后台任务调用即可，不调用也不会崩，
-    /// 只是内存会随独立用户数线性增长。
-    #[allow(dead_code)]
-    pub fn sweep_stale(&self, max_idle: Duration) {
+    /// 清理长时间未活跃的绑定，返回移除的绑定条数。定期由后台任务调用，
+    /// 否则 `bindings` 会随独立 device 数只增不减（device 绑定场景下每个唯一
+    /// device_id 永久占一条）。
+    ///
+    /// 同时清理 `cred_errors` 中早已超出错误窗口的空队列，避免随历史出错凭据增长。
+    pub fn sweep_stale(&self, max_idle: Duration) -> usize {
         let now = Instant::now();
         let mut state = self.inner.lock();
+        let before = state.bindings.len();
         state
             .bindings
             .retain(|_, b| now.duration_since(b.last_seen) <= max_idle);
+        // cred_errors：丢弃窗口外时间戳后为空的条目（凭据近期无错误则无需保留）
+        state.cred_errors.retain(|_, dq| {
+            while let Some(front) = dq.front() {
+                if now.duration_since(*front) > ERROR_WINDOW {
+                    dq.pop_front();
+                } else {
+                    break;
+                }
+            }
+            !dq.is_empty()
+        });
+        before - state.bindings.len()
     }
 
     /// 当前绑定条数（观测/测试用）
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.inner.lock().bindings.len()
     }
@@ -264,6 +278,32 @@ mod tests {
     fn sweep_stale_removes_idle_bindings() {
         let table = BindingTable::new();
         table.resolve(42, &[1]).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let removed = table.sweep_stale(Duration::from_millis(10));
+        assert_eq!(removed, 1);
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn sweep_stale_keeps_active_and_reports_count() {
+        let table = BindingTable::new();
+        table.resolve(1, &[10]).unwrap();
+        table.resolve(2, &[10]).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        // 用很大的 max_idle：两条都不算过期，移除 0 条
+        let removed = table.sweep_stale(Duration::from_secs(3600));
+        assert_eq!(removed, 0);
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn sweep_stale_prunes_empty_cred_errors() {
+        let table = BindingTable::new();
+        // 制造一条 cred_errors 记录但不触发 rebind 阈值；
+        // 验证 sweep 与 report_error 状态共存时不 panic、绑定计数正确。
+        // （cred_errors 时间戳超 ERROR_WINDOW=60s 后才会被清空，单测不便等待，
+        //  此处只覆盖 sweep 同时遍历两张表的路径。）
+        table.report_error(99);
         std::thread::sleep(Duration::from_millis(20));
         table.sweep_stale(Duration::from_millis(10));
         assert_eq!(table.len(), 0);

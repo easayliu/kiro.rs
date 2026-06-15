@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -770,6 +770,37 @@ struct CredentialEntry {
     throttle_count: u32,
     /// RPM 滑动窗口：最近 60s 内的请求时间戳，超过 60s 的会被惰性裁剪
     rpm_window: VecDeque<DateTime<Utc>>,
+    /// 当前在途请求数（least-request 负载均衡信号）。
+    ///
+    /// 用 `Arc<AtomicUsize>` 而非普通字段：`InflightGuard` 攥着同一个 Arc，
+    /// 在请求/流式响应结束时（可能数百秒后、在另一 task 里）无锁 -1，
+    /// 不必回 entries 锁里重新查找 entry，与选号热路径完全解耦。
+    inflight: Arc<AtomicUsize>,
+}
+
+/// 在途计数 RAII 守卫。
+///
+/// 构造由选号路径在 entries 锁内完成（`inflight.fetch_add(1)` 后造 guard），
+/// Drop 时 `fetch_sub(1)`。必须随请求（非流式）或流式响应的整个生命周期存活：
+/// 正常 EOF、客户端断开、上游超时、panic 展开都会触发 Drop，保证计数不泄漏。
+///
+/// 不可 Clone：clone 会导致一次 +1 对应多次 -1（或反之），破坏计数。
+pub struct InflightGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl InflightGuard {
+    /// 在 entries 锁内调用：对给定计数器 +1 并返回守卫。
+    fn acquire(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// 禁用原因
@@ -978,7 +1009,17 @@ fn is_better(new: &CredentialEntry, current: Option<&CredentialEntry>, balanced:
         return new.credentials.priority < cur.credentials.priority;
     }
     if balanced {
-        // LRU within tier; None < Some (从未使用排最前)
+        // 同 priority 档内：先比在途请求数（least-request），少者优先。
+        // inflight 是实时负载信号，比 last_used_at 更能反映"谁现在更闲"——
+        // 长流式请求会让一个号 last_used_at 很新但仍有多个请求在途，
+        // 仅靠 LRU 会把新请求继续压给它。读 Relaxed 即可：选号已在 entries 锁内，
+        // 偶发的微小读偏差不影响均衡正确性。
+        let new_inflight = new.inflight.load(Ordering::Relaxed);
+        let cur_inflight = cur.inflight.load(Ordering::Relaxed);
+        if new_inflight != cur_inflight {
+            return new_inflight < cur_inflight;
+        }
+        // 在途数相同 → 退回 LRU；None < Some（从未使用排最前）
         match (&new.last_used_at, &cur.last_used_at) {
             (None, Some(_)) => true,
             (Some(_), None) => false,
@@ -1009,7 +1050,9 @@ const THROTTLE_BACKOFF_SECS: &[i64] = &[10, 20, 30, 60];
 ///
 /// 绑定特定凭据的调用上下文，确保 token、credentials 和 id 的一致性
 /// 用于解决并发调用时 current_id 竞态问题
-#[derive(Clone)]
+///
+/// 不可 Clone：持有 `InflightGuard`（在途计数守卫），其生命周期等于本次请求/流，
+/// clone 会破坏计数配平。
 pub struct CallContext {
     /// 凭据 ID（用于 report_success/report_failure）
     pub id: u64,
@@ -1017,6 +1060,11 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// 在途计数守卫：随本上下文存活，Drop 时该凭据 inflight -1。
+    /// 仅靠 Drop 副作用生效（不会被读取），故标 dead_code 抑制误报——
+    /// 删除此字段会使该凭据的在途计数永久 +1，破坏 least-request 均衡。
+    #[allow(dead_code)]
+    pub inflight: InflightGuard,
 }
 
 impl MultiTokenManager {
@@ -1078,6 +1126,7 @@ impl MultiTokenManager {
                     throttled_until: None,
                     throttle_count: 0,
                     rpm_window: VecDeque::new(),
+                    inflight: Arc::new(AtomicUsize::new(0)),
                 }
             })
             .collect();
@@ -1287,7 +1336,7 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials, InflightGuard)> {
         let mut entries = self.entries.lock();
 
         let is_opus = model
@@ -1365,7 +1414,10 @@ impl MultiTokenManager {
         };
 
         let entry = &mut entries[selected_index];
-        let result = (entry.id, entry.credentials.clone());
+        // 在 entries 锁内 +1：保证"选中即占位"，避免两个并发请求都看到同一号
+        // inflight=0 后同时选它造成惊群。
+        let guard = InflightGuard::acquire(entry.inflight.clone());
+        let result = (entry.id, entry.credentials.clone(), guard);
 
         if is_balanced {
             entry.last_used_at = Some(now.to_rfc3339());
@@ -1460,7 +1512,7 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials) = {
+            let (id, credentials, inflight) = {
                 let now = Utc::now();
                 // 第一轮优先尝试粘性绑定凭据（只试一次，后续轮次 fallback）
                 // 仍要校验 throttled_until：被上游限流的凭据若被粘性命中，
@@ -1475,7 +1527,11 @@ impl MultiTokenManager {
                                 && e.throttled_until.is_none_or(|until| until <= now)
                         })
                         .filter(|e| !is_opus || e.credentials.supports_opus())
-                        .map(|e| (e.id, e.credentials.clone()))
+                        .map(|e| {
+                            // 锁内 +1 占位（与 select_next_credential 一致）
+                            let guard = InflightGuard::acquire(e.inflight.clone());
+                            (e.id, e.credentials.clone(), guard)
+                        })
                 });
 
                 if let Some(hit) = preferred_hit {
@@ -1498,7 +1554,10 @@ impl MultiTokenManager {
                                 && !e.disabled
                                 && e.throttled_until.is_none_or(|until| until <= now)
                         })
-                        .map(|e| (e.id, e.credentials.clone()))
+                        .map(|e| {
+                            let guard = InflightGuard::acquire(e.inflight.clone());
+                            (e.id, e.credentials.clone(), guard)
+                        })
                 };
 
                 if let Some(hit) = current_hit {
@@ -1528,11 +1587,11 @@ impl MultiTokenManager {
                         }
                     }
 
-                    if let Some((new_id, new_creds)) = best {
+                    if let Some((new_id, new_creds, guard)) = best {
                         // 更新 current_id
                         let mut current_id = self.current_id.lock();
                         *current_id = new_id;
-                        (new_id, new_creds)
+                        (new_id, new_creds, guard)
                     } else {
                         let entries = self.entries.lock();
                         // 注意：必须在 bail! 之前计算 available_count，
@@ -1549,12 +1608,14 @@ impl MultiTokenManager {
             };
 
             // 尝试获取/刷新 Token
-            match self.try_ensure_token(id, &credentials).await {
+            match self.try_ensure_token(id, &credentials, inflight).await {
                 Ok(ctx) => {
                     self.record_request_for_rpm(ctx.id);
                     return Ok(ctx);
                 }
                 Err(e) => {
+                    // 失败路径：inflight guard 已随 try_ensure_token 的入参 move 进去，
+                    // 错误返回时在该函数内 Drop（-1），不会泄漏到下一轮重试。
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available =
                         if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
@@ -1621,10 +1682,13 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID，用于更新正确的条目
     /// * `credentials` - 凭据信息
+    /// * `inflight` - 在途计数守卫（已在选号时 +1）；成功则移入 CallContext 随请求存活，
+    ///   失败（返回 Err）则在本函数结束时 Drop（-1），不泄漏到重试。
     async fn try_ensure_token(
         &self,
         id: u64,
         credentials: &KiroCredentials,
+        inflight: InflightGuard,
     ) -> anyhow::Result<CallContext> {
         // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
         if credentials.is_api_key_credential() {
@@ -1636,6 +1700,7 @@ impl MultiTokenManager {
                 id,
                 credentials: credentials.clone(),
                 token,
+                inflight,
             });
         }
 
@@ -1727,6 +1792,7 @@ impl MultiTokenManager {
             id,
             credentials: creds,
             token,
+            inflight,
         })
     }
 
@@ -2915,6 +2981,7 @@ impl MultiTokenManager {
                 throttled_until: None,
                 throttle_count: 0,
                 rpm_window: VecDeque::new(),
+                inflight: Arc::new(AtomicUsize::new(0)),
             });
         }
 
@@ -3295,6 +3362,68 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 构造最小可比较的 CredentialEntry，仅设置 is_better 关心的字段。
+    fn entry_for_balance(
+        id: u64,
+        priority: u32,
+        last_used_at: Option<&str>,
+        inflight: usize,
+    ) -> CredentialEntry {
+        let mut credentials = KiroCredentials::default();
+        credentials.priority = priority;
+        CredentialEntry {
+            id,
+            credentials,
+            failure_count: 0,
+            refresh_failure_count: 0,
+            disabled: false,
+            disabled_reason: None,
+            success_count: 0,
+            last_used_at: last_used_at.map(|s| s.to_string()),
+            throttled_until: None,
+            throttle_count: 0,
+            rpm_window: VecDeque::new(),
+            inflight: Arc::new(AtomicUsize::new(inflight)),
+        }
+    }
+
+    #[test]
+    fn is_better_prefers_lower_inflight_in_balanced_mode() {
+        // 同 priority、b 的 last_used_at 更早（LRU 上 b 更优），但 a 在途数更少。
+        // balanced 下应让 a 胜出：least-request 优先于 LRU。
+        let a = entry_for_balance(1, 0, Some("2026-01-01T00:00:01Z"), 0);
+        let b = entry_for_balance(2, 0, Some("2026-01-01T00:00:00Z"), 3);
+        assert!(is_better(&a, Some(&b), true));
+        assert!(!is_better(&b, Some(&a), true));
+    }
+
+    #[test]
+    fn is_better_falls_back_to_lru_when_inflight_equal() {
+        // 在途数相同 → 退回 LRU：last_used_at 更早者优先。
+        let older = entry_for_balance(1, 0, Some("2026-01-01T00:00:00Z"), 2);
+        let newer = entry_for_balance(2, 0, Some("2026-01-01T00:00:05Z"), 2);
+        assert!(is_better(&older, Some(&newer), true));
+        assert!(!is_better(&newer, Some(&older), true));
+    }
+
+    #[test]
+    fn is_better_priority_beats_inflight() {
+        // 低 priority 永远优先，即便其在途数更高（priority 是硬约束）。
+        let high_prio_busy = entry_for_balance(1, 0, None, 10);
+        let low_prio_idle = entry_for_balance(2, 5, None, 0);
+        assert!(is_better(&high_prio_busy, Some(&low_prio_idle), true));
+        assert!(!is_better(&low_prio_idle, Some(&high_prio_busy), true));
+    }
+
+    #[test]
+    fn is_better_ignores_inflight_when_not_balanced() {
+        // 非 balanced 模式：同 priority 下不做任何二次比较，恒为 false（保持原序）。
+        let idle = entry_for_balance(1, 0, None, 0);
+        let busy = entry_for_balance(2, 0, None, 9);
+        assert!(!is_better(&idle, Some(&busy), false));
+        assert!(!is_better(&busy, Some(&idle), false));
+    }
 
     #[test]
     fn test_is_token_expired_with_expired_token() {
@@ -3911,13 +4040,13 @@ mod tests {
 
         // 高优先级档两个凭据都从未使用过，按 LRU 应选 id=1（None 排最前，
         // 同样为 None 时按出现顺序选第一个）
-        let (id, _) = manager.select_next_credential(None).expect("应选出一个凭据");
+        let (id, _, _) = manager.select_next_credential(None).expect("应选出一个凭据");
         assert!(id == 1 || id == 2, "必须从高优先级档（priority=0）内选取，得到 {}", id);
         assert_ne!(id, 3, "低优先级凭据不应抢占高优先级档");
 
         // 再选一次，high_a 已经被打上 last_used_at，high_b 仍是 None，应轮到 high_b
         let first = id;
-        let (next_id, _) = manager.select_next_credential(None).expect("应选出第二个");
+        let (next_id, _, _) = manager.select_next_credential(None).expect("应选出第二个");
         assert_ne!(next_id, 3, "低优先级凭据仍不应被选");
         assert_ne!(next_id, first, "同档内 LRU 应轮到另一个");
     }
@@ -3946,7 +4075,7 @@ mod tests {
 
         // 连续多次选择都应落到凭据 2
         for _ in 0..5 {
-            let (id, _) = manager.select_next_credential(None).expect("凭据 2 应可用");
+            let (id, _, _) = manager.select_next_credential(None).expect("凭据 2 应可用");
             assert_eq!(id, 2, "凭据 1 处于冷却期，应只选凭据 2");
         }
 
@@ -3955,7 +4084,7 @@ mod tests {
         // 现在两者都可用：last_used_at 让 LRU 又能选到凭据 1
         let mut got_one = false;
         for _ in 0..4 {
-            let (id, _) = manager.select_next_credential(None).unwrap();
+            let (id, _, _) = manager.select_next_credential(None).unwrap();
             if id == 1 {
                 got_one = true;
                 break;
@@ -3987,7 +4116,7 @@ mod tests {
         manager.report_throttled(2);
 
         // 全员冷却中，select 不应 None；按 last_used_at 最早应选凭据 1
-        let (id, _) = manager
+        let (id, _, _) = manager
             .select_next_credential(None)
             .expect("全员冷却时应回退选择，而不是返回 None");
         assert_eq!(id, 1, "应选到最早被限流的凭据 1（其 last_used_at 最早）");
@@ -4053,7 +4182,7 @@ mod tests {
             manager.report_failure(1);
         }
 
-        let (id, _) = manager.select_next_credential(None).expect("应降级到低优先级档");
+        let (id, _, _) = manager.select_next_credential(None).expect("应降级到低优先级档");
         assert_eq!(id, 2, "高优先级全部 disabled 后应降级到低优先级凭据");
     }
 

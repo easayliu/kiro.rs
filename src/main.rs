@@ -257,6 +257,30 @@ async fn main() {
         });
     }
 
+    // 后台清理粘性绑定表：定期回收长时间未活跃的 device→凭证绑定，
+    // 防止 binding_table 随独立 device 数只增不减（绑定仅内存维护，无此清理会
+    // 随运行时长无界增长）。空闲超过 STALE_IDLE 的绑定下次请求会重新选凭证。
+    {
+        let binding_table = app_state.binding_table.clone();
+        tokio::spawn(async move {
+            // 扫描间隔 10 分钟；空闲超过 6 小时的绑定视为过期回收。
+            // 6 小时远大于上游 prompt cache TTL（1 小时），回收不会损伤仍在复用缓存的活跃 device。
+            const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+            const STALE_IDLE: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+            loop {
+                tokio::time::sleep(SWEEP_INTERVAL).await;
+                let removed = binding_table.sweep_stale(STALE_IDLE);
+                if removed > 0 {
+                    tracing::debug!(
+                        "粘性绑定清理：回收 {} 条过期绑定，当前剩余 {} 条",
+                        removed,
+                        binding_table.len()
+                    );
+                }
+            }
+        });
+    }
+
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
     // 安全检查：空字符串被视为未配置，防止空 key 绕过认证
     let admin_key_valid = config
