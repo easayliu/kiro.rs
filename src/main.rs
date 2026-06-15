@@ -212,9 +212,10 @@ async fn main() {
         });
     }
 
-    // 后台 Token 预刷新：每 60s 扫描所有 OAuth 凭据，把 10 分钟内到期的提前刷掉，
-    // 让首字请求不再为「正好命中刚过期的凭据」付出刷新延迟。
-    // 单凭据有 refresh_lock 串行保护；这里跨凭据并发，控制在 4 路防止上游集中限流。
+    // 后台 Token 预刷新：启动立即扫一次，之后每 60s 扫描所有 OAuth 凭据，
+    // 把 10 分钟内到期的提前刷掉，让首字请求不再为「正好命中刚过期的凭据」
+    // 付出刷新延迟。单凭据有 refresh_lock 串行保护；跨凭据并发控制在 4 路防止
+    // 上游集中限流。
     {
         let tm = token_manager.clone();
         tokio::spawn(async move {
@@ -222,37 +223,36 @@ async fn main() {
             const SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
             const REFRESH_CONCURRENCY: usize = 4;
             loop {
-                tokio::time::sleep(SCAN_INTERVAL).await;
                 let due = tm.refresh_due_ids();
-                if due.is_empty() {
-                    continue;
-                }
-                tracing::info!("后台预刷新：{} 个凭据临期，开始刷新", due.len());
-                let tm_inner = tm.clone();
-                let results: Vec<(u64, anyhow::Result<()>)> = stream::iter(due)
-                    .map(|id| {
-                        let tm = tm_inner.clone();
-                        async move { (id, tm.refresh_if_due(id).await) }
-                    })
-                    .buffer_unordered(REFRESH_CONCURRENCY)
-                    .collect()
-                    .await;
-                let (ok, err): (Vec<_>, Vec<_>) =
-                    results.into_iter().partition(|(_, r)| r.is_ok());
-                if !err.is_empty() {
-                    for (id, e) in &err {
-                        tracing::warn!(
-                            "后台预刷新失败：凭据 #{} {}",
-                            id,
-                            e.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
-                        );
+                if !due.is_empty() {
+                    tracing::info!("后台预刷新：{} 个凭据临期，开始刷新", due.len());
+                    let tm_inner = tm.clone();
+                    let results: Vec<(u64, anyhow::Result<()>)> = stream::iter(due)
+                        .map(|id| {
+                            let tm = tm_inner.clone();
+                            async move { (id, tm.refresh_if_due(id).await) }
+                        })
+                        .buffer_unordered(REFRESH_CONCURRENCY)
+                        .collect()
+                        .await;
+                    let (ok, err): (Vec<_>, Vec<_>) =
+                        results.into_iter().partition(|(_, r)| r.is_ok());
+                    if !err.is_empty() {
+                        for (id, e) in &err {
+                            tracing::warn!(
+                                "后台预刷新失败：凭据 #{} {}",
+                                id,
+                                e.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
+                            );
+                        }
                     }
+                    tracing::info!(
+                        "后台预刷新完成：成功 {} 个，失败 {} 个",
+                        ok.len(),
+                        err.len()
+                    );
                 }
-                tracing::info!(
-                    "后台预刷新完成：成功 {} 个，失败 {} 个",
-                    ok.len(),
-                    err.len()
-                );
+                tokio::time::sleep(SCAN_INTERVAL).await;
             }
         });
     }
