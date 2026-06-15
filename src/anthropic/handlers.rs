@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use std::sync::Arc;
 
-use super::cache_tracker::{CacheProfile, CacheTracker};
+use super::cache_tracker::{CacheProfile, CacheScope, CacheTracker};
 use super::converter::{ConversionError, KIRO_MAX_REQUEST_BYTES, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, CacheUsage, SseEvent, StreamContext};
@@ -48,15 +48,27 @@ pub(crate) struct CacheUsageContext {
 
 /// 粘性绑定解析：返回本次请求应优先使用的凭证 id。
 ///
+/// 粘性仅在 cache scope 为 `PerCredential` 时启用——此模式下本地 prompt cache
+/// 模拟按 credential 隔离，同一用户换号会 miss，故需要把同一身份钉在同一凭据上。
+/// 默认 `Global` 模式下 cache 命中只取决于用户身份、与选到哪个凭据无关（Kiro 上游
+/// 本身也无真实 prompt cache），粘性零收益却会把负载倾斜到单号，因此直接跳过，
+/// 让选号走纯 least-request / LRU 均衡。
+///
+/// 其余短路条件：
 /// - 未提供 binding_key（没有 metadata.user_id）→ 返回 None，走默认选择
 /// - 无可用凭证 → 返回 None
 /// - 首次见到的用户会在绑定表中创建新绑定
 fn resolve_sticky_preference(
+    cache_tracker: &CacheTracker,
     binding_table: &BindingTable,
     provider: &KiroProvider,
     binding_key: Option<u64>,
     model: &str,
 ) -> Option<u64> {
+    // Global 模式：换号不影响 cache 命中，禁用粘性以保留负载均衡。
+    if !matches!(cache_tracker.cache_scope(), CacheScope::PerCredential) {
+        return None;
+    }
     let identity = binding_key?;
     let available = provider.available_credential_ids(Some(model));
     binding_table.resolve(identity, &available)
@@ -412,6 +424,7 @@ pub async fn post_messages(
     let binding_key = cache_profile.binding_key();
     let binding_table = state.binding_table.clone();
     let preferred = resolve_sticky_preference(
+        &cache_tracker,
         &binding_table,
         provider.as_ref(),
         binding_key,
@@ -1236,6 +1249,7 @@ pub async fn post_messages_cc(
     let binding_key = cache_profile.binding_key();
     let binding_table = state.binding_table.clone();
     let preferred = resolve_sticky_preference(
+        &cache_tracker,
         &binding_table,
         provider.as_ref(),
         binding_key,
