@@ -3035,6 +3035,31 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 列出当前需要刷新（已过期或 10 分钟内到期）的 OAuth 凭据 ID。
+    ///
+    /// 用于后台预刷新任务：跳过 API Key 凭据（无需刷新）和已禁用凭据
+    /// （`InvalidRefreshToken`/`InvalidConfig` 等永久失效场景再刷也是空跑）。
+    pub fn refresh_due_ids(&self) -> Vec<u64> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .filter(|e| !e.disabled)
+            .filter(|e| !e.credentials.is_api_key_credential())
+            .filter(|e| {
+                is_token_expired(&e.credentials) || is_token_expiring_soon(&e.credentials)
+            })
+            .map(|e| e.id)
+            .collect()
+    }
+
+    /// 按需刷新指定凭据的 Token（不返回 token，仅做副作用）。
+    ///
+    /// 给后台预刷新任务复用 `ensure_valid_token_for` 的双检 + 持锁 + 持久化逻辑，
+    /// 避免重复实现；返回是否实际触发了上游刷新。
+    pub async fn refresh_if_due(&self, id: u64) -> anyhow::Result<()> {
+        self.ensure_valid_token_for(id).await.map(|_| ())
+    }
+
     /// 取指定凭据的有效 access_token（按需刷新），用于 Admin 侧需要上游鉴权的调用。
     ///
     /// API Key 凭据直接返回 kiroApiKey；OAuth 凭据在过期/临期时持刷新锁刷新并持久化。
