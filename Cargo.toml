@@ -1,6 +1,6 @@
 [package]
 name = "kiro-rs"
-version = "2026.3.115"
+version = "2026.3.116"
 edition = "2024"
 
 [profile.release]
