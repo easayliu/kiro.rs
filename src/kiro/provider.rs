@@ -899,6 +899,20 @@ impl KiroProvider {
                     status,
                     body
                 );
+                // 500 Internal Server Error：dump 实际发往上游的 payload，便于离线复现
+                // 排查是否由特定请求体触发（与 400 malformed 的 dump 格式对齐）。
+                // 仅 500 dump（不含 408/429/502/503/504 等），避免限流/网关瞬态刷屏超大 body；
+                // 且仅首轮（attempt==0）dump 一次，后续重试同一 body 不重复刷屏。
+                if status.as_u16() == 500 && attempt == 0 {
+                    tracing::error!(
+                        cred_id = ctx.id,
+                        status = %status,
+                        api_type = api_type,
+                        response_body = %body,
+                        request_body = %outbound_body,
+                        "API 500 上游内部错误 - dump 上游请求/响应"
+                    );
+                }
                 last_error = Some(anyhow::Error::new(UpstreamHttpError {
                     status: status.as_u16(),
                     body,
