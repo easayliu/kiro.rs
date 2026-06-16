@@ -33,6 +33,9 @@ const MAX_TOTAL_RETRIES: usize = 9;
 pub struct ApiCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    /// 向上游发出本次（成功）请求的时刻。流式下上游往往等首 token 生成好才 flush
+    /// 响应头，故 TTFT（首字耗时）应以此为原点、到首个 body 字节，而非响应头到达后。
+    pub upstream_request_at: Instant,
 }
 
 /// 已缓冲完整响应体的调用结果（非流式专用）
@@ -440,6 +443,7 @@ impl KiroProvider {
                 request = request.header("tokentype", "API_KEY");
             }
 
+            let send_start = Instant::now();
             let response = match request
                 .header("x-amz-user-agent", &x_amz_user_agent)
                 .header("user-agent", &user_agent)
@@ -475,6 +479,7 @@ impl KiroProvider {
                 return Ok(ApiCallResult {
                     response,
                     credential_id: ctx.id,
+                    upstream_request_at: send_start,
                 });
             }
 
@@ -726,6 +731,7 @@ impl KiroProvider {
                 return Ok(ApiCallResult {
                     response,
                     credential_id: ctx.id,
+                    upstream_request_at: send_start,
                 });
             }
 

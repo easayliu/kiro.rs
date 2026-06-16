@@ -528,6 +528,8 @@ async fn handle_stream_request(
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    // TTFT 原点钉在「向上游发出请求」时刻，覆盖上游等首 token 的等待（见 ApiCallResult）。
+    ctx.set_ttft_origin(api_result.upstream_request_at);
     ctx.set_cache_usage(cache_context);
     // 计费完成后（流末尾 contextUsageEvent）把缩放后的 billed 累计回写缓存，供下次命中守恒。
     ctx.set_billing_writeback(cache_tracker.clone(), cache_writeback);
@@ -652,6 +654,7 @@ fn create_sse_stream(
                             // stats.start 在 create_sse_stream 构造时（即拿到响应头后）起算。
                             // 配合 provider 的 acquire/send 即可拼出完整首字耗时分解。
                             if stats.bytes == 0 {
+                                ctx.mark_first_byte();
                                 tracing::debug!(
                                     "[TTFT] 上游首字节: header→first_byte={}ms",
                                     stats.start.elapsed().as_millis()
@@ -1356,6 +1359,8 @@ async fn handle_stream_request_buffered(
 
     // 创建缓冲流处理上下文
     let mut ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    // TTFT 原点钉在「向上游发出请求」时刻，覆盖上游等首 token 的等待（见 ApiCallResult）。
+    ctx.set_ttft_origin(api_result.upstream_request_at);
     ctx.set_cache_usage(cache_context);
     // 计费完成后（流末尾 contextUsageEvent）把缩放后的 billed 累计回写缓存，供下次命中守恒。
     ctx.set_billing_writeback(cache_tracker.clone(), cache_writeback);
@@ -1417,6 +1422,9 @@ fn create_buffered_sse_stream(
                     chunk_result = body_stream.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
+                                if stats.bytes == 0 {
+                                    ctx.mark_first_byte();
+                                }
                                 stats.bytes += chunk.len();
                                 // 解码事件
                                 if let Err(e) = decoder.feed(&chunk) {

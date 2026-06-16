@@ -638,6 +638,11 @@ pub struct StreamContext {
     upstream_credit: Option<f64>,
     /// StreamContext 创建时刻，用于在计费汇总日志里输出请求耗时。
     start: Instant,
+    /// 上游首字节到达时刻，用于在汇总日志里输出 TTFT（首字耗时）。
+    first_byte_at: Option<Instant>,
+    /// TTFT 计时原点：向上游发出请求的时刻（由 handler 注入）。流式下上游常等首
+    /// token 生成好才 flush 响应头，故以此为原点才能量到真实首字耗时；缺省回退 start。
+    ttft_origin: Option<Instant>,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -679,6 +684,8 @@ impl StreamContext {
             billing_writeback: None,
             upstream_credit: None,
             start: Instant::now(),
+            first_byte_at: None,
+            ttft_origin: None,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             thinking_enabled,
@@ -707,6 +714,18 @@ impl StreamContext {
     /// 会把缩放后的 billed 累计回写到缓存条目，供下次命中实现读写守恒。
     pub fn set_billing_writeback(&mut self, tracker: Arc<CacheTracker>, writeback: CacheWriteback) {
         self.billing_writeback = Some((tracker, writeback));
+    }
+
+    /// 设置 TTFT 计时原点（向上游发出请求的时刻）。
+    pub fn set_ttft_origin(&mut self, origin: Instant) {
+        self.ttft_origin = Some(origin);
+    }
+
+    /// 标记上游首字节到达时刻。仅首次调用生效。
+    pub fn mark_first_byte(&mut self) {
+        if self.first_byte_at.is_none() {
+            self.first_byte_at = Some(Instant::now());
+        }
     }
 
     /// 生成 message_start 事件
@@ -1318,6 +1337,15 @@ impl StreamContext {
         let stop_reason = self.state_manager.get_stop_reason();
         let truncated = stop_reason == "max_tokens";
         super::billing_stats().record(actual, official, margin, truncated);
+        // TTFT（首字耗时）：从「向上游发出请求」（ttft_origin，未注入则回退 start）到
+        // 上游首字节。以发出请求为原点才能量到上游"等首 token"的等待——流式下上游常等
+        // 首 token 生成好才 flush 响应头，若从响应头起算几乎恒为 0。
+        // 缺失（None）记 0，通常只发生在空流/未出首字节即报错的退化场景。
+        let ttft_base = self.ttft_origin.unwrap_or(self.start);
+        let ttft_ms = self
+            .first_byte_at
+            .map(|t| t.saturating_duration_since(ttft_base).as_millis() as u64)
+            .unwrap_or(0);
         tracing::info!(
             model = %self.model,
             input_tokens = billing.uncached_input_tokens.max(1),
@@ -1332,6 +1360,7 @@ impl StreamContext {
             official_price_usd = official,
             margin_usd = margin,
             stop_reason = %stop_reason,
+            ttft_ms = ttft_ms,
             elapsed_secs = self.start.elapsed().as_secs_f64(),
             "请求完成（流式）"
         );
@@ -1393,6 +1422,16 @@ impl BufferedStreamContext {
     /// 注入计费回写句柄（透传到内部 StreamContext）
     pub fn set_billing_writeback(&mut self, tracker: Arc<CacheTracker>, writeback: CacheWriteback) {
         self.inner.set_billing_writeback(tracker, writeback);
+    }
+
+    /// 设置 TTFT 计时原点（透传到内部 StreamContext）
+    pub fn set_ttft_origin(&mut self, origin: Instant) {
+        self.inner.set_ttft_origin(origin);
+    }
+
+    /// 标记上游首字节到达时刻（透传到内部 StreamContext，用于 TTFT 统计）
+    pub fn mark_first_byte(&mut self) {
+        self.inner.mark_first_byte();
     }
 
     /// 请求的模型名称（仅用于诊断日志）
