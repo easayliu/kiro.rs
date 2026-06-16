@@ -87,6 +87,14 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_region: Option<String>,
 
+    /// API Host 模板（用于 generateAssistantResponse / mcp 的 URL 与 host 头），
+    /// 模板中的 `{region}` 占位符会被替换为有效 API region。
+    /// 未配置时默认 `q.{region}.amazonaws.com`；可设为 `runtime.{region}.kiro.dev` 切换到 Kiro runtime 端点。
+    /// 注意：`ListAvailableModels` 不受此项影响（runtime 端点不提供该 API），始终走 `q.{region}.amazonaws.com`。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_host_template: Option<String>,
+
     #[serde(default = "default_kiro_version")]
     pub kiro_version: String,
 
@@ -258,6 +266,7 @@ impl Default for Config {
             region: default_region(),
             auth_region: None,
             api_region: None,
+            api_host_template: None,
             kiro_version: default_kiro_version(),
             machine_id: None,
             api_key: None,
@@ -302,6 +311,18 @@ impl Config {
     /// 优先使用 api_region，未配置时回退到 region
     pub fn effective_api_region(&self) -> &str {
         self.api_region.as_deref().unwrap_or(&self.region)
+    }
+
+    /// 默认 API Host 模板（`q.{region}.amazonaws.com`）。
+    pub const DEFAULT_API_HOST_TEMPLATE: &'static str = "q.{region}.amazonaws.com";
+
+    /// 把 API host 模板里的 `{region}` 替换为入参 region，返回最终 host。
+    /// 调用方传入的应是 `effective_api_region` 解析后的 region。
+    pub fn effective_api_host(&self, region: &str) -> String {
+        self.api_host_template
+            .as_deref()
+            .unwrap_or(Self::DEFAULT_API_HOST_TEMPLATE)
+            .replace("{region}", region)
     }
 
     /// 生成 API 请求的 user-agent（streaming API）

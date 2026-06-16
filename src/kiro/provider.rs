@@ -123,25 +123,20 @@ impl KiroProvider {
     /// 获取凭据级 API 基础 URL
     fn base_url_for(&self, credentials: &KiroCredentials) -> String {
         format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
-            credentials.effective_api_region(self.token_manager.config())
+            "https://{}/generateAssistantResponse",
+            self.base_domain_for(credentials)
         )
     }
 
     /// 获取凭据级 MCP API URL
     fn mcp_url_for(&self, credentials: &KiroCredentials) -> String {
-        format!(
-            "https://q.{}.amazonaws.com/mcp",
-            credentials.effective_api_region(self.token_manager.config())
-        )
+        format!("https://{}/mcp", self.base_domain_for(credentials))
     }
 
-    /// 获取凭据级 API 基础域名
+    /// 获取凭据级 API 基础域名（受 `config.api_host_template` 控制）
     fn base_domain_for(&self, credentials: &KiroCredentials) -> String {
-        format!(
-            "q.{}.amazonaws.com",
-            credentials.effective_api_region(self.token_manager.config())
-        )
+        let config = self.token_manager.config();
+        config.effective_api_host(credentials.effective_api_region(config))
     }
 
     /// 从请求体中提取模型信息
