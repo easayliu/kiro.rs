@@ -76,6 +76,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import { RelativeTime } from '@/components/relative-time'
@@ -847,12 +848,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <div className="text-2xl font-semibold tracking-tight">连接失败</div>
           <p className="mt-2 font-mono text-xs text-muted-foreground">{(error as Error).message}</p>
           <div className="mt-5 flex gap-2">
-            <button onClick={() => refetch()} className="inline-flex h-10 flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90">
+            <Button onClick={() => refetch()} className="flex-1">
               <RefreshCw className="h-4 w-4" /> Retry
-            </button>
-            <button onClick={handleLogout} className="inline-flex h-10 cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-border px-3 text-sm font-medium transition-colors hover:bg-muted">
+            </Button>
+            <Button variant="outline" onClick={handleLogout}>
               <LogOut className="h-4 w-4" /> Sign out
-            </button>
+            </Button>
           </div>
         </div>
       </div>
@@ -874,7 +875,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           }}
         >
           <div className="flex items-center gap-2.5">
-            <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-brand-gradient text-white">
+            <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-primary text-primary-foreground">
               <span className="font-mono text-xs font-bold">K</span>
             </div>
             <div className="flex items-baseline gap-1.5">
@@ -919,7 +920,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <h1 className="flex items-baseline gap-2 text-balance tracking-tight">
                 <span className="text-2xl font-semibold sm:text-3xl">凭据控制台</span>
                 <span className="tnum text-base font-semibold sm:text-lg">
-                  <span className={cn(availableCount > 0 ? 'text-brand-gradient' : 'text-muted-foreground')}>{availableCount}</span>
+                  <span className={cn(availableCount > 0 ? 'text-foreground' : 'text-muted-foreground')}>{availableCount}</span>
                   <span className="font-normal text-muted-foreground/40">/</span>
                   <span className="font-medium text-muted-foreground">{totalCount}</span>
                 </span>
@@ -1013,14 +1014,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
               <div className="flex flex-wrap items-center gap-x-2 gap-y-2">
                 {/* Search — fills the row on mobile, capped & left-aligned on desktop */}
                 <div className="relative order-1 min-w-0 flex-1 lg:max-w-xs">
-                  <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                  <input
+                  <Search className="pointer-events-none absolute left-3 top-1/2 z-10 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <Input
                     type="search"
                     inputMode="search"
                     placeholder="搜索邮箱 / ID / 代理 / 分组"
                     value={search}
                     onChange={e => setSearch(e.target.value)}
-                    className="h-9 w-full rounded-lg border border-input bg-background pl-9 pr-9 text-sm transition-colors placeholder:text-muted-foreground/70 focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20"
+                    className="h-9 pl-9 pr-9"
                   />
                   {search && (
                     <button
@@ -1035,28 +1036,32 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
                 {/* Primary inline actions — icon-only on mobile, text on sm+; far right on desktop */}
                 <div className="order-2 flex shrink-0 items-center gap-1.5 lg:order-3">
-                <button
+                <Button
+                  variant="outline"
+                  size="sm"
                   onClick={handleQueryCurrentPageInfo}
                   disabled={queryingInfo}
                   title={queryingInfo ? `查询中 ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询当前页信息'}
                   aria-label="查询当前页信息"
-                  className="inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-border px-2.5 text-xs font-medium text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40 sm:px-3"
+                  className="shrink-0 gap-1.5 px-2.5 text-xs [&_svg]:size-3.5 sm:px-3"
                 >
-                  <RefreshCw className={cn('h-3.5 w-3.5', queryingInfo && 'animate-spin')} />
+                  <RefreshCw className={cn(queryingInfo && 'animate-spin')} />
                   <span className="hidden sm:inline">
                     {queryingInfo ? `${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询'}
                   </span>
-                </button>
+                </Button>
                 {!readOnly && (
-                  <button
+                  <Button
+                    variant="outline"
+                    size="sm"
                     onClick={() => setKamImportDialogOpen(true)}
                     title="KAM 导入"
                     aria-label="KAM 导入"
-                    className="inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-border px-2.5 text-xs font-medium text-foreground transition-colors hover:bg-muted sm:px-3"
+                    className="shrink-0 gap-1.5 px-2.5 text-xs [&_svg]:size-3.5 sm:px-3"
                   >
-                    <FileUp className="h-3.5 w-3.5" />
+                    <FileUp />
                     <span className="hidden sm:inline">KAM</span>
-                  </button>
+                  </Button>
                 )}
 
                 <DropdownMenu>
@@ -1107,39 +1112,46 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
                 {/* Filter chips — full second row on mobile, inline between search & actions on desktop */}
                 <div className="order-3 flex w-full items-center gap-1 overflow-x-auto no-scrollbar lg:order-2 lg:w-auto lg:flex-1">
-                <Chip active={filter === 'all'} onClick={() => setFilter('all')} count={allCreds.length}>全部</Chip>
-                <Chip
-                  active={filter === 'available'}
-                  onClick={() => setFilter('available')}
-                  count={availableCount}
-                  tone={availableCount > 0 ? 'ok' : 'default'}
+                <ToggleGroup
+                  type="single"
+                  value={filter}
+                  onValueChange={v => { if (v) setFilter(v as FilterKey) }}
+                  className="shrink-0"
                 >
-                  可用
-                </Chip>
-                <Chip
-                  active={filter === 'faulty'}
-                  onClick={() => setFilter('faulty')}
-                  count={faultyCredentialCount}
-                  tone={faultyCredentialCount > 0 ? 'warn' : 'default'}
-                >
-                  异常
-                </Chip>
-                <Chip
-                  active={filter === 'throttled'}
-                  onClick={() => setFilter('throttled')}
-                  count={throttledCredentialCount}
-                  tone={throttledCredentialCount > 0 ? 'warn' : 'default'}
-                >
-                  限流冷却
-                </Chip>
-                <Chip
-                  active={filter === 'disabled'}
-                  onClick={() => setFilter('disabled')}
-                  count={disabledCredentialCount}
-                  tone={disabledCredentialCount > 0 ? 'bad' : 'default'}
-                >
-                  禁用
-                </Chip>
+                  <FilterToggle value="all" active={filter === 'all'} count={allCreds.length}>全部</FilterToggle>
+                  <FilterToggle
+                    value="available"
+                    active={filter === 'available'}
+                    count={availableCount}
+                    tone={availableCount > 0 ? 'ok' : 'default'}
+                  >
+                    可用
+                  </FilterToggle>
+                  <FilterToggle
+                    value="faulty"
+                    active={filter === 'faulty'}
+                    count={faultyCredentialCount}
+                    tone={faultyCredentialCount > 0 ? 'warn' : 'default'}
+                  >
+                    异常
+                  </FilterToggle>
+                  <FilterToggle
+                    value="throttled"
+                    active={filter === 'throttled'}
+                    count={throttledCredentialCount}
+                    tone={throttledCredentialCount > 0 ? 'warn' : 'default'}
+                  >
+                    限流冷却
+                  </FilterToggle>
+                  <FilterToggle
+                    value="disabled"
+                    active={filter === 'disabled'}
+                    count={disabledCredentialCount}
+                    tone={disabledCredentialCount > 0 ? 'bad' : 'default'}
+                  >
+                    禁用
+                  </FilterToggle>
+                </ToggleGroup>
 
                 {verifying && !verifyDialogOpen && (
                   <button
@@ -1288,23 +1300,27 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
                 {totalPages > 1 && (
                   <div className="mt-8 flex flex-wrap items-center justify-center gap-3">
-                    <button
+                    <Button
+                      variant="ghost"
+                      size="sm"
                       onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
                       disabled={safePage === 1}
-                      className="inline-flex h-9 min-w-[80px] cursor-pointer items-center justify-center gap-1 rounded-lg text-sm font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                      className="min-w-[80px] gap-1 text-muted-foreground hover:text-foreground"
                     >
                       <ChevronLeft className="h-4 w-4" /> 上一页
-                    </button>
+                    </Button>
                     <span className="tnum font-mono text-xs text-muted-foreground">
                       <span className="font-medium text-foreground">{safePage}</span> / {totalPages}
                     </span>
-                    <button
+                    <Button
+                      variant="ghost"
+                      size="sm"
                       onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
                       disabled={safePage === totalPages}
-                      className="inline-flex h-9 min-w-[80px] cursor-pointer items-center justify-center gap-1 rounded-lg text-sm font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                      className="min-w-[80px] gap-1 text-muted-foreground hover:text-foreground"
                     >
                       下一页 <ChevronRight className="h-4 w-4" />
-                    </button>
+                    </Button>
                   </div>
                 )}
               </>
@@ -1316,12 +1332,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
       {/* Mobile selection bar */}
       {selectedIds.size > 0 && (
         <div
-          className="fixed inset-x-0 bottom-0 z-40 border-t border-border bg-background/95 shadow-pop backdrop-blur-xl animate-fade-up"
+          className="fixed inset-x-0 bottom-0 z-40 border-t border-border bg-background/95 shadow-pop backdrop-blur-xl animate-in fade-in slide-in-from-bottom-2 duration-300"
           style={{ paddingBottom: 'max(0.5rem, env(safe-area-inset-bottom))' }}
         >
           <div className="mx-auto flex max-w-[1440px] items-center gap-2 px-4 pt-2 sm:px-8 lg:px-12">
             <span className="inline-flex shrink-0 items-center gap-1.5 text-sm font-medium">
-              <span className="tnum flex h-6 w-6 items-center justify-center rounded-full bg-brand-gradient text-2xs font-bold text-white">
+              <span className="tnum flex h-6 w-6 items-center justify-center rounded-full bg-primary text-2xs font-bold text-primary-foreground">
                 {selectedIds.size}
               </span>
               已选
@@ -1896,7 +1912,7 @@ function MarginCard({ stats, className }: {
         <div className="mt-3">
           <div className="flex h-1.5 w-full overflow-hidden rounded-full bg-muted">
             <div className="h-full bg-muted-foreground/40" style={{ width: `${costPct}%` }} />
-            <div className="bg-brand-gradient h-full" style={{ width: `${marginPct}%` }} />
+            <div className="bg-foreground h-full" style={{ width: `${marginPct}%` }} />
           </div>
           <div className="mt-1.5 flex items-center justify-between font-mono text-2xs text-muted-foreground">
             <span className="inline-flex items-center gap-1.5">
@@ -1904,7 +1920,7 @@ function MarginCard({ stats, className }: {
               成本 {formatUsd(stats.actual_cost_usd)}
             </span>
             <span className="inline-flex items-center gap-1.5">
-              <span className="h-1.5 w-1.5 rounded-full bg-brand" />
+              <span className="h-1.5 w-1.5 rounded-full bg-foreground" />
               官方折算 {formatUsd(official)}
             </span>
           </div>
@@ -1925,9 +1941,9 @@ function BillingStatCard({
   className?: string
 }) {
   return (
-    <div className={cn('group min-w-0 rounded-2xl border border-border bg-card px-3 py-2.5 shadow-elev transition-colors hover:border-brand/40 sm:px-4 sm:py-3.5', className)}>
+    <div className={cn('group min-w-0 rounded-2xl border border-border bg-card px-3 py-2.5 shadow-elev transition-colors hover:border-foreground/30 sm:px-4 sm:py-3.5', className)}>
       <div className="flex items-center gap-1 overflow-hidden whitespace-nowrap text-2xs font-medium uppercase tracking-wider text-muted-foreground sm:gap-1.5">
-        {icon && <span className="shrink-0 text-muted-foreground/70 transition-colors group-hover:text-brand">{icon}</span>}
+        {icon && <span className="shrink-0 text-muted-foreground/70 transition-colors group-hover:text-foreground">{icon}</span>}
         <span className="truncate">{label}</span>
       </div>
       <div className="tnum mt-1.5 truncate text-base font-semibold leading-none tracking-tight text-foreground sm:text-xl">
@@ -1955,45 +1971,29 @@ function MobileIconBtn({
   )
 }
 
-function Chip({ children, active, onClick, count, tone = 'default' }: {
+// 基于 Radix ToggleGroupItem 的筛选药丸：药丸样式由 toggle-group 提供，
+// 这里只负责计数徽标 —— 选中态用半透明前景底，未选中态按 tone 着色。
+function FilterToggle({ children, value, active, count, tone = 'default' }: {
   children: ReactNode
+  value: string
   active: boolean
-  onClick: () => void
   count: number
   tone?: 'default' | 'ok' | 'warn' | 'bad'
 }) {
-  const countDotColor =
-    !active && tone === 'ok'
+  const countClass = active
+    ? 'rounded-full bg-primary-foreground/20 px-1.5 py-px text-primary-foreground'
+    : tone === 'ok'
       ? 'text-ok'
-      : !active && tone === 'warn'
+      : tone === 'warn'
         ? 'text-warn'
-        : !active && tone === 'bad'
+        : tone === 'bad'
           ? 'text-bad'
-          : ''
+          : 'text-muted-foreground/60'
   return (
-    <button
-      onClick={onClick}
-      aria-pressed={active}
-      className={cn(
-        // outline-none + ring-inset：避免默认 focus 轮廓在 overflow-x 容器里被纵向裁成左右两条弧
-        'inline-flex min-h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3 text-xs font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset',
-        active
-          ? 'border border-transparent bg-brand-gradient text-white shadow-sm focus-visible:ring-white/60'
-          : 'border border-border text-muted-foreground hover:border-brand/40 hover:text-foreground focus-visible:ring-brand/50',
-      )}
-    >
+    <ToggleGroupItem value={value} aria-label={typeof children === 'string' ? children : value}>
       {children}
-      <span
-        className={cn(
-          'tnum font-mono text-2xs',
-          active
-            ? 'rounded-full bg-white/20 px-1.5 py-px text-white'
-            : countDotColor || 'text-muted-foreground/60',
-        )}
-      >
-        {count}
-      </span>
-    </button>
+      <span className={cn('tnum font-mono text-2xs', countClass)}>{count}</span>
+    </ToggleGroupItem>
   )
 }
 

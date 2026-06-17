@@ -1,3 +1,5 @@
+import tailwindcssAnimate from 'tailwindcss-animate'
+
 /** @type {import('tailwindcss').Config} */
 export default {
   darkMode: 'class',
@@ -70,13 +72,6 @@ export default {
           foreground: 'hsl(var(--bad-foreground))',
           soft: 'hsl(var(--bad-soft))',
         },
-        brand: {
-          DEFAULT: 'hsl(var(--brand))',
-          2: 'hsl(var(--brand-2))',
-        },
-      },
-      backgroundImage: {
-        'brand-gradient': 'linear-gradient(135deg, hsl(var(--brand)), hsl(var(--brand-2)))',
       },
       borderRadius: {
         lg: 'var(--radius)',
@@ -88,21 +83,7 @@ export default {
         elev: '0 1px 3px 0 rgba(0, 0, 0, 0.08), 0 1px 2px -1px rgba(0, 0, 0, 0.06)',
         pop: '0 8px 24px -8px rgba(0, 0, 0, 0.18), 0 2px 6px -2px rgba(0, 0, 0, 0.08)',
       },
-      keyframes: {
-        'fade-up': {
-          from: { opacity: '0', transform: 'translateY(6px)' },
-          to: { opacity: '1', transform: 'translateY(0)' },
-        },
-        'fade-in': {
-          from: { opacity: '0' },
-          to: { opacity: '1' },
-        },
-      },
-      animation: {
-        'fade-up': 'fade-up 0.4s cubic-bezier(0.22, 1, 0.36, 1) both',
-        'fade-in': 'fade-in 0.3s ease-out both',
-      },
     },
   },
-  plugins: [],
+  plugins: [tailwindcssAnimate],
 }

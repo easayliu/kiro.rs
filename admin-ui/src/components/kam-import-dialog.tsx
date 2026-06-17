@@ -9,6 +9,8 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
+import { Textarea } from '@/components/ui/textarea'
+import { Checkbox } from '@/components/ui/checkbox'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
 import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
@@ -452,12 +454,12 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                 从文件导入
               </Button>
             </div>
-            <textarea
+            <Textarea
               placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}
-              className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
+              className="min-h-[200px] font-mono"
             />
           </div>
 
@@ -472,12 +474,10 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                 {errorAccountCount > 0 && `（其中 ${errorAccountCount} 个为 error 状态）`}
               </div>
               {errorAccountCount > 0 && (
-                <label className="flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
+                <label className="flex cursor-pointer items-center gap-2 text-sm">
+                  <Checkbox
                     checked={skipErrorAccounts}
-                    onChange={(e) => setSkipErrorAccounts(e.target.checked)}
-                    className="rounded border-gray-300"
+                    onCheckedChange={(c) => setSkipErrorAccounts(c === true)}
                   />
                   跳过 error 状态的账号
                 </label>

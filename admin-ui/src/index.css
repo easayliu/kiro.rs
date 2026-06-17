@@ -46,10 +46,6 @@
     --bad-foreground: 210 40% 98%;
     --bad-soft: 0 90% 96%;
 
-    /* Brand — indigo→violet. White-on-gradient passes WCAG AA. */
-    --brand: 243 75% 58%;
-    --brand-2: 272 72% 58%;
-
     --border: 214 32% 91%;
     --input: 214 32% 91%;
     --ring: 222 47% 12%;
@@ -99,10 +95,6 @@
     --bad: 0 72% 55%;
     --bad-foreground: 210 40% 98%;
     --bad-soft: 0 50% 18%;
-
-    /* Brand — brightened for contrast on the dark slate canvas */
-    --brand: 239 84% 67%;
-    --brand-2: 270 80% 68%;
 
     --border: 217.2 32.6% 17.5%;
     --input: 217.2 32.6% 17.5%;
@@ -208,16 +200,6 @@
 @layer utilities {
   .text-balance {
     text-wrap: balance;
-  }
-
-  /* 品牌渐变文字：背景渐变裁剪到字形。无前缀的 background-clip 兜底，
-     旧内核仍走 -webkit-。 */
-  .text-brand-gradient {
-    background-image: linear-gradient(135deg, hsl(var(--brand)), hsl(var(--brand-2)));
-    -webkit-background-clip: text;
-    background-clip: text;
-    -webkit-text-fill-color: transparent;
-    color: transparent;
   }
 
   .no-scrollbar::-webkit-scrollbar {

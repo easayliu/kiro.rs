@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react'
 import { ArrowRight, Lock } from 'lucide-react'
 import { storage } from '@/lib/storage'
 import { getMe } from '@/api/credentials'
+import { Input } from '@/components/ui/input'
+import { Button } from '@/components/ui/button'
 
 interface LoginPageProps {
   onLogin: (apiKey: string) => void
@@ -78,14 +80,14 @@ export function LoginPage({ onLogin }: LoginPageProps) {
               </button>
             </label>
             <div className="group relative">
-              <Lock className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-              <input
+              <Lock className="pointer-events-none absolute left-3 top-1/2 z-10 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
                 id="apikey"
                 type={show ? 'text' : 'password'}
                 placeholder="sk-admin-•••••••••••••••"
                 value={apiKey}
                 onChange={e => setApiKey(e.target.value)}
-                className="h-11 w-full rounded-lg border border-input bg-background px-4 py-2 pl-9 font-mono text-sm tracking-wide transition-colors placeholder:text-muted-foreground/50 focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/15"
+                className="h-11 pl-9 font-mono tracking-wide"
                 autoFocus
               />
             </div>
@@ -95,14 +97,14 @@ export function LoginPage({ onLogin }: LoginPageProps) {
             <p className="text-xs text-bad" role="alert">{error}</p>
           )}
 
-          <button
+          <Button
             type="submit"
             disabled={!apiKey.trim() || submitting}
-            className="group inline-flex h-11 w-full cursor-pointer items-center justify-center gap-1.5 rounded-lg bg-foreground text-sm font-medium text-background transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+            className="group h-11 w-full"
           >
             <span>{submitting ? '验证中…' : '进入控制台'}</span>
             <ArrowRight className="h-4 w-4 transition-transform duration-200 ease-out group-hover:translate-x-0.5" />
-          </button>
+          </Button>
         </form>
 
         {/* Footer */}
