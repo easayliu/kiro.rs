@@ -13,6 +13,8 @@ export interface CredentialsStatusResponse {
   credentials: CredentialStatusItem[]
   /** 全局默认 RPM 上限（不存在时表示未配置） */
   defaultRpmLimit?: number
+  /** 全局默认并发上限（不存在时表示未配置） */
+  defaultConcurrencyLimit?: number
 }
 
 // 单个凭据状态
@@ -41,6 +43,10 @@ export interface CredentialStatusItem {
   rpmLimit?: number
   /** 最近 60s 滑动窗口内的请求数（默认 0） */
   rpmCurrent?: number
+  /** 凭据级并发上限覆盖（不存在=回退全局默认；0=显式不限并发） */
+  concurrencyLimit?: number
+  /** 当前在途请求数（默认 0） */
+  concurrencyCurrent?: number
   /** overage（超额计费）上次下发状态（不存在=从未下发，状态未知） */
   overage?: boolean
 }
@@ -101,6 +107,11 @@ export interface SetPriorityRequest {
 export interface SetRpmLimitRequest {
   /** null/undefined：清除覆盖回退全局；0：显式不限流；正整数：限制为 n 次/分钟 */
   rpmLimit: number | null
+}
+
+export interface SetConcurrencyLimitRequest {
+  /** null/undefined：清除覆盖回退全局；0：显式不限并发；正整数：最多 n 个同时在途 */
+  concurrencyLimit: number | null
 }
 
 // 添加凭据请求
@@ -195,9 +206,20 @@ export interface BatchSetOverageResponse {
   failed: BatchSetCredentialGroupFailure[]
 }
 
+export interface BatchSetConcurrencyLimitResponse {
+  total: number
+  succeeded: number[]
+  failed: BatchSetCredentialGroupFailure[]
+}
+
 export interface DefaultRpmLimitResponse {
   /** 全局默认 RPM（null=未配置；0=显式不限流；正整数=限制） */
   rpmLimit: number | null
+}
+
+export interface DefaultConcurrencyLimitResponse {
+  /** 全局默认并发上限（null=未配置；0=显式不限并发；正整数=限制） */
+  concurrencyLimit: number | null
 }
 
 // 计费累计统计（进程维度，落盘到 billing_stats.json）

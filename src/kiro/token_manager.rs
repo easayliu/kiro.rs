@@ -882,6 +882,12 @@ pub struct CredentialEntrySnapshot {
     /// 最近 60s 滑动窗口内的请求数
     #[serde(default)]
     pub rpm_current: u32,
+    /// 凭据级并发上限（None=未单独配置，回退到全局默认；0=显式不限并发）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency_limit: Option<u32>,
+    /// 当前在途请求数（实时并发负载）
+    #[serde(default)]
+    pub concurrency_current: u32,
     /// overage（超额计费）上次下发状态（None=从未下发，状态未知）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overage: Option<bool>,
@@ -902,6 +908,9 @@ pub struct ManagerSnapshot {
     /// 全局默认 RPM 上限（None=未配置；0 等价于未配置，仅作显式禁用提示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_rpm_limit: Option<u32>,
+    /// 全局默认并发上限（None=未配置；0 等价于未配置，仅作显式禁用提示）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_concurrency_limit: Option<u32>,
 }
 
 /// 批量设置代理分组 - 单条失败信息
@@ -963,6 +972,13 @@ pub struct MultiTokenManager {
     /// 只会让 `record_request_for_rpm` 多走一次 effective_rpm_limit 检查，
     /// 不影响正确性；漏报（实际开启但仍为 false）才会导致漏记，所以保守置 true。
     rpm_feature_enabled: AtomicBool,
+    /// 全局默认并发上限（运行时可变；初始化自 config，Admin API 修改后实时生效并持久化）
+    default_concurrency_limit: Mutex<Option<u32>>,
+    /// 是否有任何并发上限配置启用（凭据级 or 全局），用于热路径短路
+    ///
+    /// 与 [`Self::rpm_feature_enabled`] 同语义：单向 monotonic，误报只多走一次
+    /// effective 检查，不影响正确性。
+    concurrency_feature_enabled: AtomicBool,
     /// 代理分组（运行时可修改，与 config.json 中 proxyGroups 同步）
     proxy_groups: RwLock<BTreeMap<String, ProxyGroupConfig>>,
     /// 最近一次统计持久化时间（用于 debounce）
@@ -984,6 +1000,22 @@ const RPM_WINDOW_SECS: i64 = 60;
 /// 返回 None 表示无 RPM 限制。
 fn effective_rpm_limit(cred: &KiroCredentials, default: Option<u32>) -> Option<u32> {
     match cred.rpm_limit {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => match default {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None => None,
+        },
+    }
+}
+
+/// 根据凭据级与全局默认计算生效的并发上限（同时在途请求数）
+///
+/// 优先级与语义同 [`effective_rpm_limit`]：凭据级 > 全局；任意一级显式为 0
+/// 视为"不限并发"。返回 None 表示无并发限制。
+fn effective_concurrency_limit(cred: &KiroCredentials, default: Option<u32>) -> Option<u32> {
+    match cred.concurrency_limit {
         Some(0) => None,
         Some(n) => Some(n),
         None => match default {
@@ -1178,6 +1210,11 @@ impl MultiTokenManager {
             .iter()
             .any(|e| e.credentials.rpm_limit.unwrap_or(0) > 0);
         let any_default_rpm = default_rpm_limit.unwrap_or(0) > 0;
+        let default_concurrency_limit = config.default_concurrency_limit;
+        let any_cred_concurrency = entries
+            .iter()
+            .any(|e| e.credentials.concurrency_limit.unwrap_or(0) > 0);
+        let any_default_concurrency = default_concurrency_limit.unwrap_or(0) > 0;
         let manager = Self {
             config,
             proxy,
@@ -1189,6 +1226,10 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             default_rpm_limit: Mutex::new(default_rpm_limit),
             rpm_feature_enabled: AtomicBool::new(any_cred_rpm || any_default_rpm),
+            default_concurrency_limit: Mutex::new(default_concurrency_limit),
+            concurrency_feature_enabled: AtomicBool::new(
+                any_cred_concurrency || any_default_concurrency,
+            ),
             proxy_groups: RwLock::new(proxy_groups),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
@@ -1353,6 +1394,12 @@ impl MultiTokenManager {
         } else {
             None
         };
+        let concurrency_active = self.concurrency_feature_enabled.load(Ordering::Relaxed);
+        let default_concurrency = if concurrency_active {
+            *self.default_concurrency_limit.lock()
+        } else {
+            None
+        };
         let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
         // 单次扫描同时维护两个候选：
@@ -1391,6 +1438,18 @@ impl MultiTokenManager {
                         .filter(|t| **t > rpm_cutoff)
                         .count();
                     if count >= limit as usize {
+                        continue;
+                    }
+                }
+            }
+            if concurrency_active {
+                if let Some(limit) =
+                    effective_concurrency_limit(&entry.credentials, default_concurrency)
+                {
+                    // 在途数已达上限：跳过此号（best_fallback 已记录，全员满时仍有退路）。
+                    // +1 由选中后的 InflightGuard::acquire 在同一把 entries 锁内完成，
+                    // 故此处读到的是"不含本次请求"的在途数，limit=N 即最多 N 个并发。
+                    if entry.inflight.load(Ordering::Relaxed) >= limit as usize {
                         continue;
                     }
                 }
@@ -1450,6 +1509,12 @@ impl MultiTokenManager {
         } else {
             None
         };
+        let concurrency_active = self.concurrency_feature_enabled.load(Ordering::Relaxed);
+        let default_concurrency = if concurrency_active {
+            *self.default_concurrency_limit.lock()
+        } else {
+            None
+        };
 
         entries.iter().any(|entry| {
             if entry.disabled {
@@ -1469,6 +1534,15 @@ impl MultiTokenManager {
                         .filter(|t| **t > rpm_cutoff)
                         .count();
                     if count >= limit as usize {
+                        return false;
+                    }
+                }
+            }
+            if concurrency_active {
+                if let Some(limit) =
+                    effective_concurrency_limit(&entry.credentials, default_concurrency)
+                {
+                    if entry.inflight.load(Ordering::Relaxed) >= limit as usize {
                         return false;
                     }
                 }
@@ -2367,6 +2441,8 @@ impl MultiTokenManager {
                         .map(|t| t.to_rfc3339()),
                     rpm_limit: e.credentials.rpm_limit,
                     rpm_current: e.rpm_window.iter().filter(|t| **t > rpm_cutoff).count() as u32,
+                    concurrency_limit: e.credentials.concurrency_limit,
+                    concurrency_current: e.inflight.load(Ordering::Relaxed) as u32,
                     overage: e.credentials.overage,
                 })
                 .collect(),
@@ -2374,6 +2450,7 @@ impl MultiTokenManager {
             total: entries.len(),
             available,
             default_rpm_limit: *self.default_rpm_limit.lock(),
+            default_concurrency_limit: *self.default_concurrency_limit.lock(),
         }
     }
 
@@ -2604,6 +2681,83 @@ impl MultiTokenManager {
                 for (id, prev) in &previous {
                     if let Some(entry) = entries.iter_mut().find(|e| e.id == *id) {
                         entry.credentials.rpm_limit = *prev;
+                    }
+                }
+                for id in &succeeded {
+                    failed.push(BatchSetGroupFailure {
+                        id: *id,
+                        error: format!("持久化失败: {}", msg),
+                    });
+                }
+                return BatchSetGroupResult {
+                    succeeded: vec![],
+                    failed,
+                };
+            }
+        }
+
+        BatchSetGroupResult { succeeded, failed }
+    }
+
+    /// 设置凭据级并发上限（Admin API）
+    ///
+    /// 传 None 表示清除凭据级覆盖，回退到全局默认；
+    /// 传 Some(0) 表示显式不限并发（即使全局有默认）。
+    pub fn set_concurrency_limit(&self, id: u64, concurrency_limit: Option<u32>) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.concurrency_limit = concurrency_limit;
+        }
+        if concurrency_limit.unwrap_or(0) > 0 {
+            self.concurrency_feature_enabled.store(true, Ordering::Relaxed);
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 批量设置凭据级并发上限（Admin API）
+    ///
+    /// 行为与 [`Self::set_rpm_limit_batch`] 一致：合并 IO + 失败回滚。
+    pub fn set_concurrency_limit_batch(
+        &self,
+        ids: &[u64],
+        concurrency_limit: Option<u32>,
+    ) -> BatchSetGroupResult {
+        if concurrency_limit.unwrap_or(0) > 0 {
+            self.concurrency_feature_enabled.store(true, Ordering::Relaxed);
+        }
+        let mut succeeded = Vec::new();
+        let mut failed: Vec<BatchSetGroupFailure> = Vec::new();
+        let mut previous: Vec<(u64, Option<u32>)> = Vec::new();
+
+        {
+            let mut entries = self.entries.lock();
+            for id in ids {
+                match entries.iter_mut().find(|e| e.id == *id) {
+                    Some(entry) => {
+                        previous.push((*id, entry.credentials.concurrency_limit));
+                        entry.credentials.concurrency_limit = concurrency_limit;
+                        succeeded.push(*id);
+                    }
+                    None => failed.push(BatchSetGroupFailure {
+                        id: *id,
+                        error: format!("凭据不存在: {}", id),
+                    }),
+                }
+            }
+        }
+
+        if !succeeded.is_empty() {
+            if let Err(err) = self.persist_credentials() {
+                let msg = err.to_string();
+                let mut entries = self.entries.lock();
+                for (id, prev) in &previous {
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == *id) {
+                        entry.credentials.concurrency_limit = *prev;
                     }
                 }
                 for id in &succeeded {
@@ -3302,6 +3456,54 @@ impl MultiTokenManager {
         config
             .save()
             .with_context(|| format!("持久化全局默认 RPM 失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
+    /// 获取全局默认并发上限（Admin API）
+    pub fn get_default_concurrency_limit(&self) -> Option<u32> {
+        *self.default_concurrency_limit.lock()
+    }
+
+    /// 设置全局默认并发上限（Admin API）；持久化到 config.json
+    ///
+    /// 语义与 [`Self::set_default_rpm_limit`] 一致：None=清空；Some(0)=显式不限并发。
+    pub fn set_default_concurrency_limit(&self, value: Option<u32>) -> anyhow::Result<()> {
+        let mut guard = self.default_concurrency_limit.lock();
+        let previous = *guard;
+        *guard = value;
+
+        if value.unwrap_or(0) > 0 {
+            self.concurrency_feature_enabled.store(true, Ordering::Relaxed);
+        }
+
+        if let Err(e) = self.persist_default_concurrency_limit(value) {
+            *guard = previous;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn persist_default_concurrency_limit(&self, value: Option<u32>) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!(
+                    "配置文件路径未知，全局默认并发上限仅在当前进程生效: {:?}",
+                    value
+                );
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.default_concurrency_limit = value;
+        config
+            .save()
+            .with_context(|| format!("持久化全局默认并发上限失败: {}", config_path.display()))?;
 
         Ok(())
     }

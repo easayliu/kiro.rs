@@ -200,6 +200,15 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_rpm_limit: Option<u32>,
 
+    /// 全局默认并发上限（每个凭据同时在途请求数）
+    ///
+    /// 凭据未单独配置 `concurrencyLimit` 时回退到此值；都未配置则不限并发。
+    /// 选号时在途数已达上限的凭据会被跳过、自动切换到其他凭据；
+    /// 当所有凭据都达上限时回退到负载最轻者（不硬拒绝请求）。
+    /// 设置为 0 表示禁用全局默认。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_concurrency_limit: Option<u32>,
+
     /// kiro-cli 版本号（仅 kiro-cli 模式使用）
     #[serde(default = "default_kiro_cli_version")]
     pub kiro_cli_version: String,
@@ -289,6 +298,7 @@ impl Default for Config {
             cache_skip_rate: None,
             client_mode: ClientMode::default(),
             default_rpm_limit: None,
+            default_concurrency_limit: None,
             kiro_cli_version: default_kiro_cli_version(),
             config_path: None,
         }

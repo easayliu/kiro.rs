@@ -22,6 +22,7 @@ import {
   Network,
   ArrowUpDown,
   Gauge,
+  Activity,
   CircleDollarSign,
   Power,
 } from 'lucide-react'
@@ -48,10 +49,13 @@ import {
   useIsReadOnly,
   useBatchSetPriority,
   useBatchSetRpmLimit,
+  useBatchSetConcurrencyLimit,
   useBatchSetDisabled,
   useBatchSetOverage,
   useDefaultRpmLimit,
   useSetDefaultRpmLimit,
+  useDefaultConcurrencyLimit,
+  useSetDefaultConcurrencyLimit,
   useBillingStats,
 } from '@/hooks/use-credentials'
 import type { CacheScope } from '@/api/credentials'
@@ -111,6 +115,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchRpmValue, setBatchRpmValue] = useState('')
   const [defaultRpmDialogOpen, setDefaultRpmDialogOpen] = useState(false)
   const [defaultRpmValue, setDefaultRpmValue] = useState('')
+  const [batchConcurrencyDialogOpen, setBatchConcurrencyDialogOpen] = useState(false)
+  const [batchConcurrencyValue, setBatchConcurrencyValue] = useState('')
+  const [defaultConcurrencyDialogOpen, setDefaultConcurrencyDialogOpen] = useState(false)
+  const [defaultConcurrencyValue, setDefaultConcurrencyValue] = useState('')
   const [batchDisabledDialogOpen, setBatchDisabledDialogOpen] = useState(false)
   const [batchOverageDialogOpen, setBatchOverageDialogOpen] = useState(false)
   const [proxyGroupsOpen, setProxyGroupsOpen] = useState(false)
@@ -177,10 +185,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: resetFailure } = useResetFailure()
   const batchSetPriorityMutation = useBatchSetPriority()
   const batchSetRpmLimitMutation = useBatchSetRpmLimit()
+  const batchSetConcurrencyLimitMutation = useBatchSetConcurrencyLimit()
   const batchSetDisabledMutation = useBatchSetDisabled()
   const batchSetOverageMutation = useBatchSetOverage()
   const { data: defaultRpmData } = useDefaultRpmLimit()
   const setDefaultRpmMutation = useSetDefaultRpmLimit()
+  const { data: defaultConcurrencyData } = useDefaultConcurrencyLimit()
+  const setDefaultConcurrencyMutation = useSetDefaultConcurrencyLimit()
   const { data: billingStats } = useBillingStats()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
@@ -595,6 +606,46 @@ export function Dashboard({ onLogout }: DashboardProps) {
     )
   }
 
+  const openBatchConcurrencyDialog = () => {
+    if (selectedIds.size === 0) { toast.error('请先选择要调整的凭据'); return }
+    setBatchConcurrencyValue('')
+    setBatchConcurrencyDialogOpen(true)
+  }
+
+  const handleBatchConcurrencySubmit = () => {
+    const trimmed = batchConcurrencyValue.trim()
+    let payload: number | null
+    if (trimmed === '') {
+      payload = null
+    } else {
+      const parsed = Number(trimmed)
+      if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+        toast.error('请输入 ≥ 0 的整数（0 表示不限并发，留空表示回退全局默认）')
+        return
+      }
+      payload = parsed
+    }
+    const ids = Array.from(selectedIds)
+    batchSetConcurrencyLimitMutation.mutate(
+      { credentialIds: ids, concurrencyLimit: payload },
+      {
+        onSuccess: res => {
+          const failed = res.failed.length
+          const label = payload === null
+            ? '回退全局默认'
+            : payload === 0
+              ? '显式不限并发'
+              : `${payload} 个在途`
+          if (failed === 0) toast.success(`已将 ${res.succeeded.length} 个凭据并发上限设为${label}`)
+          else toast.warning(`成功 ${res.succeeded.length} 个，失败 ${failed} 个`)
+          setBatchConcurrencyDialogOpen(false)
+          deselectAll()
+        },
+        onError: err => toast.error('批量调整失败: ' + (err as Error).message),
+      },
+    )
+  }
+
   const openBatchOverageDialog = () => {
     if (selectedIds.size === 0) { toast.error('请先选择要调整的凭据'); return }
     setBatchOverageDialogOpen(true)
@@ -648,6 +699,41 @@ export function Dashboard({ onLogout }: DashboardProps) {
               : `全局默认 RPM 已设为 ${payload} 次/分钟`,
         )
         setDefaultRpmDialogOpen(false)
+      },
+      onError: err => toast.error('保存失败: ' + (err as Error).message),
+    })
+  }
+
+  const openDefaultConcurrencyDialog = () => {
+    setDefaultConcurrencyValue(
+      typeof defaultConcurrencyData?.concurrencyLimit === 'number' ? String(defaultConcurrencyData.concurrencyLimit) : '',
+    )
+    setDefaultConcurrencyDialogOpen(true)
+  }
+
+  const handleDefaultConcurrencySubmit = () => {
+    const trimmed = defaultConcurrencyValue.trim()
+    let payload: number | null
+    if (trimmed === '') {
+      payload = null
+    } else {
+      const parsed = Number(trimmed)
+      if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+        toast.error('请输入 ≥ 0 的整数（0 表示不限并发，留空表示清除）')
+        return
+      }
+      payload = parsed
+    }
+    setDefaultConcurrencyMutation.mutate(payload, {
+      onSuccess: () => {
+        toast.success(
+          payload === null
+            ? '已清除全局默认并发上限'
+            : payload === 0
+              ? '全局默认已设为不限并发'
+              : `全局默认并发上限已设为 ${payload} 个在途`,
+        )
+        setDefaultConcurrencyDialogOpen(false)
       },
       onError: err => toast.error('保存失败: ' + (err as Error).message),
     })
@@ -1181,6 +1267,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                       key={credential.id}
                       credential={credential}
                       defaultRpmLimit={data?.defaultRpmLimit}
+                      defaultConcurrencyLimit={data?.defaultConcurrencyLimit}
                       onViewBalance={handleViewBalance}
                       selected={selectedIds.has(credential.id)}
                       onToggleSelect={() => toggleSelect(credential.id)}
@@ -1279,6 +1366,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     RPM
                   </BarAction>
                   <BarAction
+                    onClick={openBatchConcurrencyDialog}
+                    disabled={batchSetConcurrencyLimitMutation.isPending}
+                    icon={<Activity className="h-3.5 w-3.5" />}
+                  >
+                    并发
+                  </BarAction>
+                  <BarAction
                     onClick={openBatchOverageDialog}
                     disabled={batchSetOverageMutation.isPending}
                     icon={<CircleDollarSign className="h-3.5 w-3.5" />}
@@ -1369,6 +1463,25 @@ export function Dashboard({ onLogout }: DashboardProps) {
               }
               disabled={setDefaultRpmMutation.isPending}
               onClick={() => { setPoliciesOpen(false); openDefaultRpmDialog() }}
+            />
+            <PolicyRow
+              label="全局并发默认"
+              sub={
+                defaultConcurrencyData?.concurrencyLimit == null
+                  ? '未配置（不限并发）'
+                  : defaultConcurrencyData.concurrencyLimit === 0
+                    ? '显式不限并发'
+                    : '凭据未单独配置时回退此值'
+              }
+              value={
+                defaultConcurrencyData?.concurrencyLimit == null
+                  ? '关闭'
+                  : defaultConcurrencyData.concurrencyLimit === 0
+                    ? '不限'
+                    : `${defaultConcurrencyData.concurrencyLimit} 在途`
+              }
+              disabled={setDefaultConcurrencyMutation.isPending}
+              onClick={() => { setPoliciesOpen(false); openDefaultConcurrencyDialog() }}
             />
           </div>
         </DialogContent>
@@ -1583,6 +1696,102 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Button>
             <Button onClick={handleDefaultRpmSubmit} disabled={setDefaultRpmMutation.isPending}>
               {setDefaultRpmMutation.isPending ? '保存中…' : '保存'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={batchConcurrencyDialogOpen} onOpenChange={setBatchConcurrencyDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>批量调整并发上限</DialogTitle>
+            <DialogDescription>
+              将选中的 <span className="font-mono tnum font-semibold">{selectedIds.size}</span> 个凭据统一设置最大同时在途请求数。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 py-2">
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={0}
+                step={1}
+                placeholder={
+                  typeof defaultConcurrencyData?.concurrencyLimit === 'number'
+                    ? `全局默认 ${defaultConcurrencyData.concurrencyLimit}`
+                    : '留空使用全局默认'
+                }
+                value={batchConcurrencyValue}
+                onChange={e => setBatchConcurrencyValue(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') handleBatchConcurrencySubmit() }}
+                autoFocus
+                className="tnum font-mono"
+              />
+              <span className="shrink-0 text-xs text-muted-foreground">个在途</span>
+            </div>
+            <p className="text-2xs text-muted-foreground">
+              · 留空：清除凭据级覆盖，回退到全局默认
+              <br />
+              · 0：显式不限并发（即使全局有默认）
+              <br />
+              · 正整数：最多 N 个同时在途
+            </p>
+          </div>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setBatchConcurrencyDialogOpen(false)}
+              disabled={batchSetConcurrencyLimitMutation.isPending}
+            >
+              取消
+            </Button>
+            <Button onClick={handleBatchConcurrencySubmit} disabled={batchSetConcurrencyLimitMutation.isPending}>
+              {batchSetConcurrencyLimitMutation.isPending ? '保存中…' : '保存'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={defaultConcurrencyDialogOpen} onOpenChange={setDefaultConcurrencyDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>全局默认并发上限</DialogTitle>
+            <DialogDescription>
+              凭据未单独设置并发上限时回退到此值，立即生效并持久化到 config.json。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 py-2">
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={0}
+                step={1}
+                placeholder="留空表示关闭（不限并发）"
+                value={defaultConcurrencyValue}
+                onChange={e => setDefaultConcurrencyValue(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') handleDefaultConcurrencySubmit() }}
+                autoFocus
+                className="tnum font-mono"
+              />
+              <span className="shrink-0 text-xs text-muted-foreground">个在途</span>
+            </div>
+            <p className="text-2xs text-muted-foreground">
+              · 留空：关闭全局默认（凭据未单独配置时不限并发）
+              <br />
+              · 0：显式关闭，效果同留空
+              <br />
+              · 正整数：所有未单独配置的凭据均按此值限制并发
+            </p>
+          </div>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setDefaultConcurrencyDialogOpen(false)}
+              disabled={setDefaultConcurrencyMutation.isPending}
+            >
+              取消
+            </Button>
+            <Button onClick={handleDefaultConcurrencySubmit} disabled={setDefaultConcurrencyMutation.isPending}>
+              {setDefaultConcurrencyMutation.isPending ? '保存中…' : '保存'}
             </Button>
           </DialogFooter>
         </DialogContent>

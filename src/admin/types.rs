@@ -33,6 +33,9 @@ pub struct CredentialsStatusResponse {
     /// 全局默认 RPM 上限（None=未配置）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_rpm_limit: Option<u32>,
+    /// 全局默认并发上限（None=未配置）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_concurrency_limit: Option<u32>,
 }
 
 /// 单个凭据的状态信息
@@ -85,6 +88,12 @@ pub struct CredentialStatusItem {
     /// 最近 60s 滑动窗口内的请求数（用于前端展示 X/limit）
     #[serde(default)]
     pub rpm_current: u32,
+    /// 凭据级并发上限覆盖（None=未单独配置；0=显式不限并发）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency_limit: Option<u32>,
+    /// 当前在途请求数（用于前端展示 X/limit）
+    #[serde(default)]
+    pub concurrency_current: u32,
     /// overage（超额计费）上次下发状态（None=从未下发，前端显示为未知）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overage: Option<bool>,
@@ -509,6 +518,51 @@ pub struct DefaultRpmLimitResponse {
 pub struct SetDefaultRpmLimitRequest {
     /// null=清除；0=显式不限流；正整数=每分钟 n 次
     pub rpm_limit: Option<u32>,
+}
+
+/// 修改凭据级并发上限请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetConcurrencyLimitRequest {
+    /// 新并发上限值
+    /// - None：清除凭据级覆盖，回退到全局默认
+    /// - Some(0)：显式不限并发
+    /// - Some(n>0)：最多 n 个同时在途请求
+    pub concurrency_limit: Option<u32>,
+}
+
+/// 批量设置凭据并发上限请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetConcurrencyLimitRequest {
+    pub credential_ids: Vec<u64>,
+    /// 同 `SetConcurrencyLimitRequest.concurrency_limit`：null=清除覆盖；0=显式不限并发；正整数=上限
+    pub concurrency_limit: Option<u32>,
+}
+
+/// 批量设置凭据并发上限响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSetConcurrencyLimitResponse {
+    pub total: usize,
+    pub succeeded: Vec<u64>,
+    pub failed: Vec<BatchSetCredentialGroupFailure>,
+}
+
+/// 全局默认并发上限响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefaultConcurrencyLimitResponse {
+    /// 当前全局默认值（None=未配置，等同于不限并发）
+    pub concurrency_limit: Option<u32>,
+}
+
+/// 设置全局默认并发上限请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDefaultConcurrencyLimitRequest {
+    /// null=清除；0=显式不限并发；正整数=每个凭据最多 n 个同时在途
+    pub concurrency_limit: Option<u32>,
 }
 
 // ============ 通用响应 ============

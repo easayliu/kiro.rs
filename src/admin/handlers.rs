@@ -9,10 +9,12 @@ use axum::{
 use super::{
     middleware::{AdminRole, AdminState},
     types::{
-        AddCredentialRequest, BatchSetCredentialGroupRequest, BatchSetDisabledRequest,
+        AddCredentialRequest, BatchSetConcurrencyLimitRequest, BatchSetCredentialGroupRequest,
+        BatchSetDisabledRequest,
         BatchSetOverageRequest, BatchSetPriorityRequest, BatchSetRpmLimitRequest, MeResponse,
-        SetCacheSkipRateRequest,
-        SetCredentialGroupRequest, SetDefaultRpmLimitRequest, SetDisabledRequest,
+        SetCacheSkipRateRequest, SetConcurrencyLimitRequest,
+        SetCredentialGroupRequest, SetDefaultConcurrencyLimitRequest, SetDefaultRpmLimitRequest,
+        SetDisabledRequest,
         SetGlobalCacheRequest, SetLoadBalancingModeRequest, SetOverageRequest, SetPriorityRequest,
         SetRpmLimitRequest, SuccessResponse, UpsertProxyGroupRequest,
     },
@@ -82,6 +84,24 @@ pub async fn set_credential_rpm_limit(
             None => format!("凭据 #{} RPM 上限已清除（回退到全局默认）", id),
             Some(0) => format!("凭据 #{} 已显式不限流", id),
             Some(n) => format!("凭据 #{} RPM 上限已设置为 {} 次/分钟", id, n),
+        }))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/concurrency-limit
+/// 设置凭据级并发上限
+pub async fn set_credential_concurrency_limit(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetConcurrencyLimitRequest>,
+) -> impl IntoResponse {
+    match state.service.set_concurrency_limit(id, payload.concurrency_limit) {
+        Ok(_) => Json(SuccessResponse::new(match payload.concurrency_limit {
+            None => format!("凭据 #{} 并发上限已清除（回退到全局默认）", id),
+            Some(0) => format!("凭据 #{} 已显式不限并发", id),
+            Some(n) => format!("凭据 #{} 并发上限已设置为 {} 个同时在途", id, n),
         }))
         .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
@@ -378,6 +398,34 @@ pub async fn set_default_rpm_limit(
     Json(payload): Json<SetDefaultRpmLimitRequest>,
 ) -> impl IntoResponse {
     match state.service.set_default_rpm_limit(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/concurrency-limit/batch
+/// 批量设置凭据级并发上限
+pub async fn batch_set_concurrency_limit(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchSetConcurrencyLimitRequest>,
+) -> impl IntoResponse {
+    match state.service.batch_set_concurrency_limit(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/default-concurrency-limit
+pub async fn get_default_concurrency_limit(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_default_concurrency_limit())
+}
+
+/// PUT /api/admin/config/default-concurrency-limit
+pub async fn set_default_concurrency_limit(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetDefaultConcurrencyLimitRequest>,
+) -> impl IntoResponse {
+    match state.service.set_default_concurrency_limit(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

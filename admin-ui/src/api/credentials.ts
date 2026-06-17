@@ -8,6 +8,7 @@ import type {
   SetDisabledRequest,
   SetPriorityRequest,
   SetRpmLimitRequest,
+  SetConcurrencyLimitRequest,
   AddCredentialRequest,
   AddCredentialResponse,
   ProxyGroupsResponse,
@@ -15,9 +16,11 @@ import type {
   BatchSetCredentialGroupResponse,
   BatchSetPriorityResponse,
   BatchSetRpmLimitResponse,
+  BatchSetConcurrencyLimitResponse,
   BatchSetDisabledResponse,
   BatchSetOverageResponse,
   DefaultRpmLimitResponse,
+  DefaultConcurrencyLimitResponse,
   MeResponse,
   BillingStatsResponse,
 } from '@/types/api'
@@ -83,6 +86,18 @@ export async function setCredentialRpmLimit(
   const { data } = await api.post<SuccessResponse>(
     `/credentials/${id}/rpm-limit`,
     { rpmLimit } as SetRpmLimitRequest
+  )
+  return data
+}
+
+// 设置凭据并发上限（null 表示清除凭据级覆盖回退全局；0 表示显式不限并发）
+export async function setCredentialConcurrencyLimit(
+  id: number,
+  concurrencyLimit: number | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/concurrency-limit`,
+    { concurrencyLimit } as SetConcurrencyLimitRequest
   )
   return data
 }
@@ -261,6 +276,17 @@ export async function batchSetRpmLimit(
   return data
 }
 
+export async function batchSetConcurrencyLimit(
+  credentialIds: number[],
+  concurrencyLimit: number | null,
+): Promise<BatchSetConcurrencyLimitResponse> {
+  const { data } = await api.post<BatchSetConcurrencyLimitResponse>(
+    '/credentials/concurrency-limit/batch',
+    { credentialIds, concurrencyLimit },
+  )
+  return data
+}
+
 export async function batchSetDisabled(
   credentialIds: number[],
   disabled: boolean,
@@ -290,6 +316,21 @@ export async function getDefaultRpmLimit(): Promise<DefaultRpmLimitResponse> {
 
 export async function setDefaultRpmLimit(rpmLimit: number | null): Promise<DefaultRpmLimitResponse> {
   const { data } = await api.put<DefaultRpmLimitResponse>('/config/default-rpm-limit', { rpmLimit })
+  return data
+}
+
+export async function getDefaultConcurrencyLimit(): Promise<DefaultConcurrencyLimitResponse> {
+  const { data } = await api.get<DefaultConcurrencyLimitResponse>('/config/default-concurrency-limit')
+  return data
+}
+
+export async function setDefaultConcurrencyLimit(
+  concurrencyLimit: number | null,
+): Promise<DefaultConcurrencyLimitResponse> {
+  const { data } = await api.put<DefaultConcurrencyLimitResponse>(
+    '/config/default-concurrency-limit',
+    { concurrencyLimit },
+  )
   return data
 }
 

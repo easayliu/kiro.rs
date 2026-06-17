@@ -19,10 +19,13 @@ use super::types::{
     BatchSetCredentialGroupResponse, BatchSetDisabledRequest, BatchSetDisabledResponse,
     BatchSetPriorityRequest, BatchSetPriorityResponse, BatchSetRpmLimitRequest,
     BatchSetOverageRequest, BatchSetOverageResponse, BatchSetRpmLimitResponse,
+    BatchSetConcurrencyLimitRequest, BatchSetConcurrencyLimitResponse,
     CacheSkipRateResponse, CredentialStatusItem,
-    CredentialsStatusResponse, DefaultRpmLimitResponse, GlobalCacheResponse, ModelsResponse,
+    CredentialsStatusResponse, DefaultConcurrencyLimitResponse, DefaultRpmLimitResponse,
+    GlobalCacheResponse, ModelsResponse,
     LoadBalancingModeResponse, ProxyGroupsResponse, SetCacheSkipRateRequest,
-    SetCredentialGroupRequest, SetDefaultRpmLimitRequest, SetGlobalCacheRequest,
+    SetCredentialGroupRequest, SetDefaultConcurrencyLimitRequest, SetDefaultRpmLimitRequest,
+    SetGlobalCacheRequest,
     SetLoadBalancingModeRequest, UpsertProxyGroupRequest,
 };
 
@@ -92,6 +95,8 @@ impl AdminService {
                 throttled_until: entry.throttled_until,
                 rpm_limit: entry.rpm_limit,
                 rpm_current: entry.rpm_current,
+                concurrency_limit: entry.concurrency_limit,
+                concurrency_current: entry.concurrency_current,
                 overage: entry.overage,
             })
             .collect();
@@ -105,6 +110,7 @@ impl AdminService {
             current_id: snapshot.current_id,
             credentials,
             default_rpm_limit: snapshot.default_rpm_limit,
+            default_concurrency_limit: snapshot.default_concurrency_limit,
         }
     }
 
@@ -140,6 +146,17 @@ impl AdminService {
     ) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_rpm_limit(id, rpm_limit)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据级并发上限
+    pub fn set_concurrency_limit(
+        &self,
+        id: u64,
+        concurrency_limit: Option<u32>,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_concurrency_limit(id, concurrency_limit)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -302,6 +319,7 @@ impl AdminService {
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             rpm_limit: None,
+            concurrency_limit: None,
             overage: None,
         };
 
@@ -629,6 +647,54 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         Ok(DefaultRpmLimitResponse {
             rpm_limit: req.rpm_limit,
+        })
+    }
+
+    /// 批量设置凭据级并发上限
+    pub fn batch_set_concurrency_limit(
+        &self,
+        req: BatchSetConcurrencyLimitRequest,
+    ) -> Result<BatchSetConcurrencyLimitResponse, AdminServiceError> {
+        if req.credential_ids.is_empty() {
+            return Err(AdminServiceError::InvalidParameter(
+                "credentialIds 不能为空".to_string(),
+            ));
+        }
+        let total = req.credential_ids.len();
+        let result = self
+            .token_manager
+            .set_concurrency_limit_batch(&req.credential_ids, req.concurrency_limit);
+        Ok(BatchSetConcurrencyLimitResponse {
+            total,
+            succeeded: result.succeeded,
+            failed: result
+                .failed
+                .into_iter()
+                .map(|f| BatchSetCredentialGroupFailure {
+                    id: f.id,
+                    error: f.error,
+                })
+                .collect(),
+        })
+    }
+
+    /// 获取全局默认并发上限
+    pub fn get_default_concurrency_limit(&self) -> DefaultConcurrencyLimitResponse {
+        DefaultConcurrencyLimitResponse {
+            concurrency_limit: self.token_manager.get_default_concurrency_limit(),
+        }
+    }
+
+    /// 设置全局默认并发上限
+    pub fn set_default_concurrency_limit(
+        &self,
+        req: SetDefaultConcurrencyLimitRequest,
+    ) -> Result<DefaultConcurrencyLimitResponse, AdminServiceError> {
+        self.token_manager
+            .set_default_concurrency_limit(req.concurrency_limit)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        Ok(DefaultConcurrencyLimitResponse {
+            concurrency_limit: req.concurrency_limit,
         })
     }
 

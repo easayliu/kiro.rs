@@ -13,6 +13,7 @@ import {
   ChevronDown,
   Network,
   Gauge,
+  Activity,
   CircleDollarSign,
   Boxes,
   X,
@@ -45,6 +46,7 @@ import {
   useSetDisabled,
   useSetPriority,
   useSetRpmLimit,
+  useSetConcurrencyLimit,
   useSetOverage,
   useResetFailure,
   useDeleteCredential,
@@ -58,6 +60,7 @@ import {
 interface CredentialCardProps {
   credential: CredentialStatusItem
   defaultRpmLimit?: number
+  defaultConcurrencyLimit?: number
   onViewBalance: (id: number) => void
   selected: boolean
   onToggleSelect: () => void
@@ -68,6 +71,15 @@ interface CredentialCardProps {
 // 计算生效的 RPM 上限：凭据级 0 / 正整数覆盖全局；undefined 回退全局；
 // 任意一级显式为 0 视为"不限流"。返回 0 表示不限流，正整数为限制值。
 function resolveEffectiveRpm(credLimit: number | undefined, defaultLimit: number | undefined): number {
+  if (credLimit === 0) return 0
+  if (typeof credLimit === 'number' && credLimit > 0) return credLimit
+  if (defaultLimit === 0) return 0
+  if (typeof defaultLimit === 'number' && defaultLimit > 0) return defaultLimit
+  return 0
+}
+
+// 计算生效的并发上限：与 resolveEffectiveRpm 同语义。返回 0 表示不限并发。
+function resolveEffectiveConcurrency(credLimit: number | undefined, defaultLimit: number | undefined): number {
   if (credLimit === 0) return 0
   if (typeof credLimit === 'number' && credLimit > 0) return credLimit
   if (defaultLimit === 0) return 0
@@ -89,6 +101,7 @@ function formatRemaining(ms: number): string {
 export function CredentialCard({
   credential,
   defaultRpmLimit,
+  defaultConcurrencyLimit,
   onViewBalance,
   selected,
   onToggleSelect,
@@ -100,6 +113,8 @@ export function CredentialCard({
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const [showRpmDialog, setShowRpmDialog] = useState(false)
   const [rpmInputValue, setRpmInputValue] = useState('')
+  const [showConcurrencyDialog, setShowConcurrencyDialog] = useState(false)
+  const [concurrencyInputValue, setConcurrencyInputValue] = useState('')
   // 懒加载可用模型：仅在"可用模型"子菜单首次展开后才发起请求
   const [modelsRequested, setModelsRequested] = useState(false)
 
@@ -107,6 +122,7 @@ export function CredentialCard({
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const setRpmLimit = useSetRpmLimit()
+  const setConcurrencyLimit = useSetConcurrencyLimit()
   const setOverage = useSetOverage()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
@@ -227,6 +243,30 @@ export function CredentialCard({
     handleRpmSave(parsed)
   }
 
+  const openConcurrencyDialog = () => {
+    setConcurrencyInputValue(typeof credential.concurrencyLimit === 'number' ? String(credential.concurrencyLimit) : '')
+    setShowConcurrencyDialog(true)
+  }
+  const handleConcurrencySave = (concurrencyLimit: number | null) => {
+    setConcurrencyLimit.mutate({ id: credential.id, concurrencyLimit }, {
+      onSuccess: res => { toast.success(res.message); setShowConcurrencyDialog(false) },
+      onError: err => toast.error('保存失败: ' + (err as Error).message),
+    })
+  }
+  const handleConcurrencySubmit = () => {
+    const trimmed = concurrencyInputValue.trim()
+    if (trimmed === '') {
+      handleConcurrencySave(null)
+      return
+    }
+    const parsed = Number(trimmed)
+    if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+      toast.error('请输入 ≥ 0 的整数（0 表示不限并发，留空表示回退全局默认）')
+      return
+    }
+    handleConcurrencySave(parsed)
+  }
+
   const hasFailures = credential.failureCount > 0 || credential.refreshFailureCount > 0
   const usedPercent = balance ? Math.max(0, Math.min(100, balance.usagePercentage)) : 0
   const isOverLimit = !!balance && balance.usagePercentage >= 100
@@ -266,6 +306,19 @@ export function CredentialCard({
     : rpmIsExhausted
       ? 'text-bad'
       : rpmUsageRatio >= 0.7
+        ? 'text-warn'
+        : 'text-foreground'
+
+  const effectiveConcurrency = resolveEffectiveConcurrency(credential.concurrencyLimit, defaultConcurrencyLimit)
+  const concurrencyCurrent = credential.concurrencyCurrent ?? 0
+  const concurrencyActive = effectiveConcurrency > 0
+  const concurrencyUsageRatio = concurrencyActive ? Math.min(1, concurrencyCurrent / effectiveConcurrency) : 0
+  const concurrencyIsExhausted = concurrencyActive && concurrencyCurrent >= effectiveConcurrency
+  const concurrencyColorClass = !concurrencyActive
+    ? 'text-muted-foreground'
+    : concurrencyIsExhausted
+      ? 'text-bad'
+      : concurrencyUsageRatio >= 0.7
         ? 'text-warn'
         : 'text-foreground'
 
@@ -544,6 +597,20 @@ export function CredentialCard({
                 </span>
               </>
             )}
+
+            {/* 并发在途指示器：仅在生效并发限制时显示 */}
+            {concurrencyActive && (
+              <>
+                <span className="text-muted-foreground/40">·</span>
+                <span
+                  className={cn('inline-flex items-center gap-1 tnum font-mono', concurrencyColorClass)}
+                  title={`并发 ${concurrencyCurrent}/${effectiveConcurrency} 在途${typeof credential.concurrencyLimit !== 'number' ? '（默认）' : ''}`}
+                >
+                  <Activity className="h-3 w-3" />
+                  {concurrencyCurrent}/{effectiveConcurrency}
+                </span>
+              </>
+            )}
           </div>
         </div>
 
@@ -597,6 +664,12 @@ export function CredentialCard({
                 disabled={setRpmLimit.isPending}
               >
                 <Gauge /> RPM 上限
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={openConcurrencyDialog}
+                disabled={setConcurrencyLimit.isPending}
+              >
+                <Activity /> 并发上限
               </DropdownMenuItem>
               <DropdownMenuSub>
                 <DropdownMenuSubTrigger>
@@ -750,6 +823,51 @@ export function CredentialCard({
               取消
             </Button>
             <Button onClick={handleRpmSubmit} disabled={setRpmLimit.isPending}>
+              保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={showConcurrencyDialog} onOpenChange={setShowConcurrencyDialog}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>设置并发上限</DialogTitle>
+            <DialogDescription>
+              凭据 <span className="font-mono tnum">#{String(credential.id).padStart(3, '0')}</span> 允许的最大同时在途请求数。
+              在途数达到上限后该凭据会被跳过、自动切换到其他凭据；所有凭据都满时回退到负载最轻者（不拒绝请求）。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 py-2">
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                inputMode="numeric"
+                min="0"
+                value={concurrencyInputValue}
+                placeholder={typeof defaultConcurrencyLimit === 'number' ? `全局默认 ${defaultConcurrencyLimit}` : '留空使用全局默认'}
+                onChange={e => setConcurrencyInputValue(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') handleConcurrencySubmit() }}
+                className="tnum font-mono"
+              />
+              <span className="shrink-0 text-xs text-muted-foreground">个在途</span>
+            </div>
+            <p className="text-2xs text-muted-foreground">
+              · 留空：清除凭据级覆盖，回退到全局默认
+              {typeof defaultConcurrencyLimit === 'number'
+                ? defaultConcurrencyLimit === 0 ? '（当前全局不限并发）' : `（当前全局 ${defaultConcurrencyLimit}）`
+                : '（当前全局未配置）'}
+              <br />
+              · 0：显式不限并发（即使全局有默认）
+              <br />
+              · 正整数：最多 N 个同时在途
+            </p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowConcurrencyDialog(false)} disabled={setConcurrencyLimit.isPending}>
+              取消
+            </Button>
+            <Button onClick={handleConcurrencySubmit} disabled={setConcurrencyLimit.isPending}>
               保存
             </Button>
           </DialogFooter>

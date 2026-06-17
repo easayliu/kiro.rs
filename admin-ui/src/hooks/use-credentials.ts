@@ -5,6 +5,7 @@ import {
   setCredentialDisabled,
   setCredentialPriority,
   setCredentialRpmLimit,
+  setCredentialConcurrencyLimit,
   setCredentialOverage,
   batchSetOverage,
   resetCredentialFailure,
@@ -28,9 +29,12 @@ import {
   batchSetCredentialGroup,
   batchSetPriority,
   batchSetRpmLimit,
+  batchSetConcurrencyLimit,
   batchSetDisabled,
   getDefaultRpmLimit,
   setDefaultRpmLimit,
+  getDefaultConcurrencyLimit,
+  setDefaultConcurrencyLimit,
   getBillingStats,
 } from '@/api/credentials'
 import type { AddCredentialRequest, UpsertProxyGroupRequest } from '@/types/api'
@@ -111,6 +115,18 @@ export function useSetRpmLimit() {
   return useMutation({
     mutationFn: ({ id, rpmLimit }: { id: number; rpmLimit: number | null }) =>
       setCredentialRpmLimit(id, rpmLimit),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 设置凭据并发上限
+export function useSetConcurrencyLimit() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, concurrencyLimit }: { id: number; concurrencyLimit: number | null }) =>
+      setCredentialConcurrencyLimit(id, concurrencyLimit),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
@@ -327,6 +343,17 @@ export function useBatchSetRpmLimit() {
   })
 }
 
+export function useBatchSetConcurrencyLimit() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ credentialIds, concurrencyLimit }: { credentialIds: number[]; concurrencyLimit: number | null }) =>
+      batchSetConcurrencyLimit(credentialIds, concurrencyLimit),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
 export function useBatchSetDisabled() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -363,6 +390,25 @@ export function useSetDefaultRpmLimit() {
     mutationFn: (rpmLimit: number | null) => setDefaultRpmLimit(rpmLimit),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['default-rpm-limit'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+export function useDefaultConcurrencyLimit() {
+  return useQuery({
+    queryKey: ['default-concurrency-limit'],
+    queryFn: getDefaultConcurrencyLimit,
+    staleTime: 30 * 1000,
+  })
+}
+
+export function useSetDefaultConcurrencyLimit() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (concurrencyLimit: number | null) => setDefaultConcurrencyLimit(concurrencyLimit),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['default-concurrency-limit'] })
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })

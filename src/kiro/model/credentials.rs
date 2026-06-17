@@ -120,6 +120,12 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpm_limit: Option<u32>,
 
+    /// 凭据级并发上限（同时在途请求数）
+    /// 未配置时回退到 config.json 的 `defaultConcurrencyLimit`；都未配置则不限并发。
+    /// 设置为 0 表示该凭据不限并发，即使全局有默认值也强制不限。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency_limit: Option<u32>,
+
     /// overage（超额计费）开关的「上次下发状态」。
     /// 上游无读接口（setUserPreference 只写），故用本字段记录我们最后一次
     /// 通过 Admin 下发的值，作为前端展示/核对依据：
@@ -617,6 +623,7 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             rpm_limit: None,
+            concurrency_limit: None,
             overage: None,
         };
 
@@ -738,6 +745,7 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             rpm_limit: None,
+            concurrency_limit: None,
             overage: None,
         };
 
@@ -772,6 +780,7 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             rpm_limit: None,
+            concurrency_limit: None,
             overage: None,
         };
 
@@ -889,6 +898,7 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             rpm_limit: None,
+            concurrency_limit: None,
             overage: None,
         };
 
