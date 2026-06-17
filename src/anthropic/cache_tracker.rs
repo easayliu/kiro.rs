@@ -169,15 +169,12 @@ pub struct CacheTracker {
     max_supported_ttl: Duration,
     /// 分桶模式（运行时可切换）。用 AtomicU8 编码 CacheScope。
     scope: AtomicU8,
-    /// 缓存查找跳过率（0.0-1.0）。以此概率跳过 cache 查找（当作首次请求，
-    /// cache_read = 0），但仍正常写入 checkpoint；用于在自然命中率偏高时整体
-    /// 降低可观察到的缓存命中率。
+    /// 缓存查找跳过率（0.0-1.0）。每次请求以此概率跳过 cache 查找（当作首次
+    /// 请求，cache_read = 0），但仍正常写入 checkpoint；用于在自然命中率偏高时
+    /// 整体降低可观察到的缓存命中率。
     ///
-    /// 跳过判定是**会话维度确定性**的：按 `identity_key`（含 session_id）的 hash
-    /// 与 rate 比较，使同一会话整段一致冷/热，避免会话内忽冷忽热的账单跳变；
-    /// 聚合命中率仍按 rate 下降，且分布天然双峰（部分会话全冷、部分全热），
-    /// 贴近真实 prompt cache 的冷启动行为。无 identity（无 metadata）时退回
-    /// per-request 随机。
+    /// 跳过判定是**逐请求独立随机**的：与会话身份无关，聚合命中率按 `(1 - rate)`
+    /// 下降，同一 device/session 不会被固定 hash 永久锁死在"全冷"区间。
     cache_skip_rate: Mutex<Option<f32>>,
 }
 
@@ -228,10 +225,11 @@ impl CacheTracker {
 
     /// 按配置的跳过率决定本次请求是否跳过 cache 查找。
     ///
-    /// 会话维度确定性：用 `identity_key`（含 session_id）的加盐 hash 映射到 [0,1)
-    /// 分位与 rate 比较，使同一会话整段一致跳过/不跳过，避免会话内忽冷忽热；
-    /// 无 identity 时退回 per-request 随机。
-    fn should_skip_lookup(&self, profile: &CacheProfile) -> bool {
+    /// 逐请求独立随机：每次请求以 `rate` 概率跳过查找（cache_read=0、本次变为
+    /// cache 写入），与会话身份无关。聚合命中率按 `(1 - rate)` 下降，且同一
+    /// device/session 不会被某个固定 hash 永久锁死在"全冷"区间——这是相对
+    /// 会话维度确定性跳过的关键区别。
+    fn should_skip_lookup(&self) -> bool {
         let Some(rate) = self.cache_skip_rate() else {
             return false;
         };
@@ -241,10 +239,7 @@ impl CacheTracker {
         if rate >= 1.0 {
             return true;
         }
-        match profile.identity_key {
-            Some(id) => session_skip_unit(id) < rate,
-            None => fastrand::f32() < rate,
-        }
+        fastrand::f32() < rate
     }
 
     fn effective_bucket_key(&self, credential_id: u64, profile: &CacheProfile) -> u64 {
@@ -415,7 +410,7 @@ impl CacheTracker {
         let mut matched_block_index: Option<usize> = None;
         // 命中条目持久化的上游计费口径累计 token（W），供计费时钉住 cache_read。
         let mut matched_billed: Option<i32> = None;
-        let skipped_lookup = self.should_skip_lookup(profile);
+        let skipped_lookup = self.should_skip_lookup();
 
         if skipped_lookup {
             tracing::debug!(
@@ -972,21 +967,6 @@ fn hash_to_u64(s: String) -> u64 {
     u64::from_be_bytes([
         hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
     ])
-}
-
-/// 跳过判定专用盐值，使 `session_skip_unit` 与分桶 hash（`effective_bucket_key`）
-/// 去相关——否则"是否跳过"会与"落到哪个 bucket"耦合，造成系统性偏置。
-const SKIP_UNIT_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
-
-/// 把会话身份 hash 确定性地映射到 [0,1) 分位，用于会话维度跳过判定。
-/// 同一 `identity_key` 永远得到同一分位，故同一会话整段一致冷/热。
-fn session_skip_unit(identity_key: u64) -> f32 {
-    let mut hasher = Sha256::new();
-    hasher.update(SKIP_UNIT_SALT.to_be_bytes());
-    hasher.update(identity_key.to_be_bytes());
-    let h: [u8; 32] = hasher.finalize().into();
-    let v = u32::from_be_bytes([h[0], h[1], h[2], h[3]]);
-    (v as f64 / (u32::MAX as f64 + 1.0)) as f32
 }
 
 fn mix_fingerprint(content: &[u8; 32], extras: &[u8; 32]) -> [u8; 32] {
@@ -1840,10 +1820,11 @@ mod tests {
         );
     }
 
-    /// 会话维度确定性跳过：同一会话（identity）重复"本应命中"的请求，
-    /// 跳过与否完全一致，不出现 per-request 抖动（旧 per-request 随机会忽冷忽热）。
+    /// 逐请求独立随机跳过：同一会话（identity）重复"本应命中"的请求，
+    /// 跳过与否逐请求独立——既会出现命中（cache_read>0）也会出现跳过
+    /// （cache_read=0），不会被固定 hash 永久锁死在"全冷"区间。
     #[test]
-    fn session_deterministic_skip_is_stable_within_session() {
+    fn per_request_skip_is_not_locked_per_session() {
         let tracker = CacheTracker::new(DEFAULT_CACHE_TTL, CacheScope::Global, Some(0.5));
         let sys = large_text("S ", LARGE_SYSTEM_CHARS);
         let meta = make_metadata("dev-stable", "acct-stable", "sess-stable");
@@ -1862,34 +1843,48 @@ mod tests {
         let (_r0, wb0) = tracker.compute_and_update(1, &p0);
         tracker.apply_billing_writeback(&wb0, 0, 5_000);
 
-        // 同一会话重复"本应命中"的请求多次，cache_read 结果应完全一致
-        // （要么稳定命中、要么稳定跳过），不会逐请求抖动。
-        let mut reads = Vec::new();
-        for _ in 0..8 {
+        // 同一会话重复"本应命中"的请求多次：rate=0.5 下两种结果都应出现，
+        // 证明跳过是逐请求随机、不被会话身份永久锁死。
+        let mut hits = 0;
+        let mut skips = 0;
+        for _ in 0..200 {
             let p = tracker.build_profile(&req, 10_000);
             let (r, _) = tracker.compute_and_update(1, &p);
-            reads.push(r.cache_read_input_tokens);
+            if r.cache_read_input_tokens > 0 {
+                hits += 1;
+            } else {
+                skips += 1;
+            }
         }
         assert!(
-            reads.iter().all(|&x| x == reads[0]),
-            "同一会话跳过决策应稳定一致，got={:?}",
-            reads
+            hits > 0 && skips > 0,
+            "同一会话应既有命中也有跳过（逐请求随机），hits={hits}, skips={skips}"
         );
     }
 
-    /// 跨大量会话，跳过比例应近似 rate（确定性分位整体均匀）。
+    /// rate=0：从不跳过，回访会话稳定命中。
     #[test]
-    fn session_skip_unit_distribution_approximates_rate() {
-        let rate = 0.3f32;
-        let n = 5_000;
-        let skipped = (0..n)
-            .filter(|i| session_skip_unit(hash_to_u64(format!("session-{i}"))) < rate)
-            .count();
-        let frac = skipped as f64 / n as f64;
-        assert!(
-            (frac - rate as f64).abs() < 0.03,
-            "跨会话跳过比例应≈rate(0.3)，got={frac}"
+    fn skip_rate_zero_never_skips() {
+        let tracker = CacheTracker::new(DEFAULT_CACHE_TTL, CacheScope::Global, Some(0.0));
+        let sys = large_text("S ", LARGE_SYSTEM_CHARS);
+        let req = build_request(
+            &sys,
+            vec![user_message(vec![json!({
+                "type": "text",
+                "text": "hi",
+                "cache_control": ephemeral_5m(),
+            })])],
         );
+        let p1 = tracker.build_profile(&req, 10_000);
+        let (r1, _) = tracker.compute_and_update(1, &p1);
+        let creation = r1.cache_creation_input_tokens;
+        assert!(creation > 0);
+        // 回访多次都应稳定命中，永不跳过。
+        for _ in 0..8 {
+            let p = tracker.build_profile(&req, 10_000);
+            let (r, _) = tracker.compute_and_update(1, &p);
+            assert_eq!(r.cache_read_input_tokens, creation, "rate=0 应从不跳过");
+        }
     }
 
     /// rate=1.0 强制跳过：回访会话也命中不到（短路在 identity 判定之前）。
