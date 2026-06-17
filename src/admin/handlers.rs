@@ -16,7 +16,7 @@ use super::{
         SetCredentialGroupRequest, SetDefaultConcurrencyLimitRequest, SetDefaultRpmLimitRequest,
         SetDisabledRequest,
         SetGlobalCacheRequest, SetLoadBalancingModeRequest, SetOverageRequest, SetPriorityRequest,
-        SetRpmLimitRequest, SuccessResponse, UpsertProxyGroupRequest,
+        SetRpmLimitRequest, SetUsageMultiplierRequest, SuccessResponse, UpsertProxyGroupRequest,
     },
 };
 
@@ -289,6 +289,24 @@ pub async fn set_cache_skip_rate(
     Json(payload): Json<SetCacheSkipRateRequest>,
 ) -> impl IntoResponse {
     match state.service.set_cache_skip_rate(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/usage-multiplier
+/// 获取 usage 倍率
+pub async fn get_usage_multiplier(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_usage_multiplier())
+}
+
+/// PUT /api/admin/config/usage-multiplier
+/// 设置 usage 倍率（> 0，传 null 恢复 1.0）
+pub async fn set_usage_multiplier(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetUsageMultiplierRequest>,
+) -> impl IntoResponse {
+    match state.service.set_usage_multiplier(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

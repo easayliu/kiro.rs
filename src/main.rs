@@ -167,6 +167,9 @@ async fn main() {
         None => anthropic::CacheScope::PerCredential,
     };
 
+    // 注入全局 usage 倍率（放大上报给客户端的 token 计数；admin 可运行时改写）
+    anthropic::set_usage_multiplier(config.usage_multiplier.unwrap_or(1.0));
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     let (anthropic_app, app_state) = anthropic::create_router_with_provider(
         &api_key,

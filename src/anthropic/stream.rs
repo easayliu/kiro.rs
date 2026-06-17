@@ -576,17 +576,17 @@ impl SseStateManager {
                     },
                     "usage": self.final_usage.map_or_else(
                         || json!({
-                            "input_tokens": input_tokens,
-                            "output_tokens": output_tokens,
+                            "input_tokens": apply_usage_multiplier(input_tokens),
+                            "output_tokens": apply_usage_multiplier(output_tokens),
                         }),
                         |usage| json!({
-                            "input_tokens": input_tokens,
-                            "output_tokens": output_tokens,
-                            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                            "cache_read_input_tokens": usage.cache_read_input_tokens,
+                            "input_tokens": apply_usage_multiplier(input_tokens),
+                            "output_tokens": apply_usage_multiplier(output_tokens),
+                            "cache_creation_input_tokens": apply_usage_multiplier(usage.cache_creation_input_tokens),
+                            "cache_read_input_tokens": apply_usage_multiplier(usage.cache_read_input_tokens),
                             "cache_creation": {
-                                "ephemeral_5m_input_tokens": usage.cache_creation_5m_input_tokens,
-                                "ephemeral_1h_input_tokens": usage.cache_creation_1h_input_tokens
+                                "ephemeral_5m_input_tokens": apply_usage_multiplier(usage.cache_creation_5m_input_tokens),
+                                "ephemeral_1h_input_tokens": apply_usage_multiplier(usage.cache_creation_1h_input_tokens)
                             }
                         })
                     )
@@ -607,7 +607,9 @@ impl SseStateManager {
     }
 }
 
-use super::converter::{credit_to_usd, get_context_window_size, official_price_usd};
+use super::converter::{
+    apply_usage_multiplier, credit_to_usd, get_context_window_size, official_price_usd,
+};
 use super::handlers::CacheUsageContext;
 
 /// 流处理上下文
@@ -741,13 +743,13 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.cache_usage.uncached_input_tokens.max(1),
+                    "input_tokens": apply_usage_multiplier(self.cache_usage.uncached_input_tokens.max(1)),
                     "output_tokens": 1,
-                    "cache_creation_input_tokens": self.cache_usage.cache_creation_input_tokens,
-                    "cache_read_input_tokens": self.cache_usage.cache_read_input_tokens,
+                    "cache_creation_input_tokens": apply_usage_multiplier(self.cache_usage.cache_creation_input_tokens),
+                    "cache_read_input_tokens": apply_usage_multiplier(self.cache_usage.cache_read_input_tokens),
                     "cache_creation": {
-                        "ephemeral_5m_input_tokens": self.cache_usage.cache_creation_5m_input_tokens,
-                        "ephemeral_1h_input_tokens": self.cache_usage.cache_creation_1h_input_tokens,
+                        "ephemeral_5m_input_tokens": apply_usage_multiplier(self.cache_usage.cache_creation_5m_input_tokens),
+                        "ephemeral_1h_input_tokens": apply_usage_multiplier(self.cache_usage.cache_creation_1h_input_tokens),
                     }
                 }
             }

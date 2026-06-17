@@ -26,7 +26,8 @@ use super::types::{
     LoadBalancingModeResponse, ProxyGroupsResponse, SetCacheSkipRateRequest,
     SetCredentialGroupRequest, SetDefaultConcurrencyLimitRequest, SetDefaultRpmLimitRequest,
     SetGlobalCacheRequest,
-    SetLoadBalancingModeRequest, UpsertProxyGroupRequest,
+    SetLoadBalancingModeRequest, SetUsageMultiplierRequest, UpsertProxyGroupRequest,
+    UsageMultiplierResponse,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -500,6 +501,47 @@ impl AdminService {
         }
 
         Ok(CacheSkipRateResponse { rate: req.rate })
+    }
+
+    /// 获取 usage 倍率
+    pub fn get_usage_multiplier(&self) -> UsageMultiplierResponse {
+        UsageMultiplierResponse {
+            multiplier: crate::anthropic::usage_multiplier(),
+        }
+    }
+
+    /// 设置 usage 倍率（放大上报给客户端的 token 计数）
+    pub fn set_usage_multiplier(
+        &self,
+        req: SetUsageMultiplierRequest,
+    ) -> Result<UsageMultiplierResponse, AdminServiceError> {
+        if let Some(m) = req.multiplier {
+            if !m.is_finite() || m <= 0.0 {
+                return Err(AdminServiceError::InvalidParameter(format!(
+                    "usage 倍率必须为正数，收到: {}",
+                    m
+                )));
+            }
+        }
+
+        let effective = req.multiplier.unwrap_or(1.0);
+        crate::anthropic::set_usage_multiplier(effective);
+
+        if let Some(config_path) = self.token_manager.config().config_path() {
+            match crate::model::config::Config::load(config_path) {
+                Ok(mut config) => {
+                    config.usage_multiplier = req.multiplier;
+                    if let Err(e) = config.save() {
+                        tracing::warn!("保存 usage 倍率失败: {}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("加载配置文件失败: {}", e);
+                }
+            }
+        }
+
+        Ok(UsageMultiplierResponse { multiplier: effective })
     }
 
     /// 强制刷新指定凭据的 Token

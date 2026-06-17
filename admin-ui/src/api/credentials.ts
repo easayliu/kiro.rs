@@ -207,6 +207,18 @@ export async function setCacheSkipRate(rate: number | null): Promise<{ rate: num
   return data
 }
 
+// 获取 usage 倍率（放大上报给客户端的 token 计数）
+export async function getUsageMultiplier(): Promise<{ multiplier: number }> {
+  const { data } = await api.get<{ multiplier: number }>('/config/usage-multiplier')
+  return data
+}
+
+// 设置 usage 倍率（> 0，传 null 恢复 1.0）
+export async function setUsageMultiplier(multiplier: number | null): Promise<{ multiplier: number }> {
+  const { data } = await api.put<{ multiplier: number }>('/config/usage-multiplier', { multiplier })
+  return data
+}
+
 // ============ 代理分组管理 ============
 
 export async function listProxyGroups(): Promise<ProxyGroupsResponse> {

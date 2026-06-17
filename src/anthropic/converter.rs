@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine;
 use parking_lot::RwLock;
@@ -211,6 +212,42 @@ pub const CREDIT_TO_USD: f64 = 0.04;
 /// 四舍五入到 6 位小数（微美元）。
 pub fn credit_to_usd(credit: f64) -> f64 {
     ((credit.max(0.0) * CREDIT_TO_USD) * 1_000_000.0).round() / 1_000_000.0
+}
+
+/// 上报给客户端的 usage token 全局放大倍率（以 f64 bit 存入原子，0 视为未设置 = 1.0）。
+///
+/// 仅作用于响应里返回给客户端的 token 计数（message_start / message_delta / 非流式
+/// usage），用于按倍率抬高下游「按 token 计费」的费用；**不影响**内部 billing_stats
+/// 记录的真实上游成本与官方价。由 main 启动时按 config 注入、admin 可运行时改写。
+static USAGE_MULTIPLIER_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// 设置全局 usage 倍率。非有限或 <= 0 一律回退 1.0。
+pub fn set_usage_multiplier(multiplier: f64) {
+    let m = if multiplier.is_finite() && multiplier > 0.0 {
+        multiplier
+    } else {
+        1.0
+    };
+    USAGE_MULTIPLIER_BITS.store(m.to_bits(), Ordering::Relaxed);
+}
+
+/// 读取当前全局 usage 倍率（未设置时为 1.0）。
+pub fn usage_multiplier() -> f64 {
+    match USAGE_MULTIPLIER_BITS.load(Ordering::Relaxed) {
+        0 => 1.0,
+        bits => f64::from_bits(bits),
+    }
+}
+
+/// 把上报给客户端的某项 token 计数按全局倍率放大（四舍五入，下限 0）。
+/// 倍率为 1.0 时原样返回，零成本。
+pub fn apply_usage_multiplier(tokens: i32) -> i32 {
+    let m = usage_multiplier();
+    if m == 1.0 {
+        return tokens;
+    }
+    let scaled = (tokens.max(0) as f64 * m).round();
+    scaled.clamp(0.0, i32::MAX as f64) as i32
 }
 
 /// 模型官方价（USD / MTok）：`(base_input, output)`。
