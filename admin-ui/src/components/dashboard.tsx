@@ -1973,18 +1973,22 @@ function Chip({ children, active, onClick, count, tone = 'default' }: {
   return (
     <button
       onClick={onClick}
+      aria-pressed={active}
       className={cn(
-        'inline-flex min-h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3 text-xs font-medium transition-all',
+        // outline-none + ring-inset：避免默认 focus 轮廓在 overflow-x 容器里被纵向裁成左右两条弧
+        'inline-flex min-h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3 text-xs font-medium outline-none transition-colors focus-visible:ring-2 focus-visible:ring-inset',
         active
-          ? 'bg-brand-gradient text-white'
-          : 'border border-border text-muted-foreground hover:border-brand/40 hover:text-foreground',
+          ? 'border border-transparent bg-brand-gradient text-white shadow-sm focus-visible:ring-white/60'
+          : 'border border-border text-muted-foreground hover:border-brand/40 hover:text-foreground focus-visible:ring-brand/50',
       )}
     >
       {children}
       <span
         className={cn(
           'tnum font-mono text-2xs',
-          active ? 'opacity-70' : countDotColor || 'text-muted-foreground/60',
+          active
+            ? 'rounded-full bg-white/20 px-1.5 py-px text-white'
+            : countDotColor || 'text-muted-foreground/60',
         )}
       >
         {count}

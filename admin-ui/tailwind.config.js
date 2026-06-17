@@ -70,6 +70,13 @@ export default {
           foreground: 'hsl(var(--bad-foreground))',
           soft: 'hsl(var(--bad-soft))',
         },
+        brand: {
+          DEFAULT: 'hsl(var(--brand))',
+          2: 'hsl(var(--brand-2))',
+        },
+      },
+      backgroundImage: {
+        'brand-gradient': 'linear-gradient(135deg, hsl(var(--brand)), hsl(var(--brand-2)))',
       },
       borderRadius: {
         lg: 'var(--radius)',
@@ -78,6 +85,7 @@ export default {
       },
       boxShadow: {
         card: '0 1px 2px 0 rgba(0, 0, 0, 0.04)',
+        elev: '0 1px 3px 0 rgba(0, 0, 0, 0.08), 0 1px 2px -1px rgba(0, 0, 0, 0.06)',
         pop: '0 8px 24px -8px rgba(0, 0, 0, 0.18), 0 2px 6px -2px rgba(0, 0, 0, 0.08)',
       },
       keyframes: {
