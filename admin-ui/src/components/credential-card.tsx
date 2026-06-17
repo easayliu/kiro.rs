@@ -286,6 +286,16 @@ export function CredentialCard({
   // 已实际产生超额用量，或（开了超额且越过额度）= 正在超额计费（amber 警示，而非"耗尽"红色）。
   const hasActualOverage = !!balance && balance.currentOverages > 0
   const isOverageBilling = hasActualOverage || (overageEnabled && isOverLimit)
+  // 超额本身也已触顶（currentOverages 越过 overageCap）→ 从 amber 升级为 red 警示
+  const overageCapExceeded =
+    !!balance && balance.overageCap > 0 && balance.currentOverages >= balance.overageCap
+  // 超额段进度：currentOverages 占 overageCap 的比例（0–100）；cap 未知时填满表示"正在超额"
+  const overageFillPercent =
+    balance && balance.overageCap > 0
+      ? Math.max(0, Math.min(100, (balance.currentOverages / balance.overageCap) * 100))
+      : isOverageBilling
+        ? 100
+        : 0
 
   const tier = resolveTier(balance?.subscriptionTitle)
   const displayName = credential.email || `凭据 #${credential.id}`
@@ -326,7 +336,7 @@ export function CredentialCard({
     !balance
       ? 'bg-muted'
       : isOverageBilling
-        ? 'bg-warn'
+        ? overageCapExceeded ? 'bg-bad' : 'bg-warn'
         : balance.usagePercentage >= 90
           ? 'bg-bad'
           : balance.usagePercentage >= 70
@@ -373,9 +383,13 @@ export function CredentialCard({
           'group relative flex flex-col overflow-hidden rounded-lg border bg-surface shadow-sm transition-shadow duration-200 hover:shadow-md',
           selected
             ? 'border-primary ring-2 ring-primary/20'
-            : credential.isCurrent
-              ? 'border-primary/40'
-              : 'border-border',
+            : overageCapExceeded
+              ? 'border-bad/50 ring-1 ring-bad/20'
+              : isOverageBilling
+                ? 'border-warn/50 ring-1 ring-warn/20'
+                : credential.isCurrent
+                  ? 'border-primary/40'
+                  : 'border-border',
           credential.disabled && 'opacity-75',
         )}
       >
@@ -469,17 +483,26 @@ export function CredentialCard({
                     <span
                       className={cn(
                         'tnum text-sm font-bold leading-none',
-                        isOverageBilling ? 'text-warn' : isOverLimit ? 'text-bad' : 'text-foreground',
+                        isOverageBilling
+                          ? overageCapExceeded ? 'text-bad' : 'text-warn'
+                          : isOverLimit ? 'text-bad' : 'text-foreground',
                       )}
                     >
                       {(isOverageBilling ? rawUsagePercent : balance.usagePercentage).toFixed(1)}%
                     </span>
                     {isOverageBilling && (
                       <span
-                        className="text-2xs font-medium text-warn"
-                        title="用量已越过额度，正在按超额计费"
+                        className={cn(
+                          'shrink-0 rounded-full px-1.5 py-0.5 text-2xs font-medium leading-none',
+                          overageCapExceeded ? 'bg-bad-soft text-bad' : 'bg-warn-soft text-warn',
+                        )}
+                        title={
+                          overageCapExceeded
+                            ? '超额用量已达上限（overageCap），请尽快处理'
+                            : '用量已越过额度，正在按超额计费'
+                        }
                       >
-                        超额计费中
+                        {overageCapExceeded ? '超额已触顶' : '超额计费中'}
                       </span>
                     )}
                   </>
@@ -493,11 +516,25 @@ export function CredentialCard({
                 </span>
               )}
             </div>
-            <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
+            <div
+              className="relative h-1 w-full overflow-hidden rounded-full bg-muted"
+              title={
+                isOverageBilling && balance.overageCap > 0
+                  ? `超额已用 ${overageFillPercent.toFixed(0)}% 上限（${balance.currentOverages.toFixed(0)}/${balance.overageCap.toFixed(0)}）`
+                  : undefined
+              }
+            >
               <div
-                className={cn('h-full rounded-full transition-[width] duration-500 ease-out', barColor)}
+                className={cn('absolute inset-y-0 left-0 rounded-full transition-[width] duration-500 ease-out', barColor)}
                 style={{ width: balance ? `${usedPercent}%` : '0%' }}
               />
+              {/* 超额段：在填满的基础额度条上叠加斜纹，宽度 = 超额已用占 overageCap 的比例 */}
+              {isOverageBilling && (
+                <div
+                  className="overage-stripe absolute inset-y-0 left-0 transition-[width] duration-500 ease-out"
+                  style={{ width: `${overageFillPercent}%` }}
+                />
+              )}
             </div>
             {/* 超额行固定占位：无超额时也保留高度，保证各卡片元信息行垂直对齐 */}
             <div className="mt-1 flex h-4 items-center gap-1.5 text-[11px] text-warn">
@@ -510,7 +547,13 @@ export function CredentialCard({
                     超额 +{balance.overageCharges.toFixed(2)} {balance.currency ?? ''}
                   </span>
                   <span className="text-muted-foreground/40">·</span>
-                  <span className="tnum font-mono text-muted-foreground">
+                  <span
+                    className={cn(
+                      'tnum font-mono',
+                      overageCapExceeded ? 'font-semibold text-bad' : 'text-muted-foreground',
+                    )}
+                    title={overageCapExceeded ? '超额用量已达/超过上限' : undefined}
+                  >
                     {balance.currentOverages.toFixed(2)}
                     {balance.overageCap > 0 && `/${balance.overageCap.toFixed(0)}`}
                   </span>
@@ -519,8 +562,10 @@ export function CredentialCard({
             </div>
           </div>
 
-          {/* Meta — single inline stat row: priority · success/fail · last used · RPM */}
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+          {/* Meta — 两行语义分组：① 身份/活动  ② 限流器（仅生效时显示，整体换行不孤字） */}
+          <div className="space-y-1 text-xs">
+            {/* Row ① — 优先级 · 成功/失败 · 最近使用 */}
+            <div className="flex items-center gap-x-2">
             {/* 优先级（可编辑） */}
             {readOnly ? (
               <span className="inline-flex items-center gap-0.5 tnum font-mono" title="优先级">
@@ -583,33 +628,37 @@ export function CredentialCard({
             <span className="tnum font-mono text-muted-foreground" title="最近使用">
               <RelativeTime value={credential.lastUsedAt} />
             </span>
+            </div>
 
-            {/* RPM 滑动窗口指示器：仅在生效限流时显示 */}
-            {rpmActive && (
-              <>
-                <span className="text-muted-foreground/40">·</span>
-                <span
-                  className={cn('inline-flex items-center gap-1 tnum font-mono', rpmColorClass)}
-                  title={`RPM ${rpmCurrent}/${effectiveRpm} · 60s 窗口${typeof credential.rpmLimit !== 'number' ? '（默认）' : ''}`}
-                >
-                  <Gauge className="h-3 w-3" />
-                  {rpmCurrent}/{effectiveRpm}
-                </span>
-              </>
-            )}
+            {/* Row ② — 限流器：RPM · 并发（任一生效才整体出现，作为一个分组一起换行） */}
+            {(rpmActive || concurrencyActive) && (
+              <div className="flex items-center gap-x-2">
+                {/* RPM 滑动窗口指示器 */}
+                {rpmActive && (
+                  <span
+                    className={cn('inline-flex items-center gap-1 tnum font-mono', rpmColorClass)}
+                    title={`RPM ${rpmCurrent}/${effectiveRpm} · 60s 窗口${typeof credential.rpmLimit !== 'number' ? '（默认）' : ''}`}
+                  >
+                    <Gauge className="h-3 w-3" />
+                    {rpmCurrent}/{effectiveRpm}
+                  </span>
+                )}
 
-            {/* 并发在途指示器：仅在生效并发限制时显示 */}
-            {concurrencyActive && (
-              <>
-                <span className="text-muted-foreground/40">·</span>
-                <span
-                  className={cn('inline-flex items-center gap-1 tnum font-mono', concurrencyColorClass)}
-                  title={`并发 ${concurrencyCurrent}/${effectiveConcurrency} 在途${typeof credential.concurrencyLimit !== 'number' ? '（默认）' : ''}`}
-                >
-                  <Activity className="h-3 w-3" />
-                  {concurrencyCurrent}/{effectiveConcurrency}
-                </span>
-              </>
+                {rpmActive && concurrencyActive && (
+                  <span className="text-muted-foreground/40">·</span>
+                )}
+
+                {/* 并发在途指示器 */}
+                {concurrencyActive && (
+                  <span
+                    className={cn('inline-flex items-center gap-1 tnum font-mono', concurrencyColorClass)}
+                    title={`并发 ${concurrencyCurrent}/${effectiveConcurrency} 在途${typeof credential.concurrencyLimit !== 'number' ? '（默认）' : ''}`}
+                  >
+                    <Activity className="h-3 w-3" />
+                    {concurrencyCurrent}/{effectiveConcurrency}
+                  </span>
+                )}
+              </div>
             )}
           </div>
         </div>

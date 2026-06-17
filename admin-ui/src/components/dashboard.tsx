@@ -918,8 +918,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
               {/* Title + ratio */}
               <h1 className="flex items-baseline gap-2 text-balance tracking-tight">
                 <span className="text-2xl font-semibold sm:text-3xl">凭据控制台</span>
-                <span className="tnum text-base font-medium text-muted-foreground sm:text-lg">
-                  {availableCount}<span className="text-muted-foreground/60">/</span>{totalCount}
+                <span className="tnum text-base font-medium sm:text-lg">
+                  <span className={cn(availableCount > 0 ? 'text-foreground' : 'text-muted-foreground')}>{availableCount}</span>
+                  <span className="text-muted-foreground/50">/</span>
+                  <span className="text-muted-foreground">{totalCount}</span>
                 </span>
               </h1>
 
@@ -970,7 +972,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           {/* ━━━━━━━━━━━━ BILLING SUMMARY ━━━━━━━━━━━━ */}
           {billingStats && (
             <section className="mb-5 sm:mb-6">
-              <div className="grid grid-cols-2 gap-2.5 sm:gap-3 lg:grid-cols-4">
+              <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
                 <BillingStatCard
                   label="累计请求"
                   value={billingStats.requests.toLocaleString('en-US')}
@@ -1859,16 +1861,23 @@ function BillingStatCard({
 }) {
   const valueColor =
     emphasis === 'good' ? 'text-ok' : emphasis === 'bad' ? 'text-bad' : 'text-foreground'
+  // 焦点 KPI（毛利等）以极淡 tint 自然吸睛，与普通指标拉开层级；普通卡片保持纯描边。
+  const cardTone =
+    emphasis === 'good'
+      ? 'border-ok/30 bg-ok-soft/40'
+      : emphasis === 'bad'
+        ? 'border-bad/30 bg-bad-soft/40'
+        : 'border-border bg-card'
   return (
-    <div className="rounded-xl border border-border bg-card px-3.5 py-3 sm:px-4 sm:py-3.5">
+    <div className={cn('rounded-xl border px-3.5 py-3 sm:px-4 sm:py-3.5', cardTone)}>
       <div className="text-2xs font-medium uppercase tracking-wider text-muted-foreground">
         {label}
       </div>
-      <div className={cn('tnum mt-1 text-lg font-semibold tracking-tight sm:text-xl', valueColor)}>
+      <div className={cn('tnum mt-1.5 text-lg font-semibold leading-none tracking-tight sm:text-xl', valueColor)}>
         {value}
       </div>
       {hint && (
-        <div className="mt-0.5 truncate font-mono text-2xs text-muted-foreground/70">{hint}</div>
+        <div className="mt-1 truncate font-mono text-2xs text-muted-foreground">{hint}</div>
       )}
     </div>
   )
