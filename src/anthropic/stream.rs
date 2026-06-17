@@ -566,6 +566,27 @@ impl SseStateManager {
         // 发送 message_delta
         if !self.message_delta_sent {
             self.message_delta_sent = true;
+            // 上报上游返回的真实 token 计数（无 cache 信息时输入侧仅为 input_tokens）。
+            let usage_json = self.final_usage.map_or_else(
+                || {
+                    json!({
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                    })
+                },
+                |usage| {
+                    json!({
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                        "cache_read_input_tokens": usage.cache_read_input_tokens,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": usage.cache_creation_5m_input_tokens,
+                            "ephemeral_1h_input_tokens": usage.cache_creation_1h_input_tokens
+                        }
+                    })
+                },
+            );
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
@@ -574,22 +595,7 @@ impl SseStateManager {
                         "stop_reason": self.get_stop_reason(),
                         "stop_sequence": null
                     },
-                    "usage": self.final_usage.map_or_else(
-                        || json!({
-                            "input_tokens": apply_usage_multiplier(input_tokens),
-                            "output_tokens": apply_usage_multiplier(output_tokens),
-                        }),
-                        |usage| json!({
-                            "input_tokens": apply_usage_multiplier(input_tokens),
-                            "output_tokens": apply_usage_multiplier(output_tokens),
-                            "cache_creation_input_tokens": apply_usage_multiplier(usage.cache_creation_input_tokens),
-                            "cache_read_input_tokens": apply_usage_multiplier(usage.cache_read_input_tokens),
-                            "cache_creation": {
-                                "ephemeral_5m_input_tokens": apply_usage_multiplier(usage.cache_creation_5m_input_tokens),
-                                "ephemeral_1h_input_tokens": apply_usage_multiplier(usage.cache_creation_1h_input_tokens)
-                            }
-                        })
-                    )
+                    "usage": usage_json
                 }),
             ));
         }
@@ -607,9 +613,7 @@ impl SseStateManager {
     }
 }
 
-use super::converter::{
-    apply_usage_multiplier, credit_to_usd, get_context_window_size, official_price_usd,
-};
+use super::converter::{credit_to_usd, get_context_window_size, official_price_usd};
 use super::handlers::CacheUsageContext;
 
 /// 流处理上下文
@@ -732,6 +736,7 @@ impl StreamContext {
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let input = self.cache_usage.uncached_input_tokens.max(1);
         json!({
             "type": "message_start",
             "message": {
@@ -743,13 +748,13 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": apply_usage_multiplier(self.cache_usage.uncached_input_tokens.max(1)),
+                    "input_tokens": input,
                     "output_tokens": 1,
-                    "cache_creation_input_tokens": apply_usage_multiplier(self.cache_usage.cache_creation_input_tokens),
-                    "cache_read_input_tokens": apply_usage_multiplier(self.cache_usage.cache_read_input_tokens),
+                    "cache_creation_input_tokens": self.cache_usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": self.cache_usage.cache_read_input_tokens,
                     "cache_creation": {
-                        "ephemeral_5m_input_tokens": apply_usage_multiplier(self.cache_usage.cache_creation_5m_input_tokens),
-                        "ephemeral_1h_input_tokens": apply_usage_multiplier(self.cache_usage.cache_creation_1h_input_tokens),
+                        "ephemeral_5m_input_tokens": self.cache_usage.cache_creation_5m_input_tokens,
+                        "ephemeral_1h_input_tokens": self.cache_usage.cache_creation_1h_input_tokens,
                     }
                 }
             }
@@ -1372,10 +1377,10 @@ impl StreamContext {
 
         // 生成最终事件（input_tokens 用计费口径的 uncached；对齐 Anthropic
         // 行为保底 1：即使 breakpoint 之后无新内容，官方也不会返回 0）
-        events.extend(self.state_manager.generate_final_events(
-            billing.uncached_input_tokens.max(1),
-            self.output_tokens,
-        ));
+        events.extend(
+            self.state_manager
+                .generate_final_events(billing.uncached_input_tokens.max(1), self.output_tokens),
+        );
         events
     }
 }

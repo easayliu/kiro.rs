@@ -801,9 +801,7 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
-use super::converter::{
-    apply_usage_multiplier, credit_to_usd, get_context_window_size, official_price_usd,
-};
+use super::converter::{credit_to_usd, get_context_window_size, official_price_usd};
 
 /// 处理非流式请求
 async fn handle_non_stream_request(
@@ -1065,7 +1063,7 @@ async fn handle_non_stream_request(
         "请求完成（非流式）"
     );
 
-    // 构建 Anthropic 响应
+    // 构建 Anthropic 响应（上报上游返回的真实 token 计数）
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
         "type": "message",
@@ -1075,13 +1073,13 @@ async fn handle_non_stream_request(
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
-            "input_tokens": apply_usage_multiplier(billed_input_tokens),
-            "output_tokens": apply_usage_multiplier(output_tokens),
-            "cache_creation_input_tokens": apply_usage_multiplier(billing.cache_creation_input_tokens),
-            "cache_read_input_tokens": apply_usage_multiplier(billing.cache_read_input_tokens),
+            "input_tokens": billed_input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": billing.cache_creation_input_tokens,
+            "cache_read_input_tokens": billing.cache_read_input_tokens,
             "cache_creation": {
-                "ephemeral_5m_input_tokens": apply_usage_multiplier(billing.cache_creation_5m_input_tokens),
-                "ephemeral_1h_input_tokens": apply_usage_multiplier(billing.cache_creation_1h_input_tokens),
+                "ephemeral_5m_input_tokens": billing.cache_creation_5m_input_tokens,
+                "ephemeral_1h_input_tokens": billing.cache_creation_1h_input_tokens,
             }
         }
     });

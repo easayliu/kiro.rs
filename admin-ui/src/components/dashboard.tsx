@@ -46,8 +46,6 @@ import {
   useSetCacheScope,
   useCacheSkipRate,
   useSetCacheSkipRate,
-  useUsageMultiplier,
-  useSetUsageMultiplier,
   useIsReadOnly,
   useBatchSetPriority,
   useBatchSetRpmLimit,
@@ -203,10 +201,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: setCacheSkipRateMutation, isPending: isSettingCacheSkipRate } = useSetCacheSkipRate()
   const [cacheSkipRateDialogOpen, setCacheSkipRateDialogOpen] = useState(false)
   const [cacheSkipRateInput, setCacheSkipRateInput] = useState('')
-  const { data: usageMultiplierData, isLoading: isLoadingUsageMultiplier } = useUsageMultiplier()
-  const { mutate: setUsageMultiplierMutation, isPending: isSettingUsageMultiplier } = useSetUsageMultiplier()
-  const [usageMultiplierDialogOpen, setUsageMultiplierDialogOpen] = useState(false)
-  const [usageMultiplierInput, setUsageMultiplierInput] = useState('')
 
   const allCreds = data?.credentials || []
   const totalCount = data?.total || 0
@@ -814,34 +808,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
   }
 
-  const handleOpenUsageMultiplierDialog = () => {
-    const current = usageMultiplierData?.multiplier
-    setUsageMultiplierInput(current == null || current === 1 ? '' : String(current))
-    setUsageMultiplierDialogOpen(true)
-  }
-
-  const handleSaveUsageMultiplier = () => {
-    if (isSettingUsageMultiplier) return
-    const trimmed = usageMultiplierInput.trim()
-    let multiplier: number | null
-    if (trimmed === '') multiplier = null
-    else {
-      const parsed = Number(trimmed)
-      if (!Number.isFinite(parsed) || parsed <= 0) {
-        toast.error('请输入大于 0 的倍率（留空表示 1.0 不放大）')
-        return
-      }
-      multiplier = parsed
-    }
-    setUsageMultiplierMutation(multiplier, {
-      onSuccess: () => {
-        toast.success(multiplier == null || multiplier === 1 ? '已恢复倍率 1.0' : `已设置倍率为 ${multiplier}×`)
-        setUsageMultiplierDialogOpen(false)
-      },
-      onError: err => toast.error(`设置失败: ${extractErrorMessage(err)}`),
-    })
-  }
-
   const handleCycleCacheScope = () => {
     const current = cacheScopeData?.scope ?? 'global'
     const next: CacheScope = current === 'global' ? 'per_credential' : 'global'
@@ -897,7 +863,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     <div className="relative min-h-screen bg-background text-foreground">
       {/* Top header — shared across mobile & desktop */}
       <header
-        className="sticky top-0 z-30 border-b border-border bg-background/90 backdrop-blur-md"
+        className="sticky top-0 z-30 border-b border-border bg-background/80 backdrop-blur-xl"
         style={{ paddingTop: 'env(safe-area-inset-top)' }}
       >
         <div
@@ -908,7 +874,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           }}
         >
           <div className="flex items-center gap-2.5">
-            <div className="flex h-7 w-7 items-center justify-center rounded-md bg-foreground text-background">
+            <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-brand-gradient text-white">
               <span className="font-mono text-xs font-bold">K</span>
             </div>
             <div className="flex items-baseline gap-1.5">
@@ -952,16 +918,20 @@ export function Dashboard({ onLogout }: DashboardProps) {
               {/* Title + ratio */}
               <h1 className="flex items-baseline gap-2 text-balance tracking-tight">
                 <span className="text-2xl font-semibold sm:text-3xl">凭据控制台</span>
-                <span className="tnum text-base font-medium sm:text-lg">
-                  <span className={cn(availableCount > 0 ? 'text-foreground' : 'text-muted-foreground')}>{availableCount}</span>
-                  <span className="text-muted-foreground/50">/</span>
-                  <span className="text-muted-foreground">{totalCount}</span>
+                <span className="tnum text-base font-semibold sm:text-lg">
+                  <span className={cn(availableCount > 0 ? 'text-brand-gradient' : 'text-muted-foreground')}>{availableCount}</span>
+                  <span className="font-normal text-muted-foreground/40">/</span>
+                  <span className="font-medium text-muted-foreground">{totalCount}</span>
                 </span>
               </h1>
 
               {/* Active credential */}
               {data?.currentId && (
                 <p className="flex min-w-0 items-center gap-1.5 font-mono text-xs text-muted-foreground">
+                  <span className="relative flex h-1.5 w-1.5 shrink-0">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-ok/70" />
+                    <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-ok" />
+                  </span>
                   <span className="shrink-0">当前</span>
                   <span className="shrink-0 text-border">·</span>
                   <span className="min-w-0 truncate text-foreground">
@@ -1006,31 +976,31 @@ export function Dashboard({ onLogout }: DashboardProps) {
           {/* ━━━━━━━━━━━━ BILLING SUMMARY ━━━━━━━━━━━━ */}
           {billingStats && (
             <section className="mb-5 sm:mb-6">
-              <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-                <BillingStatCard
-                  label="累计请求"
-                  value={billingStats.requests.toLocaleString('en-US')}
-                />
-                <BillingStatCard
-                  label="实际成本"
-                  value={formatUsd(billingStats.actual_cost_usd)}
-                  hint="上游折扣后真实成本"
-                />
-                <BillingStatCard
-                  label="官方折算"
-                  value={formatUsd(billingStats.official_price_usd)}
-                  hint="Anthropic 零售价"
-                />
-                <BillingStatCard
-                  label="累计毛利"
-                  value={formatUsd(billingStats.margin_usd)}
-                  hint={
-                    billingStats.official_price_usd > 0
-                      ? `毛利率 ${((billingStats.margin_usd / billingStats.official_price_usd) * 100).toFixed(1)}%`
-                      : undefined
-                  }
-                  emphasis={billingStats.margin_usd >= 0 ? 'good' : 'bad'}
-                />
+              <div className="flex flex-col gap-3 lg:grid lg:grid-cols-10">
+                <MarginCard stats={billingStats} className="lg:col-span-4" />
+                {/* 3 辅指标：移动端 3-up 一行，桌面端 lg:contents 融入 12 栅格 */}
+                <div className="grid grid-cols-3 gap-2.5 sm:gap-3 lg:contents">
+                  <BillingStatCard
+                    className="lg:col-span-2"
+                    label="累计请求"
+                    value={billingStats.requests.toLocaleString('en-US')}
+                    icon={<Activity className="h-3.5 w-3.5" />}
+                  />
+                  <BillingStatCard
+                    className="lg:col-span-2"
+                    label="实际成本"
+                    value={formatUsd(billingStats.actual_cost_usd)}
+                    hint="上游折扣后真实成本"
+                    icon={<CircleDollarSign className="h-3.5 w-3.5" />}
+                  />
+                  <BillingStatCard
+                    className="lg:col-span-2"
+                    label="官方折算"
+                    value={formatUsd(billingStats.official_price_usd)}
+                    hint="Anthropic 零售价"
+                    icon={<Gauge className="h-3.5 w-3.5" />}
+                  />
+                </div>
               </div>
             </section>
           )}
@@ -1040,8 +1010,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
             {/* Sticky toolbar — single row */}
             <div className="sticky top-12 z-20 -mx-4 mb-4 border-b border-border bg-background/92 px-4 py-2.5 backdrop-blur-md sm:-mx-8 sm:top-14 sm:px-8 lg:-mx-12 lg:px-12">
-              <div className="flex items-center gap-1.5">
-                <div className="relative min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-2">
+                {/* Search — fills the row on mobile, capped & left-aligned on desktop */}
+                <div className="relative order-1 min-w-0 flex-1 lg:max-w-xs">
                   <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
                   <input
                     type="search"
@@ -1062,7 +1033,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   )}
                 </div>
 
-                {/* Primary inline actions — icon-only on mobile, text on sm+ */}
+                {/* Primary inline actions — icon-only on mobile, text on sm+; far right on desktop */}
+                <div className="order-2 flex shrink-0 items-center gap-1.5 lg:order-3">
                 <button
                   onClick={handleQueryCurrentPageInfo}
                   disabled={queryingInfo}
@@ -1131,10 +1103,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
-              </div>
+                </div>
 
-              {/* Chips row — filters + stat indicators */}
-              <div className="mt-2 flex items-center gap-1 overflow-x-auto no-scrollbar">
+                {/* Filter chips — full second row on mobile, inline between search & actions on desktop */}
+                <div className="order-3 flex w-full items-center gap-1 overflow-x-auto no-scrollbar lg:order-2 lg:w-auto lg:flex-1">
                 <Chip active={filter === 'all'} onClick={() => setFilter('all')} count={allCreds.length}>全部</Chip>
                 <Chip
                   active={filter === 'available'}
@@ -1178,6 +1150,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     验活 {verifyProgress.current}/{verifyProgress.total}
                   </button>
                 )}
+                </div>
               </div>
             </div>
 
@@ -1348,7 +1321,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
         >
           <div className="mx-auto flex max-w-[1440px] items-center gap-2 px-4 pt-2 sm:px-8 lg:px-12">
             <span className="inline-flex shrink-0 items-center gap-1.5 text-sm font-medium">
-              <span className="tnum flex h-6 w-6 items-center justify-center rounded-full bg-foreground text-2xs font-bold text-background">
+              <span className="tnum flex h-6 w-6 items-center justify-center rounded-full bg-brand-gradient text-2xs font-bold text-white">
                 {selectedIds.size}
               </span>
               已选
@@ -1472,18 +1445,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
               loading={isLoadingCacheSkipRate}
               disabled={isLoadingCacheSkipRate || isSettingCacheSkipRate}
               onClick={() => { setPoliciesOpen(false); handleOpenCacheSkipRateDialog() }}
-            />
-            <PolicyRow
-              label="计费倍率"
-              sub={usageMultiplierData?.multiplier == null || usageMultiplierData.multiplier === 1 ? '按上游真实 token 上报' : '放大上报 token 抬高费用'}
-              value={
-                isLoadingUsageMultiplier ? '—'
-                : usageMultiplierData?.multiplier == null || usageMultiplierData.multiplier === 1 ? '1.0×'
-                : `${usageMultiplierData.multiplier}×`
-              }
-              loading={isLoadingUsageMultiplier}
-              disabled={isLoadingUsageMultiplier || isSettingUsageMultiplier}
-              onClick={() => { setPoliciesOpen(false); handleOpenUsageMultiplierDialog() }}
             />
             <PolicyRow
               label="负载均衡"
@@ -1880,39 +1841,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={usageMultiplierDialogOpen} onOpenChange={setUsageMultiplierDialogOpen}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>计费倍率</DialogTitle>
-            <DialogDescription>
-              放大上报给客户端的 token 计数（input/output/cache），用于按倍率抬高下游按 token 计费的费用。不影响内部记录的真实上游成本。留空表示 1.0（不放大）。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-2 py-2">
-            <Input
-              type="number"
-              min={0}
-              step={0.1}
-              placeholder="例如 1.5；留空表示 1.0"
-              value={usageMultiplierInput}
-              onChange={e => setUsageMultiplierInput(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') handleSaveUsageMultiplier() }}
-              autoFocus
-            />
-            <p className="font-mono text-2xs uppercase tracking-wider text-muted-foreground">
-              当前：{usageMultiplierData?.multiplier == null ? '1.0×' : `${usageMultiplierData.multiplier}×`}
-            </p>
-          </div>
-          <DialogFooter className="gap-2 sm:gap-2">
-            <Button variant="outline" onClick={() => setUsageMultiplierInput('')} disabled={isSettingUsageMultiplier}>
-              清空
-            </Button>
-            <Button onClick={handleSaveUsageMultiplier} disabled={isSettingUsageMultiplier}>
-              {isSettingUsageMultiplier ? '保存中…' : '保存'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   )
 }
@@ -1930,34 +1858,83 @@ function formatUsd(usd: number): string {
   })}`
 }
 
-// 计费汇总卡片
+// 计费焦点卡：累计毛利放大 + 成本/毛利占比条 + 品牌渐变描边
+function MarginCard({ stats, className }: {
+  stats: { requests: number; actual_cost_usd: number; official_price_usd: number; margin_usd: number }
+  className?: string
+}) {
+  const positive = stats.margin_usd >= 0
+  const official = stats.official_price_usd
+  const marginRate = official > 0 ? (stats.margin_usd / official) * 100 : 0
+  // 成本 / 毛利在官方零售价中的占比（毛利为负时仅显示成本占满）
+  const costPct = official > 0 ? Math.min(100, Math.max(0, (stats.actual_cost_usd / official) * 100)) : 0
+  const marginPct = official > 0 && positive ? Math.min(100, Math.max(0, (stats.margin_usd / official) * 100)) : 0
+  return (
+    <div
+      className={cn(
+        'relative overflow-hidden rounded-2xl border border-border bg-card p-3.5 shadow-elev sm:p-4',
+        className,
+      )}
+    >
+      <div className="relative">
+        <div className="flex items-center justify-between">
+          <span className="label-eyebrow">累计毛利 · margin</span>
+          <span
+            className={cn(
+              'tnum inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-mono text-2xs font-semibold',
+              positive ? 'bg-ok-soft text-ok' : 'bg-bad-soft text-bad',
+            )}
+          >
+            {positive ? '▲' : '▼'} {official > 0 ? `${marginRate.toFixed(1)}%` : '—'}
+          </span>
+        </div>
+        <div className={cn('tnum mt-1.5 text-2xl font-bold leading-none tracking-tight sm:text-3xl', positive ? 'text-ok' : 'text-bad')}>
+          {formatUsd(stats.margin_usd)}
+        </div>
+
+        {/* 成本 / 毛利占比条 */}
+        <div className="mt-3">
+          <div className="flex h-1.5 w-full overflow-hidden rounded-full bg-muted">
+            <div className="h-full bg-muted-foreground/40" style={{ width: `${costPct}%` }} />
+            <div className="bg-brand-gradient h-full" style={{ width: `${marginPct}%` }} />
+          </div>
+          <div className="mt-1.5 flex items-center justify-between font-mono text-2xs text-muted-foreground">
+            <span className="inline-flex items-center gap-1.5">
+              <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/40" />
+              成本 {formatUsd(stats.actual_cost_usd)}
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <span className="h-1.5 w-1.5 rounded-full bg-brand" />
+              官方折算 {formatUsd(official)}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// 计费辅助指标卡
 function BillingStatCard({
-  label, value, hint, emphasis = 'default',
+  label, value, hint, icon, className,
 }: {
   label: string
   value: string
   hint?: string
-  emphasis?: 'default' | 'good' | 'bad'
+  icon?: ReactNode
+  className?: string
 }) {
-  const valueColor =
-    emphasis === 'good' ? 'text-ok' : emphasis === 'bad' ? 'text-bad' : 'text-foreground'
-  // 焦点 KPI（毛利等）以极淡 tint 自然吸睛，与普通指标拉开层级；普通卡片保持纯描边。
-  const cardTone =
-    emphasis === 'good'
-      ? 'border-ok/30 bg-ok-soft/40'
-      : emphasis === 'bad'
-        ? 'border-bad/30 bg-bad-soft/40'
-        : 'border-border bg-card'
   return (
-    <div className={cn('rounded-xl border px-3.5 py-3 sm:px-4 sm:py-3.5', cardTone)}>
-      <div className="text-2xs font-medium uppercase tracking-wider text-muted-foreground">
-        {label}
+    <div className={cn('group min-w-0 rounded-2xl border border-border bg-card px-3 py-2.5 shadow-elev transition-colors hover:border-brand/40 sm:px-4 sm:py-3.5', className)}>
+      <div className="flex items-center gap-1 overflow-hidden whitespace-nowrap text-2xs font-medium uppercase tracking-wider text-muted-foreground sm:gap-1.5">
+        {icon && <span className="shrink-0 text-muted-foreground/70 transition-colors group-hover:text-brand">{icon}</span>}
+        <span className="truncate">{label}</span>
       </div>
-      <div className={cn('tnum mt-1.5 text-lg font-semibold leading-none tracking-tight sm:text-xl', valueColor)}>
+      <div className="tnum mt-1.5 truncate text-base font-semibold leading-none tracking-tight text-foreground sm:text-xl">
         {value}
       </div>
       {hint && (
-        <div className="mt-1 truncate font-mono text-2xs text-muted-foreground">{hint}</div>
+        <div className="mt-1 hidden truncate font-mono text-2xs text-muted-foreground sm:block">{hint}</div>
       )}
     </div>
   )
@@ -1997,10 +1974,10 @@ function Chip({ children, active, onClick, count, tone = 'default' }: {
     <button
       onClick={onClick}
       className={cn(
-        'inline-flex min-h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3 text-xs font-medium transition-colors',
+        'inline-flex min-h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-full px-3 text-xs font-medium transition-all',
         active
-          ? 'bg-foreground text-background'
-          : 'text-muted-foreground hover:bg-muted hover:text-foreground',
+          ? 'bg-brand-gradient text-white'
+          : 'border border-border text-muted-foreground hover:border-brand/40 hover:text-foreground',
       )}
     >
       {children}

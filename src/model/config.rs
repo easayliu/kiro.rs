@@ -209,14 +209,6 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_concurrency_limit: Option<u32>,
 
-    /// 上报给客户端的 usage token 放大倍率（> 0，默认 1.0 = 不放大）
-    ///
-    /// 仅放大响应中返回给客户端的 token 计数（input/output/cache），用于按倍率抬高
-    /// 下游「按 token 计费」的费用；不影响内部记录的真实上游成本与官方价。可在管理
-    /// 后台运行时调整。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage_multiplier: Option<f64>,
-
     /// kiro-cli 版本号（仅 kiro-cli 模式使用）
     #[serde(default = "default_kiro_cli_version")]
     pub kiro_cli_version: String,
@@ -307,7 +299,6 @@ impl Default for Config {
             client_mode: ClientMode::default(),
             default_rpm_limit: None,
             default_concurrency_limit: None,
-            usage_multiplier: None,
             kiro_cli_version: default_kiro_cli_version(),
             config_path: None,
         }
