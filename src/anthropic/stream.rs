@@ -1411,13 +1411,17 @@ impl StreamContext {
         }
 
         // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
-        // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
-        // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
+        // 补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块。
         if self.thinking_enabled
             && self.thinking_block_index.is_some()
             && !self.state_manager.has_non_thinking_blocks()
         {
-            self.state_manager.set_stop_reason("max_tokens");
+            // 仅老内联 `<thinking>` 路径：thinking-only 意味着模型把预算耗在思考上（被截断），
+            // 标记 max_tokens。新端点 reasoningContentEvent 的思考是独立完整流（带签名收尾），
+            // thinking-only 是正常结束，不应改写上游真实 stop_reason。
+            if !self.reasoning_seen {
+                self.state_manager.set_stop_reason("max_tokens");
+            }
             events.extend(self.create_text_delta_events(" "));
         }
 
