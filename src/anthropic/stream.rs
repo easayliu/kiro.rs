@@ -668,6 +668,10 @@ pub struct StreamContext {
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 是否已收到过 `reasoningContentEvent`（新 Kiro runtime 端点的独立思考流）。
+    /// 一旦为 true，说明思考经独立事件下发，`assistantResponseEvent` 的正文即纯文本，
+    /// 无需再走 `<thinking>` 文本标签扫描（那是老 CodeWhisperer 端点的内联格式）。
+    reasoning_seen: bool,
 }
 
 impl StreamContext {
@@ -701,6 +705,7 @@ impl StreamContext {
             thinking_block_index: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            reasoning_seen: false,
         }
     }
 
@@ -804,6 +809,7 @@ impl StreamContext {
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
+            Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比反推实际 input_tokens。
@@ -853,8 +859,82 @@ impl StreamContext {
         }
     }
 
+    /// 处理推理（思考）内容事件（新 Kiro runtime 端点的独立思考流）
+    ///
+    /// 上游以 `reasoningContentEvent` 逐 token 下发 `{"text":...}`，并在末尾用
+    /// `{"signature":...}` 携带思考签名。这里懒启动一个 Anthropic `thinking` 块，
+    /// 把文本作为 `thinking_delta`、签名作为 `signature_delta` 流式转发。
+    fn process_reasoning_content(
+        &mut self,
+        reasoning: &crate::kiro::model::events::ReasoningContentEvent,
+    ) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        self.reasoning_seen = true;
+
+        // 懒启动 thinking 块
+        if self.thinking_block_index.is_none() {
+            let thinking_index = self.state_manager.next_block_index();
+            self.thinking_block_index = Some(thinking_index);
+            self.in_thinking_block = true;
+            let start_events = self.state_manager.handle_content_block_start(
+                thinking_index,
+                "thinking",
+                json!({
+                    "type": "content_block_start",
+                    "index": thinking_index,
+                    "content_block": { "type": "thinking", "thinking": "" }
+                }),
+            );
+            events.extend(start_events);
+        }
+        let Some(thinking_index) = self.thinking_block_index else {
+            return events;
+        };
+
+        if !reasoning.text.is_empty() {
+            self.output_tokens += estimate_tokens(&reasoning.text);
+            events.push(self.create_thinking_delta_event(thinking_index, &reasoning.text));
+        }
+        if let Some(signature) = &reasoning.signature {
+            if !signature.is_empty() {
+                events.push(self.create_signature_delta_event(thinking_index, signature));
+            }
+        }
+
+        events
+    }
+
+    /// 关闭由 `reasoningContentEvent` 开启的 thinking 块（发送 content_block_stop）。
+    fn close_reasoning_block(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        if self.in_thinking_block {
+            if let Some(thinking_index) = self.thinking_block_index {
+                if let Some(stop_event) =
+                    self.state_manager.handle_content_block_stop(thinking_index)
+                {
+                    events.push(stop_event);
+                }
+            }
+        }
+        self.in_thinking_block = false;
+        self.thinking_extracted = true;
+        events
+    }
+
     /// 处理助手响应事件
     fn process_assistant_response(&mut self, content: &str) -> Vec<SseEvent> {
+        // 新端点（思考走独立 reasoningContentEvent）：先收尾思考块，正文按纯文本处理，
+        // 不再走 `<thinking>` 文本标签扫描（该格式仅老 CodeWhisperer 端点会内联返回）。
+        if self.reasoning_seen {
+            let mut events = self.close_reasoning_block();
+            if content.is_empty() {
+                return events;
+            }
+            self.output_tokens += estimate_tokens(content);
+            events.extend(self.create_text_delta_events(content));
+            return events;
+        }
+
         if content.is_empty() {
             return Vec::new();
         }
@@ -1093,6 +1173,21 @@ impl StreamContext {
         )
     }
 
+    /// 创建 signature_delta 事件（思考块签名，对齐 Anthropic thinking 流格式）
+    fn create_signature_delta_event(&self, index: i32, signature: &str) -> SseEvent {
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": signature
+                }
+            }),
+        )
+    }
+
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
@@ -1101,6 +1196,11 @@ impl StreamContext {
         let mut events = Vec::new();
 
         self.state_manager.set_has_tool_use(true);
+
+        // 新端点：reasoningContentEvent 开的 thinking 块需在 tool_use 前收尾。
+        if self.reasoning_seen && self.in_thinking_block {
+            events.extend(self.close_reasoning_block());
+        }
 
         // tool_use 必须发生在 thinking 结束之后。
         // 但当 `</thinking>` 后面没有 `\n\n`（例如紧跟 tool_use 或流结束）时，
@@ -1241,6 +1341,12 @@ impl StreamContext {
 
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        // 新端点：若 reasoningContentEvent 开的 thinking 块仍未收尾（无后续正文/工具），
+        // 在收口前补一个 content_block_stop。
+        if self.reasoning_seen && self.in_thinking_block {
+            events.extend(self.close_reasoning_block());
+        }
 
         // Flush thinking_buffer 中的剩余内容
         if self.thinking_enabled && !self.thinking_buffer.is_empty() {
@@ -1585,6 +1691,60 @@ mod tests {
         // 重复 stop 应该被跳过
         let event = manager.handle_content_block_stop(0);
         assert!(event.is_none());
+    }
+
+    #[test]
+    fn test_reasoning_content_event_emits_thinking_then_text() {
+        use crate::kiro::model::events::ReasoningContentEvent;
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        // 新端点：先来 reasoningContentEvent（文本增量 + 签名），再来正文。
+        let r1: ReasoningContentEvent = serde_json::from_str(r#"{"text":"Let me"}"#).unwrap();
+        let r2: ReasoningContentEvent = serde_json::from_str(r#"{"text":" think"}"#).unwrap();
+        let sig: ReasoningContentEvent = serde_json::from_str(r#"{"signature":"EuYCabc"}"#).unwrap();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_kiro_event(&Event::ReasoningContent(r1)));
+        all.extend(ctx.process_kiro_event(&Event::ReasoningContent(r2)));
+        all.extend(ctx.process_kiro_event(&Event::ReasoningContent(sig)));
+        let resp: crate::kiro::model::events::AssistantResponseEvent =
+            serde_json::from_str(r#"{"content":"答案是 23"}"#).unwrap();
+        all.extend(ctx.process_kiro_event(&Event::AssistantResponse(resp)));
+
+        // thinking 块开启
+        let start = all
+            .iter()
+            .find(|e| e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking");
+        assert!(start.is_some(), "应有 thinking 块的 content_block_start");
+
+        // thinking_delta 文本拼接
+        let thinking: String = all
+            .iter()
+            .filter(|e| e.data["delta"]["type"] == "thinking_delta")
+            .map(|e| e.data["delta"]["thinking"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(thinking, "Let me think");
+
+        // signature_delta 透传
+        let has_sig = all
+            .iter()
+            .any(|e| e.data["delta"]["type"] == "signature_delta"
+                && e.data["delta"]["signature"] == "EuYCabc");
+        assert!(has_sig, "应透传 signature_delta");
+
+        // thinking 块在正文前收尾
+        let has_stop = all.iter().any(|e| e.event == "content_block_stop");
+        assert!(has_stop, "thinking 块应被 content_block_stop 收尾");
+
+        // 正文以 text_delta 输出
+        let text: String = all
+            .iter()
+            .filter(|e| e.data["delta"]["type"] == "text_delta")
+            .map(|e| e.data["delta"]["text"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(text, "答案是 23");
     }
 
     #[test]

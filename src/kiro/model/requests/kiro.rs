@@ -35,6 +35,15 @@ pub struct KiroRequest {
     /// Profile ARN（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
+    /// 代理模式（顶层），对齐真实 Kiro IDE 请求体（与 `x-amzn-kiro-agent-mode`
+    /// 请求头同值，通常为 "vibe"）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_mode: Option<String>,
+    /// 附加模型请求字段（顶层），对齐真实 Kiro IDE：thinking 配置通过
+    /// `additionalModelRequestFields.thinking`（Bedrock 原生 reasoning 字段）下发，
+    /// 而非注入到 system 文本。仅当开启 thinking 时存在。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_model_request_fields: Option<serde_json::Value>,
 }
 #[cfg(test)]
 mod tests {

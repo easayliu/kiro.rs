@@ -369,6 +369,8 @@ pub async fn post_messages(
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        agent_mode: Some("vibe".to_string()),
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -864,6 +866,9 @@ async fn handle_non_stream_request(
     }
 
     let mut text_content = String::new();
+    // 新 Kiro runtime 端点的独立思考流（reasoningContentEvent）累计：文本 + 签名。
+    let mut reasoning_text = String::new();
+    let mut reasoning_signature: Option<String> = None;
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
@@ -884,6 +889,12 @@ async fn handle_non_stream_request(
                     match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
+                        }
+                        Event::ReasoningContent(reasoning) => {
+                            reasoning_text.push_str(&reasoning.text);
+                            if let Some(sig) = reasoning.signature {
+                                reasoning_signature = Some(sig);
+                            }
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
@@ -973,8 +984,25 @@ async fn handle_non_stream_request(
     // 构建响应内容
     let mut content: Vec<serde_json::Value> = Vec::new();
 
-    if thinking_enabled {
-        // 从完整文本中提取 thinking 块
+    if !reasoning_text.is_empty() {
+        // 新端点：思考经独立 reasoningContentEvent 下发，正文是纯文本，无需标签提取。
+        let mut block = json!({
+            "type": "thinking",
+            "thinking": reasoning_text
+        });
+        if let Some(sig) = &reasoning_signature {
+            block["signature"] = json!(sig);
+        }
+        content.push(block);
+
+        if !text_content.is_empty() {
+            content.push(json!({
+                "type": "text",
+                "text": text_content
+            }));
+        }
+    } else if thinking_enabled {
+        // 老端点：从完整文本中提取内联 `<thinking>` 块
         let (thinking, remaining_text) =
             super::stream::extract_thinking_from_complete_text(&text_content);
 
@@ -1197,6 +1225,8 @@ pub async fn post_messages_cc(
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        agent_mode: Some("vibe".to_string()),
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {

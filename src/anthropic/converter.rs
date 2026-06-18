@@ -281,6 +281,8 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// 顶层 `additionalModelRequestFields`（thinking 配置），未开启 thinking 时为 None
+    pub additional_model_request_fields: Option<serde_json::Value>,
 }
 
 /// 转换错误
@@ -536,6 +538,7 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
+        additional_model_request_fields: build_additional_model_request_fields(req),
     })
 }
 
@@ -1025,32 +1028,33 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
         .collect()
 }
 
-/// 生成thinking标签前缀
-fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
-    if let Some(t) = &req.thinking {
-        if t.thinking_type == "enabled" {
-            return Some(format!(
-                "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
-                t.budget_tokens
-            ));
-        } else if t.thinking_type == "adaptive" {
-            let effort = req
-                .output_config
-                .as_ref()
-                .map(|c| c.effort.as_str())
-                .unwrap_or("high");
-            return Some(format!(
-                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
-                effort
-            ));
-        }
+/// 构建顶层 `additionalModelRequestFields`，对齐真实 Kiro IDE 的 thinking 下发方式
+///
+/// 真实 Kiro IDE 通过 Bedrock 原生 reasoning 字段（请求体顶层
+/// `additionalModelRequestFields.thinking`）开启思考，而非把 `<thinking_mode>` 标签
+/// 注入 system 文本。仅当请求开启 thinking 时返回 `Some`。
+///
+/// - `adaptive`：抓包确认形如 `{"thinking":{"type":"adaptive","display":"summarized"},
+///   "output_config":{"effort":<effort>}}`。
+/// - `enabled`：采用 Bedrock 原生形状 `{"thinking":{"type":"enabled",
+///   "budget_tokens":<n>}}`（暂无对应抓包，待实测校正）。
+fn build_additional_model_request_fields(req: &MessagesRequest) -> Option<serde_json::Value> {
+    let t = req.thinking.as_ref()?;
+    // 新 Kiro runtime 端点实测：`thinking.type` 仅接受枚举 ["adaptive","disabled"]，
+    // 传 "enabled" 会被上游以 REQUEST_BODY_INVALID 400。故客户端的 enabled（标准 Anthropic
+    // 写法）与 adaptive 一律映射为 adaptive；budget_tokens 在该端点无对应字段，忽略。
+    if !t.is_enabled() {
+        return None;
     }
-    None
-}
-
-/// 检查内容是否已包含thinking标签
-fn has_thinking_tags(content: &str) -> bool {
-    content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
+    let effort = req
+        .output_config
+        .as_ref()
+        .map(|c| c.effort.as_str())
+        .unwrap_or("high");
+    Some(serde_json::json!({
+        "thinking": { "type": "adaptive", "display": "summarized" },
+        "output_config": { "effort": effort },
+    }))
 }
 
 /// 构建历史消息
@@ -1064,9 +1068,6 @@ fn has_thinking_tags(content: &str) -> bool {
 fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
-    // 生成thinking前缀（如果需要）
-    let thinking_prefix = generate_thinking_prefix(req);
-
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
         let system_content: String = system
@@ -1077,18 +1078,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 
         if !system_content.is_empty() {
             // 追加分块写入策略到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
-
-            // 注入thinking标签到系统消息最前面（如果需要且不存在）
-            let final_content = if let Some(ref prefix) = thinking_prefix {
-                if !has_thinking_tags(&system_content) {
-                    format!("{}\n{}", prefix, system_content)
-                } else {
-                    system_content
-                }
-            } else {
-                system_content
-            };
+            let final_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
 
             // 系统消息作为 user + assistant 配对
             let user_msg = HistoryUserMessage::new(final_content, model_id);
@@ -1097,13 +1087,6 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
             let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
             history.push(Message::Assistant(assistant_msg));
         }
-    } else if let Some(ref prefix) = thinking_prefix {
-        // 没有系统消息但有thinking配置，插入新的系统消息
-        let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
-        history.push(Message::User(user_msg));
-
-        let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-        history.push(Message::Assistant(assistant_msg));
     }
 
     // 2. 处理常规消息历史
@@ -1816,6 +1799,76 @@ mod tests {
         // thinking 后缀不应影响 haiku 模型映射
         let result = map_model("claude-haiku-4-5-20251001-thinking");
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
+    }
+
+    /// 构建一个最小可用的 MessagesRequest，仅关心 thinking / output_config 字段
+    fn req_with_thinking(
+        thinking: Option<super::super::types::Thinking>,
+        effort: Option<&str>,
+    ) -> MessagesRequest {
+        MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 64,
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking,
+            output_config: effort.map(|e| super::super::types::OutputConfig { effort: e.to_string() }),
+            metadata: None,
+            messages: vec![],
+        }
+    }
+
+    #[test]
+    fn test_additional_model_request_fields_adaptive() {
+        // adaptive：对齐真实 Kiro 抓包，display=summarized + output_config.effort
+        let req = req_with_thinking(
+            Some(super::super::types::Thinking { thinking_type: "adaptive".to_string(), budget_tokens: 20000 }),
+            Some("high"),
+        );
+        let fields = build_additional_model_request_fields(&req).unwrap();
+        assert_eq!(
+            fields,
+            serde_json::json!({
+                "thinking": { "type": "adaptive", "display": "summarized" },
+                "output_config": { "effort": "high" },
+            })
+        );
+    }
+
+    #[test]
+    fn test_additional_model_request_fields_adaptive_default_effort() {
+        // adaptive 无 output_config 时 effort 回退 high
+        let req = req_with_thinking(
+            Some(super::super::types::Thinking { thinking_type: "adaptive".to_string(), budget_tokens: 20000 }),
+            None,
+        );
+        let fields = build_additional_model_request_fields(&req).unwrap();
+        assert_eq!(fields["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_additional_model_request_fields_enabled_maps_to_adaptive() {
+        // 上游只认 ["adaptive","disabled"]：客户端 enabled 必须映射成 adaptive
+        let req = req_with_thinking(
+            Some(super::super::types::Thinking { thinking_type: "enabled".to_string(), budget_tokens: 12000 }),
+            None,
+        );
+        let fields = build_additional_model_request_fields(&req).unwrap();
+        assert_eq!(
+            fields,
+            serde_json::json!({
+                "thinking": { "type": "adaptive", "display": "summarized" },
+                "output_config": { "effort": "high" },
+            })
+        );
+    }
+
+    #[test]
+    fn test_additional_model_request_fields_none_when_no_thinking() {
+        let req = req_with_thinking(None, None);
+        assert!(build_additional_model_request_fields(&req).is_none());
     }
 
     #[test]

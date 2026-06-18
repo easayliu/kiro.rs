@@ -379,6 +379,32 @@ impl Config {
         }
     }
 
+    /// 生成 Kiro runtime（`runtime.{region}.kiro.dev`）端点的 user-agent
+    ///
+    /// 对齐新版 Kiro IDE 抓包：API 段从 `codewhispererruntime` 变为 `kiroruntime`，
+    /// 与该端点的 AWS JSON 1.0 RPC 协议（`x-amz-target`）配套。KiroIDE-{version} 段沿用
+    /// `kiro_version` 配置（抓包样本为 1.0.0，可经 config 校正）。
+    pub fn kiro_runtime_user_agent(&self, machine_id: &str, mode: ClientMode) -> String {
+        match mode {
+            ClientMode::KiroCli => format!(
+                "aws-sdk-rust/1.3.14 ua/2.1 api/kiroruntime/0.1.14474 os/linux lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
+                self.kiro_cli_version
+            ),
+            ClientMode::KiroIde => format!(
+                "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/kiroruntime#1.0.0 m/N KiroIDE-{}-{}",
+                self.system_version, self.node_version, self.kiro_version, machine_id
+            ),
+        }
+    }
+
+    /// 生成 Kiro runtime（`runtime.{region}.kiro.dev`）端点的 x-amz-user-agent
+    pub fn kiro_runtime_x_amz_user_agent(&self, machine_id: &str, mode: ClientMode) -> String {
+        match mode {
+            ClientMode::KiroCli => "aws-sdk-rust/1.3.14 ua/2.1 api/kiroruntime/0.1.14474 os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI".to_string(),
+            ClientMode::KiroIde => format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", self.kiro_version, machine_id),
+        }
+    }
+
     /// 生成 token 刷新的 user-agent
     pub fn refresh_user_agent(&self, machine_id: &str, mode: ClientMode) -> String {
         match mode {

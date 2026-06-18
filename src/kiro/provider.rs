@@ -124,11 +124,23 @@ impl KiroProvider {
     }
 
     /// 获取凭据级 API 基础 URL
+    /// 判断 host 是否为新版 Kiro runtime 端点（`runtime.{region}.kiro.dev`）。
+    ///
+    /// 命中时 chat 走 AWS JSON 1.0 RPC 协议（根路径 `/` + `x-amz-target` +
+    /// `application/x-amz-json-1.0` + `kiroruntime` UA）；否则保持老 CodeWhisperer
+    /// REST 协议（`/generateAssistantResponse` + `application/json`）。
+    fn is_kiro_runtime_host(host: &str) -> bool {
+        host.contains("kiro.dev")
+    }
+
     fn base_url_for(&self, credentials: &KiroCredentials) -> String {
-        format!(
-            "https://{}/generateAssistantResponse",
-            self.base_domain_for(credentials)
-        )
+        let domain = self.base_domain_for(credentials);
+        if Self::is_kiro_runtime_host(&domain) {
+            // 新 runtime 端点为 RPC 风格，方法由 x-amz-target 头指定，路径为根 `/`
+            format!("https://{}/", domain)
+        } else {
+            format!("https://{}/generateAssistantResponse", domain)
+        }
     }
 
     /// 获取凭据级 MCP API URL
@@ -627,8 +639,19 @@ impl KiroProvider {
             let mode = ctx.credentials.effective_client_mode(config);
 
             let url = self.base_url_for(&ctx.credentials);
-            let x_amz_user_agent = config.streaming_x_amz_user_agent(&machine_id, mode);
-            let user_agent = config.streaming_user_agent(&machine_id, mode);
+            let domain = self.base_domain_for(&ctx.credentials);
+            let is_runtime = Self::is_kiro_runtime_host(&domain);
+            let (x_amz_user_agent, user_agent) = if is_runtime {
+                (
+                    config.kiro_runtime_x_amz_user_agent(&machine_id, mode),
+                    config.kiro_runtime_user_agent(&machine_id, mode),
+                )
+            } else {
+                (
+                    config.streaming_x_amz_user_agent(&machine_id, mode),
+                    config.streaming_user_agent(&machine_id, mode),
+                )
+            };
 
             // 按实际凭据重写 body：profileArn / origin / envState 均按凭据级 mode 决定。
             // profileArn 由 effective_profile_arn 三级解析（自带 → 探测写回 → auth_method 兜底，
@@ -640,19 +663,35 @@ impl KiroProvider {
             );
 
             // 发送请求；clone 一份留给 400 等请求侧错误时回溯实际发往上游的 payload
+            let content_type = if is_runtime {
+                "application/x-amz-json-1.0"
+            } else {
+                "application/json"
+            };
+
             let mut request = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
                 .body(outbound_body.clone())
-                .header("content-type", "application/json")
-                .header("x-amzn-kiro-agent-mode", "vibe")
+                .header("content-type", content_type)
                 .header("x-amz-user-agent", &x_amz_user_agent)
                 .header("user-agent", &user_agent)
-                .header("host", &self.base_domain_for(&ctx.credentials))
+                .header("host", &domain)
                 .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
                 .header("amz-sdk-request", "attempt=1; max=3")
                 .header("Authorization", format!("Bearer {}", ctx.token))
                 .header("Connection", "close");
+
+            if is_runtime {
+                // 新 runtime 端点：RPC 方法名走 x-amz-target，agentMode 改由 body 顶层携带
+                // （故不再发 x-amzn-kiro-agent-mode 头），并显式声明 telemetry opt-out。
+                request = request
+                    .header("x-amz-target", "KiroRuntimeService.GenerateAssistantResponse")
+                    .header("x-amzn-codewhisperer-optout", "true");
+            } else {
+                // 老 CodeWhisperer REST 端点：agentMode 走请求头。
+                request = request.header("x-amzn-kiro-agent-mode", "vibe");
+            }
 
             if ctx.credentials.is_api_key_credential() {
                 request = request.header("tokentype", "API_KEY");
@@ -1129,6 +1168,15 @@ mod tests {
     fn test_is_invalid_model_id_detects_reason() {
         let body = r#"{"message":"Invalid model. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}"#;
         assert!(KiroProvider::is_invalid_model_id(body));
+    }
+
+    #[test]
+    fn test_is_kiro_runtime_host() {
+        // 新 runtime 端点命中，老 CodeWhisperer 端点不命中
+        assert!(KiroProvider::is_kiro_runtime_host("runtime.us-east-1.kiro.dev"));
+        assert!(KiroProvider::is_kiro_runtime_host("runtime.eu-west-1.kiro.dev"));
+        assert!(!KiroProvider::is_kiro_runtime_host("q.us-east-1.amazonaws.com"));
+        assert!(!KiroProvider::is_kiro_runtime_host("codewhisperer.us-east-1.amazonaws.com"));
     }
 
     #[test]
