@@ -25,7 +25,7 @@ use uuid::Uuid;
 use std::sync::Arc;
 
 use super::cache_tracker::{CacheProfile, CacheScope, CacheTracker};
-use super::converter::{ConversionError, KIRO_MAX_REQUEST_BYTES, convert_request};
+use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, CacheUsage, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse};
@@ -387,26 +387,6 @@ pub async fn post_messages(
                 .into_response();
         }
     };
-
-    if request_body.len() > KIRO_MAX_REQUEST_BYTES {
-        tracing::warn!(
-            bytes = request_body.len(),
-            limit = KIRO_MAX_REQUEST_BYTES,
-            "请求体超过上游 Kiro 限额，提前返回 413（绝大多数由历史图片/超长贴文堆积引起）"
-        );
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(ErrorResponse::new(
-                "request_too_large",
-                format!(
-                    "请求体 {} 字节超过上游限额 {} 字节；请减少图片数量、压缩历史或截断超长文本",
-                    request_body.len(),
-                    KIRO_MAX_REQUEST_BYTES
-                ),
-            )),
-        )
-            .into_response();
-    }
 
     tracing::debug!("Kiro request body: {}", request_body);
 
@@ -1243,26 +1223,6 @@ pub async fn post_messages_cc(
                 .into_response();
         }
     };
-
-    if request_body.len() > KIRO_MAX_REQUEST_BYTES {
-        tracing::warn!(
-            bytes = request_body.len(),
-            limit = KIRO_MAX_REQUEST_BYTES,
-            "请求体超过上游 Kiro 限额，提前返回 413（绝大多数由历史图片/超长贴文堆积引起）"
-        );
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(ErrorResponse::new(
-                "request_too_large",
-                format!(
-                    "请求体 {} 字节超过上游限额 {} 字节；请减少图片数量、压缩历史或截断超长文本",
-                    request_body.len(),
-                    KIRO_MAX_REQUEST_BYTES
-                ),
-            )),
-        )
-            .into_response();
-    }
 
     tracing::debug!("Kiro request body: {}", request_body);
 

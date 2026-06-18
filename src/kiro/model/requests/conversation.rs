@@ -102,6 +102,9 @@ pub struct UserInputMessage {
     /// 图片列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<KiroImage>,
+    /// 文档列表（PDF 等，对齐 Kiro IDE `userInputMessage.documents`）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<KiroDocument>,
     /// 消息来源（通常为 "AI_EDITOR"）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
@@ -115,6 +118,7 @@ impl UserInputMessage {
             content: content.into(),
             model_id: model_id.into(),
             images: Vec::new(),
+            documents: Vec::new(),
             origin: None,
         }
     }
@@ -128,6 +132,12 @@ impl UserInputMessage {
     /// 添加图片
     pub fn with_images(mut self, images: Vec<KiroImage>) -> Self {
         self.images = images;
+        self
+    }
+
+    /// 添加文档（PDF 等）
+    pub fn with_documents(mut self, documents: Vec<KiroDocument>) -> Self {
+        self.documents = documents;
         self
     }
 
@@ -217,6 +227,35 @@ impl KiroImage {
 pub struct KiroImageSource {
     /// base64 编码的图片数据
     pub bytes: String,
+}
+
+/// Kiro 文档（PDF 等）
+///
+/// 对齐 Kiro IDE `userInputMessage.documents[]`：`{name, format, source:{bytes}}`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroDocument {
+    /// 文档名（不含扩展名）
+    pub name: String,
+    /// 文档格式（"pdf"、"csv"、"docx" 等，Bedrock document 枚举）
+    pub format: String,
+    /// 文档数据源（base64）
+    pub source: KiroImageSource,
+}
+
+impl KiroDocument {
+    /// 从 base64 数据创建文档
+    pub fn from_base64(
+        name: impl Into<String>,
+        format: impl Into<String>,
+        data: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            format: format.into(),
+            source: KiroImageSource { bytes: data.into() },
+        }
+    }
 }
 
 /// 历史消息

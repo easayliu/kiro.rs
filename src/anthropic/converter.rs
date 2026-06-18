@@ -12,7 +12,8 @@ use uuid::Uuid;
 
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, EnvState, HistoryAssistantMessage,
-    HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
+    HistoryUserMessage, KiroDocument, KiroImage, Message, UserInputMessage, UserInputMessageContext,
+    UserMessage,
 };
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
@@ -401,19 +402,10 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
         return Err(ConversionError::EmptyMessages);
     }
 
-    // 2.5. 预处理 prefill：如果末尾是 assistant，静默丢弃并截断到最后一条 user
-    // Claude 4.x 已弃用 assistant prefill，Kiro API 也不支持
-    let messages: &[_] = if req.messages.last().is_some_and(|m| m.role != "user") {
-        tracing::info!("检测到末尾 assistant 消息（prefill），静默丢弃");
-        let last_user_idx = req
-            .messages
-            .iter()
-            .rposition(|m| m.role == "user")
-            .ok_or(ConversionError::EmptyMessages)?;
-        &req.messages[..=last_user_idx]
-    } else {
-        &req.messages
-    };
+    // 2.5. prefill：末尾是 assistant 时不再静默丢弃，直接透传。
+    // Kiro 无原生 prefill（currentMessage 必须是 userInputMessage），故末尾 assistant 的
+    // 内容会作为 currentMessage 发出；这里只负责不丢弃，具体上游表现按实测观察。
+    let messages: &[_] = &req.messages;
 
     // 3. 生成会话 ID 和代理 ID
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
@@ -428,9 +420,10 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
 
-    // 5. 处理最后一条消息作为 current_message（经过 prefill 预处理，末尾必为 user）
+    // 5. 处理最后一条消息作为 current_message（末尾可能是 user 或 assistant(prefill 透传)）
     let last_message = messages.last().unwrap();
-    let (text_content, images, tool_results) = process_message_content(&last_message.content)?;
+    let (text_content, images, documents, tool_results) =
+        process_message_content(&last_message.content)?;
 
     // 5.5. 当前消息图片维度预校验：上游对单图长边有硬上限（8000），超过会以
     // "Improperly formed request" 拒绝。提前拦截给出可读错误。
@@ -518,6 +511,10 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
         user_input = user_input.with_images(images);
     }
 
+    if !documents.is_empty() {
+        user_input = user_input.with_documents(documents);
+    }
+
     let current_message = CurrentMessage::new(user_input);
 
     // 13. 构建 ConversationState
@@ -551,9 +548,10 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
 /// 处理消息内容，提取文本、图片和工具结果
 fn process_message_content(
     content: &serde_json::Value,
-) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+) -> Result<(String, Vec<KiroImage>, Vec<KiroDocument>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
+    let mut documents = Vec::new();
     let mut tool_results = Vec::new();
 
     match content {
@@ -573,6 +571,27 @@ fn process_message_content(
                             if let Some(source) = block.source {
                                 if let Some(format) = get_image_format(&source.media_type) {
                                     images.push(KiroImage::from_base64(format, source.data));
+                                }
+                            }
+                        }
+                        "document" => {
+                            // 对齐 Kiro IDE：PDF 等作为 userInputMessage.documents 透传。
+                            // 仅支持 base64 源；format 由 media_type 推导，未知类型跳过。
+                            if let Some(source) = block.source {
+                                if source.source_type == "base64" {
+                                    if let Some(format) = get_document_format(&source.media_type) {
+                                        let name = block
+                                            .title
+                                            .as_deref()
+                                            .map(sanitize_document_name)
+                                            .filter(|s| !s.is_empty())
+                                            .unwrap_or_else(|| "document".to_string());
+                                        documents.push(KiroDocument::from_base64(
+                                            name,
+                                            format,
+                                            source.data,
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -604,7 +623,31 @@ fn process_message_content(
         _ => {}
     }
 
-    Ok((text_parts.join("\n"), images, tool_results))
+    Ok((text_parts.join("\n"), images, documents, tool_results))
+}
+
+/// 从 media_type 推导 Kiro 文档格式（Bedrock document 枚举：pdf/csv/doc/docx/xls/xlsx/html/txt/md）
+fn get_document_format(media_type: &str) -> Option<String> {
+    let fmt = match media_type {
+        "application/pdf" => "pdf",
+        "text/csv" => "csv",
+        "application/msword" => "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/vnd.ms-excel" => "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "text/html" => "html",
+        "text/markdown" => "md",
+        "text/plain" => "txt",
+        _ => return None,
+    };
+    Some(fmt.to_string())
+}
+
+/// 规整文档名：去掉扩展名与路径，Kiro `documents[].name` 不含扩展名。
+fn sanitize_document_name(title: &str) -> String {
+    let base = title.rsplit(['/', '\\']).next().unwrap_or(title);
+    let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
+    stem.trim().to_string()
 }
 
 /// 从 media_type 获取图片格式
@@ -842,9 +885,6 @@ const TOOL_NAME_MAX_LEN: usize = 63;
 /// Kiro API tool_use_id 最大长度限制（Bedrock 标准约 64，超长会触发 400 Improperly formed request）
 const TOOL_USE_ID_MAX_LEN: usize = 64;
 
-/// Kiro 上游请求体上限（AWS CodeWhisperer Smithy 层约 4MB，超过会以 "Improperly
-/// formed request" 形式 400）。这里留 256KB 缓冲给请求外壳/profileArn 等元数据。
-pub const KIRO_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024 - 256 * 1024;
 
 /// 单图长边像素上限（AWS Bedrock Claude 文档绝对上限 8000×8000；超过会 400
 /// "Improperly formed request"）。Anthropic 官方推荐长边 ≤ 1568 像素以达到最佳效果，
@@ -1081,9 +1121,8 @@ fn build_additional_model_request_fields(req: &MessagesRequest) -> Option<serde_
 ///
 /// # Arguments
 /// * `req` - 原始请求，用于读取 `system`、`thinking` 等配置字段
-/// * `messages` - 经过 prefill 预处理的消息切片，末尾必定是 user 消息。
-///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
-///   调用方应始终使用此参数而非 `req.messages`。
+/// * `messages` - 消息切片；最后一条作为 currentMessage（可能是 user，也可能是
+///   末尾 assistant(prefill 透传)），其余进入历史。
 /// * `model_id` - 已映射的 Kiro 模型 ID
 fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
@@ -1110,8 +1149,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     }
 
     // 2. 处理常规消息历史
-    // 最后一条消息作为 currentMessage，不加入历史
-    // 经过 prefill 预处理后，messages 末尾必定是 user，故直接截掉最后一条即可
+    // 最后一条消息作为 currentMessage，不加入历史（末尾可能是 user 或 assistant）
     let history_end_index = messages.len().saturating_sub(1);
 
     // 收集并配对消息
@@ -1172,17 +1210,25 @@ fn merge_user_messages(
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut omitted_images = 0usize;
+    let mut omitted_documents = 0usize;
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
+        let (text, images, documents, tool_results) = process_message_content(&msg.content)?;
         if !text.is_empty() {
             content_parts.push(text);
         }
         omitted_images += images.len();
+        omitted_documents += documents.len();
         all_tool_results.extend(tool_results);
     }
 
+    if omitted_documents > 0 {
+        content_parts.insert(
+            0,
+            format!("[{} document(s) omitted from history]", omitted_documents),
+        );
+    }
     if omitted_images > 0 {
         content_parts.insert(
             0,
@@ -1928,6 +1974,47 @@ mod tests {
     }
 
     #[test]
+    fn test_process_message_content_document_pdf() {
+        let content = serde_json::json!([
+            {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0x"},"title":"sub/report.pdf"},
+            {"type":"text","text":"读它"}
+        ]);
+        let (text, images, docs, tools) = process_message_content(&content).unwrap();
+        assert_eq!(text, "读它");
+        assert!(images.is_empty());
+        assert!(tools.is_empty());
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].name, "report"); // 去路径与扩展名
+        assert_eq!(docs[0].format, "pdf");
+        assert_eq!(docs[0].source.bytes, "JVBERi0x");
+    }
+
+    #[test]
+    fn test_process_message_content_document_defaults_and_skips() {
+        // 无 title → 默认名 "document"
+        let pdf = serde_json::json!([
+            {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"AAAA"}}
+        ]);
+        let (_t, _i, docs, _r) = process_message_content(&pdf).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].name, "document");
+
+        // 未知 media_type → 跳过
+        let zip = serde_json::json!([
+            {"type":"document","source":{"type":"base64","media_type":"application/zip","data":"AAAA"}}
+        ]);
+        let (_t, _i, docs, _r) = process_message_content(&zip).unwrap();
+        assert!(docs.is_empty());
+
+        // 非 base64 源 → 跳过
+        let urlsrc = serde_json::json!([
+            {"type":"document","source":{"type":"url","media_type":"application/pdf","data":"http://x/y.pdf"}}
+        ]);
+        let (_t, _i, docs, _r) = process_message_content(&urlsrc).unwrap();
+        assert!(docs.is_empty());
+    }
+
+    #[test]
     fn test_determine_chat_trigger_type() {
         // 无工具时返回 MANUAL
         let req = MessagesRequest {
@@ -2389,13 +2476,6 @@ mod tests {
     fn test_kiro_max_image_side_within_aws_documented_limit() {
         assert!(KIRO_MAX_IMAGE_SIDE <= 8000);
         assert!(KIRO_MAX_IMAGE_SIDE >= 1568);
-    }
-
-    #[test]
-    fn test_kiro_max_request_bytes_constant_is_below_aws_limit() {
-        // sanity check: 上限留了缓冲，且明显小于 4MB
-        assert!(KIRO_MAX_REQUEST_BYTES < 4 * 1024 * 1024);
-        assert!(KIRO_MAX_REQUEST_BYTES >= 3 * 1024 * 1024);
     }
 
     #[test]

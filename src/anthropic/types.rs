@@ -268,6 +268,9 @@ pub struct ContentBlock {
     pub is_error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<ImageSource>,
+    /// document 块的标题/文件名（Anthropic 可选字段）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// 图片数据源
