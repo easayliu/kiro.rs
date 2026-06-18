@@ -1038,12 +1038,32 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
 ///   "output_config":{"effort":<effort>}}`。
 /// - `enabled`：采用 Bedrock 原生形状 `{"thinking":{"type":"enabled",
 ///   "budget_tokens":<n>}}`（暂无对应抓包，待实测校正）。
+/// 该（已归一化的）模型是否支持 `additionalModelRequestFields.thinking`
+///
+/// 新 Kiro runtime 端点实测：仅 4.6 及以上世代支持（opus 4.6/4.7/4.8、sonnet 4.6）；
+/// 对 opus-4.5 / sonnet-4.5 下发该字段会以 `additionalModelRequestFields is not supported
+/// for this model` 400；haiku 不在新端点提供。不支持的模型直接不发该字段（thinking 静默
+/// 降级为普通响应），避免带 thinking 的请求整体失败。
+fn model_supports_thinking(model: &str) -> bool {
+    matches!(
+        map_model(model).as_deref(),
+        Some("claude-opus-4.6")
+            | Some("claude-opus-4.7")
+            | Some("claude-opus-4.8")
+            | Some("claude-sonnet-4.6")
+    )
+}
+
 fn build_additional_model_request_fields(req: &MessagesRequest) -> Option<serde_json::Value> {
     let t = req.thinking.as_ref()?;
     // 新 Kiro runtime 端点实测：`thinking.type` 仅接受枚举 ["adaptive","disabled"]，
     // 传 "enabled" 会被上游以 REQUEST_BODY_INVALID 400。故客户端的 enabled（标准 Anthropic
     // 写法）与 adaptive 一律映射为 adaptive；budget_tokens 在该端点无对应字段，忽略。
     if !t.is_enabled() {
+        return None;
+    }
+    // 模型不支持 thinking 时不下发该字段（否则上游 400）。
+    if !model_supports_thinking(&req.model) {
         return None;
     }
     let effort = req
@@ -1869,6 +1889,42 @@ mod tests {
     fn test_additional_model_request_fields_none_when_no_thinking() {
         let req = req_with_thinking(None, None);
         assert!(build_additional_model_request_fields(&req).is_none());
+    }
+
+    #[test]
+    fn test_additional_model_request_fields_gated_by_model() {
+        let thinking =
+            || Some(super::super::types::Thinking { thinking_type: "adaptive".to_string(), budget_tokens: 0 });
+
+        // 支持 thinking 的世代：发字段
+        for m in [
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-fable-5", // fable → opus-4.8
+        ] {
+            let mut req = req_with_thinking(thinking(), Some("high"));
+            req.model = m.to_string();
+            assert!(
+                build_additional_model_request_fields(&req).is_some(),
+                "{m} 应下发 additionalModelRequestFields"
+            );
+        }
+
+        // 不支持的模型：不发字段（避免上游 400）
+        for m in [
+            "claude-opus-4-5-20251101",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-4-5-20251001",
+        ] {
+            let mut req = req_with_thinking(thinking(), Some("high"));
+            req.model = m.to_string();
+            assert!(
+                build_additional_model_request_fields(&req).is_none(),
+                "{m} 不应下发 additionalModelRequestFields"
+            );
+        }
     }
 
     #[test]
