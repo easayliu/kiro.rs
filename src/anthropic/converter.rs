@@ -496,12 +496,9 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
 
     // 12. 构建当前消息
     // 保留文本内容，即使有工具结果也不丢弃用户文本
-    // kiro API 不接受空 content（Smithy @length(min:1)），仅有 tool_results 时用占位符兜底
-    let content = if text_content.is_empty() && has_tool_results {
-        " ".to_string()
-    } else {
-        text_content
-    };
+    // 空 content 实测 2026-06-18 新端点已接受（旧 CodeWhisperer Smithy @length(min:1) 已解除），
+    // 不再用占位符兜底。
+    let content = text_content;
 
     let mut user_input = UserInputMessage::new(content, &model_id)
         .with_context(context)
@@ -880,6 +877,10 @@ fn align_history_tool_pairing(history: &mut [Message]) {
 }
 
 /// Kiro API 工具名称最大长度限制
+///
+/// 实测新 Kiro runtime 端点（2026-06-18）：工具名 ≤64 字符通过，>64 即
+/// 400 `Invalid tool use format / REQUEST_BODY_INVALID`（Bedrock toolSpec.name 约束，
+/// 未因换端点放开）。这里取 63 留 1 字符余量。
 const TOOL_NAME_MAX_LEN: usize = 63;
 
 /// Kiro API tool_use_id 最大长度限制（Bedrock 标准约 64，超长会触发 400 Improperly formed request）
@@ -1044,7 +1045,7 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
                 description.push_str(suffix);
             }
 
-            // kiro API 不接受空描述（Smithy @length(min:1)），填充工具名作为占位符
+            // kiro API 不接受空描述（Smithy @length(min:1)，实测 2026-06-18 仍 400），填充工具名作为占位符
             let description = if description.trim().is_empty() {
                 t.name.clone()
             } else {
@@ -1236,14 +1237,8 @@ fn merge_user_messages(
         );
     }
 
+    // 空 content 实测新端点已接受（Smithy @length(min:1) 已解除），不再用占位符兜底。
     let content = content_parts.join("\n");
-    // 保留文本内容，即使有工具结果也不丢弃用户文本
-    // kiro API 不接受空 content（Smithy @length(min:1)），仅有 tool_results 时用占位符兜底
-    let content = if content.is_empty() && !all_tool_results.is_empty() {
-        " ".to_string()
-    } else {
-        content
-    };
     let user_msg = UserMessage::new(&content, model_id);
 
     let user_msg = if !all_tool_results.is_empty() {
