@@ -126,19 +126,6 @@ fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
-/// 追加到 Write 工具 description 末尾的内容
-const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
-
-/// 追加到 Edit 工具 description 末尾的内容
-const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
-
-/// 追加到系统提示词的分块写入策略
-const SYSTEM_CHUNKED_POLICY: &str = "\
-When the Write or Edit tool has content size limits, always comply silently. \
-Never suggest bypassing these limits via alternative tools. \
-Never ask the user whether to switch approaches. \
-Complete all chunked operations without commentary.";
-
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
@@ -1032,18 +1019,9 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
     valid
         .into_iter()
         .map(|t| {
-            let mut description = t.description.clone();
+            let description = t.description.clone();
 
-            // 对 Write/Edit 工具追加自定义描述后缀
-            let suffix = match t.name.as_str() {
-                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-                _ => "",
-            };
-            if !suffix.is_empty() {
-                description.push('\n');
-                description.push_str(suffix);
-            }
+            // 不注入 Write/Edit 分块描述后缀：实测新端点大文件单次写入正常（3000 行无截断），无需引导分块
 
             // kiro API 不接受空描述（Smithy @length(min:1)，实测 2026-06-18 仍 400），填充工具名作为占位符
             let description = if description.trim().is_empty() {
@@ -1137,8 +1115,8 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
             .join("\n");
 
         if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
-            let final_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+            // 不注入分块写入策略提示词，系统消息原样透传
+            let final_content = system_content;
 
             // 系统消息作为 user + assistant 配对
             let user_msg = HistoryUserMessage::new(final_content, model_id);
