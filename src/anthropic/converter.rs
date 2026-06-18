@@ -1079,17 +1079,30 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     // 最后一条消息作为 currentMessage，不加入历史（末尾可能是 user 或 assistant）
     let history_end_index = messages.len().saturating_sub(1);
 
-    // 按序原样输出历史：实测新端点不要求 user/assistant 交替，故不再合并连续同角色、
-    // 不再为末尾孤立 user 补 "OK" assistant。tool_use/tool_result 配对由前面的
-    // align/validate 步骤保证。
-    for i in 0..history_end_index {
-        let msg = &messages[i];
-        if msg.role == "user" {
-            let u = merge_user_messages(&[msg], model_id)?;
-            history.push(Message::User(u));
-        } else if msg.role == "assistant" {
-            let a = convert_assistant_message(msg, tool_name_map)?;
-            history.push(Message::Assistant(a));
+    // 新端点不要求 user/assistant 严格交替，连续 assistant 不必合并、末尾孤立 user 不必补
+    // "OK" 应答。但**连续 user 必须合并**：并行工具调用（assistant 一轮多个 tool_use）的多个
+    // tool_result 常被客户端拆成多条连续 user 消息各带一个。若不合并，align_history_tool_pairing
+    // 只能对紧邻的单条 user 配对，会把"结果在后续 user 里"的 tool_use 误判为孤立并删除，留下
+    // 孤儿 tool_result；Bedrock 侧又会把相邻 user 合并成一轮 → toolResult 数超过 toolUse 数 →
+    // 400 TOOL_USE_RESULT_MISMATCH。故在此提前合并连续 user，使 align 能看到完整的 result 集合。
+    let mut i = 0;
+    while i < history_end_index {
+        match messages[i].role.as_str() {
+            "user" => {
+                let start = i;
+                while i < history_end_index && messages[i].role == "user" {
+                    i += 1;
+                }
+                let group: Vec<&super::types::Message> = messages[start..i].iter().collect();
+                let u = merge_user_messages(&group, model_id)?;
+                history.push(Message::User(u));
+            }
+            "assistant" => {
+                let a = convert_assistant_message(&messages[i], tool_name_map)?;
+                history.push(Message::Assistant(a));
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
 
@@ -1532,6 +1545,106 @@ mod pairing_tests {
         // 逐轮校验 history：每个 user 轮的 result 数 <= 紧邻上一轮 assistant 的 use 数
         for i in 1..cs.history.len() {
             if let Message::User(u) = &cs.history[i] {
+                let res = u.user_input_message.user_input_message_context.tool_results.len();
+                let prev_uses = match &cs.history[i - 1] {
+                    Message::Assistant(a) => a
+                        .assistant_response_message
+                        .tool_uses
+                        .as_ref()
+                        .map(|t| t.len())
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                assert!(res <= prev_uses, "history[{}] result 数 {} > 上一轮 use 数 {}", i, res, prev_uses);
+            }
+        }
+    }
+
+    #[test]
+    fn test_convert_request_parallel_results_split_in_history() {
+        // 复现 kiro-400.raw.log：assistant 一轮并行调用两个工具（call_a + call_b），
+        // 客户端把两个 tool_result 拆成**两条连续 user 消息**各带一个，且都落在 history
+        // （后面还有更多轮，所以不是 currentMessage）。
+        // 修复前：build_history 逐条输出 → align 只对紧邻的第一条 user 配对，把 call_b 的
+        // use 误删 → 第二条 user 的 call_b result 成孤儿 → Bedrock 合并 user 轮后
+        // toolResult 数 > toolUse 数 → 400 TOOL_USE_RESULT_MISMATCH。
+        // 修复后：连续 user 先合并，align 看到 {call_a, call_b} 完整集合 → 两个 use 都保留。
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 64,
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("do two things"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "call_a", "name": "Read", "input": {}},
+                        {"type": "tool_use", "id": "call_b", "name": "Read", "input": {}}
+                    ]),
+                },
+                // 并行结果被拆成两条连续 user 消息
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "call_a", "content": "result a"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "call_b", "content": "result b"}
+                    ]),
+                },
+                // 后续还有一轮，确保上面两条 user 都进 history 而非 currentMessage
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([{"type": "text", "text": "done"}]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("thanks"),
+                },
+            ],
+        };
+
+        let result = convert_request(&req, "AI_EDITOR", false).unwrap();
+        let cs = &result.conversation_state;
+
+        // 两个并行 tool_use 都应保留
+        let history_use_ids: std::collections::HashSet<String> = cs
+            .history
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant(a) => a.assistant_response_message.tool_uses.as_ref(),
+                _ => None,
+            })
+            .flatten()
+            .map(|t| t.tool_use_id.clone())
+            .collect();
+        assert!(history_use_ids.contains(&map_tool_use_id("call_a")), "call_a use 应保留");
+        assert!(history_use_ids.contains(&map_tool_use_id("call_b")), "call_b use 应保留");
+
+        // history 不应有孤儿 result，且每个 user 轮 result 数 <= 上一轮 assistant use 数
+        for i in 1..cs.history.len() {
+            if let Message::User(u) = &cs.history[i] {
+                for r in &u.user_input_message.user_input_message_context.tool_results {
+                    assert!(
+                        history_use_ids.contains(&r.tool_use_id),
+                        "history result {} 无对应 use（孤儿，会触发 400）",
+                        r.tool_use_id
+                    );
+                }
                 let res = u.user_input_message.user_input_message_context.tool_results.len();
                 let prev_uses = match &cs.history[i - 1] {
                     Message::Assistant(a) => a

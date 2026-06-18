@@ -116,14 +116,14 @@ fn default_effort() -> String {
 }
 
 /// Claude Code 请求中的 metadata
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Metadata {
     /// 用户 ID，格式如: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
     pub user_id: Option<String>,
 }
 
 /// Messages 请求体
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct MessagesRequest {
     pub model: String,

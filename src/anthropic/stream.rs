@@ -672,6 +672,14 @@ pub struct StreamContext {
     /// 一旦为 true，说明思考经独立事件下发，`assistantResponseEvent` 的正文即纯文本，
     /// 无需再走 `<thinking>` 文本标签扫描（那是老 CodeWhisperer 端点的内联格式）。
     reasoning_seen: bool,
+    /// 是否抓取流式响应内容用于 debug dump（构造时按日志级别决定，info 下为 false 零开销）。
+    debug_capture: bool,
+    /// debug 抓取：累积的助手正文。
+    dbg_text: String,
+    /// debug 抓取：累积的思考内容。
+    dbg_thinking: String,
+    /// debug 抓取：累积的工具调用 (id, name, 部分 input JSON 拼接)。
+    dbg_tools: Vec<(String, String, String)>,
 }
 
 impl StreamContext {
@@ -706,6 +714,10 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
             reasoning_seen: false,
+            debug_capture: tracing::enabled!(tracing::Level::DEBUG),
+            dbg_text: String::new(),
+            dbg_thinking: String::new(),
+            dbg_tools: Vec::new(),
         }
     }
 
@@ -807,6 +819,33 @@ impl StreamContext {
 
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
+        // debug 抓取：累积响应内容，供流末尾 dump 一个拼好的最终响应（info 下零开销）。
+        if self.debug_capture {
+            match event {
+                Event::AssistantResponse(resp) => self.dbg_text.push_str(&resp.content),
+                Event::ReasoningContent(reasoning) => self.dbg_thinking.push_str(&reasoning.text),
+                Event::ToolUse(tu) => {
+                    // 工具 input 可能分多帧到达：同一 id（或后续帧 id 为空）则拼接，否则新开一条。
+                    let same = self
+                        .dbg_tools
+                        .last()
+                        .map(|(id, _, _)| id == &tu.tool_use_id || tu.tool_use_id.is_empty())
+                        .unwrap_or(false);
+                    if same {
+                        if let Some((_, _, input)) = self.dbg_tools.last_mut() {
+                            input.push_str(&tu.input);
+                        }
+                    } else {
+                        self.dbg_tools.push((
+                            tu.tool_use_id.clone(),
+                            tu.name.clone(),
+                            tu.input.clone(),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
@@ -857,6 +896,44 @@ impl StreamContext {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// debug 级 dump 流式响应体：把累积的思考/正文/工具调用拼成一个最终 Anthropic 消息打印，
+    /// 与非流式的 "Anthropic response body" 日志格式对齐。仅在 debug_capture 时有内容。
+    pub fn debug_dump_response_body(&self) {
+        if !self.debug_capture {
+            return;
+        }
+        let mut content = Vec::new();
+        if !self.dbg_thinking.is_empty() {
+            content.push(serde_json::json!({"type": "thinking", "thinking": self.dbg_thinking}));
+        }
+        if !self.dbg_text.is_empty() {
+            content.push(serde_json::json!({"type": "text", "text": self.dbg_text}));
+        }
+        for (id, name, input) in &self.dbg_tools {
+            // 还原工具原名（短名映射）+ 补客户端 toolu_ 前缀，与实际下发一致。
+            let original_name = self.tool_name_map.get(name).cloned().unwrap_or_else(|| name.clone());
+            let client_id = super::converter::normalize_tool_use_id_for_client(id);
+            // input 是拼接的部分 JSON 字符串，能解析成 JSON 就解析，否则原样作字符串。
+            let parsed_input: serde_json::Value =
+                serde_json::from_str(input).unwrap_or_else(|_| serde_json::Value::String(input.clone()));
+            content.push(serde_json::json!({
+                "type": "tool_use",
+                "id": client_id,
+                "name": original_name,
+                "input": parsed_input,
+            }));
+        }
+        let body = serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": content,
+            "model": self.model,
+            "stop_reason": self.state_manager.get_stop_reason(),
+            "output_tokens": self.output_tokens,
+        });
+        tracing::debug!("Anthropic response body (stream): {}", body);
     }
 
     /// 处理推理（思考）内容事件（新 Kiro runtime 端点的独立思考流）
