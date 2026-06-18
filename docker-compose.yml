@@ -8,10 +8,6 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - "8990:8990"
-    environment:
-      # 日志级别。设为 debug 可打印客户端原始 Anthropic 请求体与转换后的 Kiro 请求体，
-      # 便于直接拿原始 body 复现问题；默认 info 不打印请求体。
-      - RUST_LOG=${RUST_LOG:-info}
     volumes:
       - ./config/:/app/config/
     restart: unless-stopped

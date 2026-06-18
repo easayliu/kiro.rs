@@ -300,14 +300,6 @@ pub async fn post_messages(
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
-    // debug 级 dump 客户端原始 Anthropic 请求体（转换前），便于直接拿原始 body 复现问题。
-    // 转换后的 kiro body 由 send_*_request 里的 "Kiro request body" 日志打印，两者互补。
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        match serde_json::to_string(&payload) {
-            Ok(body) => tracing::debug!("Anthropic request body: {}", body),
-            Err(e) => tracing::debug!("Anthropic request body 序列化失败: {}", e),
-        }
-    }
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -715,8 +707,6 @@ fn create_sse_stream(
                             // likely_complete=false（真截断）：只发 error 事件，不补 message_stop——
                             //   否则客户端会把半截回复当成正常 end_turn 收下、不重试。
                             let bytes: Vec<Result<Bytes, Infallible>> = if likely_complete {
-                                // 误判但响应其实已完整：debug 级 dump 拼好的流式响应体。
-                                ctx.debug_dump_response_body();
                                 ctx.generate_final_events()
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -770,8 +760,6 @@ fn create_sse_stream(
                             let bytes: Vec<Result<Bytes, Infallible>> = if pending > 0 {
                                 vec![Ok(create_truncation_error_sse())]
                             } else {
-                                // 干净收尾：debug 级 dump 拼好的流式响应体。
-                                ctx.debug_dump_response_body();
                                 ctx.generate_final_events()
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1103,11 +1091,6 @@ async fn handle_non_stream_request(
             }
         }
     });
-
-    // debug 级 dump 返回给客户端的 Anthropic 响应体（非流式），与请求体日志互补。
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        tracing::debug!("Anthropic response body: {}", response_body);
-    }
 
     (StatusCode::OK, Json(response_body)).into_response()
 }

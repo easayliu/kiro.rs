@@ -339,7 +339,6 @@ pub struct HistoryAssistantMessage {
 
 impl HistoryAssistantMessage {
     /// 创建新的历史助手消息
-    #[allow(dead_code)] // 仅测试构造历史使用；生产路径不再合成 assistant 应答
     pub fn new(content: impl Into<String>) -> Self {
         Self {
             assistant_response_message: AssistantMessage::new(content),
