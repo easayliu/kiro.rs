@@ -341,43 +341,6 @@ fn is_valid_uuid(s: &str) -> bool {
     s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
 }
 
-/// 收集历史消息中使用的所有工具名称
-fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
-    let mut tool_names = Vec::new();
-
-    for msg in history {
-        if let Message::Assistant(assistant_msg) = msg {
-            if let Some(ref tool_uses) = assistant_msg.assistant_response_message.tool_uses {
-                for tool_use in tool_uses {
-                    if !tool_names.contains(&tool_use.name) {
-                        tool_names.push(tool_use.name.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    tool_names
-}
-
-/// 为历史中使用但不在 tools 列表中的工具创建占位符定义
-/// Kiro API 要求：历史消息中引用的工具必须在 currentMessage.tools 中有定义
-fn create_placeholder_tool(name: &str) -> Tool {
-    Tool {
-        tool_specification: ToolSpecification {
-            name: name.to_string(),
-            description: "Tool used in conversation history".to_string(),
-            input_schema: InputSchema::from_json(serde_json::json!({
-                "$schema": "http://json-schema.org/draft-07/schema#",
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "additionalProperties": true
-            })),
-        },
-    }
-}
-
 /// 将 Anthropic 请求转换为 Kiro 请求
 pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bool) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
@@ -428,7 +391,7 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
     let mut tool_name_map = HashMap::new();
-    let mut tools = convert_tools(&req.tools, &mut tool_name_map);
+    let tools = convert_tools(&req.tools, &mut tool_name_map);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
@@ -450,20 +413,7 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
     // 10. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
     remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
 
-    // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
-    // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
-    // 注意：Kiro 匹配工具名称时忽略大小写，所以这里也需要忽略大小写比较
-    let history_tool_names = collect_history_tool_names(&history);
-    let existing_tool_names: std::collections::HashSet<_> = tools
-        .iter()
-        .map(|t| t.tool_specification.name.to_lowercase())
-        .collect();
-
-    for tool_name in history_tool_names {
-        if !existing_tool_names.contains(&tool_name.to_lowercase()) {
-            tools.push(create_placeholder_tool(&tool_name));
-        }
-    }
+    // 历史引用但当前缺失的工具不再补占位定义：实测新端点接受历史引用未定义的工具，不会 400。
 
     // 11. 构建 UserInputMessageContext
     let mut context = UserInputMessageContext::new();
@@ -1118,12 +1068,10 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
             // 不注入分块写入策略提示词，系统消息原样透传
             let final_content = system_content;
 
-            // 系统消息作为 user + assistant 配对
+            // 系统消息作为 user 放入历史。新端点不要求 user/assistant 严格交替，
+            // 故不再补配 "I will follow" assistant 应答。
             let user_msg = HistoryUserMessage::new(final_content, model_id);
             history.push(Message::User(user_msg));
-
-            let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-            history.push(Message::Assistant(assistant_msg));
         }
     }
 
@@ -1131,47 +1079,18 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     // 最后一条消息作为 currentMessage，不加入历史（末尾可能是 user 或 assistant）
     let history_end_index = messages.len().saturating_sub(1);
 
-    // 收集并配对消息
-    let mut user_buffer: Vec<&super::types::Message> = Vec::new();
-    let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
-
+    // 按序原样输出历史：实测新端点不要求 user/assistant 交替，故不再合并连续同角色、
+    // 不再为末尾孤立 user 补 "OK" assistant。tool_use/tool_result 配对由前面的
+    // align/validate 步骤保证。
     for i in 0..history_end_index {
         let msg = &messages[i];
-
         if msg.role == "user" {
-            // 先处理累积的 assistant 消息
-            if !assistant_buffer.is_empty() {
-                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
-                history.push(Message::Assistant(merged));
-                assistant_buffer.clear();
-            }
-            user_buffer.push(msg);
+            let u = merge_user_messages(&[msg], model_id)?;
+            history.push(Message::User(u));
         } else if msg.role == "assistant" {
-            // 先处理累积的 user 消息
-            if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id)?;
-                history.push(Message::User(merged_user));
-                user_buffer.clear();
-            }
-            // 累积 assistant 消息（支持连续多条）
-            assistant_buffer.push(msg);
+            let a = convert_assistant_message(msg, tool_name_map)?;
+            history.push(Message::Assistant(a));
         }
-    }
-
-    // 处理末尾累积的 assistant 消息
-    if !assistant_buffer.is_empty() {
-        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map)?;
-        history.push(Message::Assistant(merged));
-    }
-
-    // 处理结尾的孤立 user 消息
-    if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id)?;
-        history.push(Message::User(merged_user));
-
-        // 自动配对一个 "OK" 的 assistant 响应
-        let auto_assistant = HistoryAssistantMessage::new("OK");
-        history.push(Message::Assistant(auto_assistant));
     }
 
     Ok(history)
@@ -1188,7 +1107,8 @@ fn merge_user_messages(
     model_id: &str,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
-    let mut omitted_images = 0usize;
+    // 历史图片透传：老的 ~4MB 体积限已在新端点解除，且新端点接受历史图片，故不再丢弃。
+    let mut all_images = Vec::new();
     let mut omitted_documents = 0usize;
     let mut all_tool_results = Vec::new();
 
@@ -1197,7 +1117,7 @@ fn merge_user_messages(
         if !text.is_empty() {
             content_parts.push(text);
         }
-        omitted_images += images.len();
+        all_images.extend(images);
         omitted_documents += documents.len();
         all_tool_results.extend(tool_results);
     }
@@ -1208,16 +1128,11 @@ fn merge_user_messages(
             format!("[{} document(s) omitted from history]", omitted_documents),
         );
     }
-    if omitted_images > 0 {
-        content_parts.insert(
-            0,
-            format!("[{} image(s) omitted from history]", omitted_images),
-        );
-    }
 
     // 空 content 实测新端点已接受（Smithy @length(min:1) 已解除），不再用占位符兜底。
     let content = content_parts.join("\n");
-    let user_msg = UserMessage::new(&content, model_id);
+    let mut user_msg = UserMessage::new(&content, model_id);
+    user_msg.images = all_images;
 
     let user_msg = if !all_tool_results.is_empty() {
         let mut ctx = UserInputMessageContext::new();
@@ -1293,7 +1208,8 @@ fn convert_assistant_message(
             format!("<thinking>{}</thinking>", thinking_content)
         }
     } else if text_content.is_empty() && !tool_uses.is_empty() {
-        " ".to_string()
+        // 空 content 实测新端点已接受，不再用占位符兜底
+        String::new()
     } else {
         text_content
     };
@@ -1303,46 +1219,6 @@ fn convert_assistant_message(
         assistant = assistant.with_tool_uses(tool_uses);
     }
 
-    Ok(HistoryAssistantMessage {
-        assistant_response_message: assistant,
-    })
-}
-
-/// 合并多个连续的 assistant 消息为一条
-/// 用于处理网络不稳定时产生的连续 assistant 消息（Issue #79）
-fn merge_assistant_messages(
-    messages: &[&super::types::Message],
-    tool_name_map: &mut HashMap<String, String>,
-) -> Result<HistoryAssistantMessage, ConversionError> {
-    assert!(!messages.is_empty());
-    if messages.len() == 1 {
-        return convert_assistant_message(messages[0], tool_name_map);
-    }
-
-    let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
-    let mut content_parts: Vec<String> = Vec::new();
-
-    for msg in messages {
-        let converted = convert_assistant_message(msg, tool_name_map)?;
-        let am = converted.assistant_response_message;
-        if !am.content.trim().is_empty() {
-            content_parts.push(am.content);
-        }
-        if let Some(tus) = am.tool_uses {
-            all_tool_uses.extend(tus);
-        }
-    }
-
-    let content = if content_parts.is_empty() && !all_tool_uses.is_empty() {
-        " ".to_string()
-    } else {
-        content_parts.join("\n\n")
-    };
-
-    let mut assistant = AssistantMessage::new(content);
-    if !all_tool_uses.is_empty() {
-        assistant = assistant.with_tool_uses(all_tool_uses);
-    }
     Ok(HistoryAssistantMessage {
         assistant_response_message: assistant,
     })
@@ -2006,47 +1882,6 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_history_tool_names() {
-        use crate::kiro::model::requests::tool::ToolUseEntry;
-
-        // 创建包含工具使用的历史消息
-        let mut assistant_msg = AssistantMessage::new("I'll read the file.");
-        assistant_msg = assistant_msg.with_tool_uses(vec![
-            ToolUseEntry::new("tool-1", "read")
-                .with_input(serde_json::json!({"path": "/test.txt"})),
-            ToolUseEntry::new("tool-2", "write")
-                .with_input(serde_json::json!({"path": "/out.txt"})),
-        ]);
-
-        let history = vec![
-            Message::User(HistoryUserMessage::new(
-                "Read the file",
-                "claude-sonnet-4.5",
-            )),
-            Message::Assistant(HistoryAssistantMessage {
-                assistant_response_message: assistant_msg,
-            }),
-        ];
-
-        let tool_names = collect_history_tool_names(&history);
-        assert_eq!(tool_names.len(), 2);
-        assert!(tool_names.contains(&"read".to_string()));
-        assert!(tool_names.contains(&"write".to_string()));
-    }
-
-    #[test]
-    fn test_create_placeholder_tool() {
-        let tool = create_placeholder_tool("my_custom_tool");
-
-        assert_eq!(tool.tool_specification.name, "my_custom_tool");
-        assert!(!tool.tool_specification.description.is_empty());
-
-        // 验证 JSON 序列化正确
-        let json = serde_json::to_string(&tool).unwrap();
-        assert!(json.contains("\"name\":\"my_custom_tool\""));
-    }
-
-    #[test]
     fn test_shorten_tool_name_deterministic() {
         let long_name = "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
         assert!(long_name.len() > TOOL_NAME_MAX_LEN);
@@ -2205,7 +2040,7 @@ mod tests {
     }
 
     #[test]
-    fn test_history_tools_added_to_tools_list() {
+    fn test_history_tools_not_placeholdered() {
         use super::super::types::Message as AnthropicMessage;
 
         // 创建一个请求，历史中有工具使用，但 tools 列表为空
@@ -2242,19 +2077,24 @@ mod tests {
 
         let result = convert_request(&req, "AI_EDITOR", false).unwrap();
 
-        // 验证 tools 列表中包含了历史中使用的工具的占位符定义
+        // 新行为：不再为历史引用的工具补占位定义（实测新端点接受历史引用未定义的工具）。
         let tools = &result
             .conversation_state
             .current_message
             .user_input_message
             .user_input_message_context
             .tools;
+        assert!(tools.is_empty(), "不应再生成占位工具定义，实际: {:?}", tools.len());
 
-        assert!(!tools.is_empty(), "tools 列表不应为空");
-        assert!(
-            tools.iter().any(|t| t.tool_specification.name == "read"),
-            "tools 列表应包含 'read' 工具的占位符定义"
-        );
+        // 历史里仍应保留该 tool_use
+        let found = result.conversation_state.history.iter().any(|m| {
+            matches!(m, Message::Assistant(a) if a
+                .assistant_response_message
+                .tool_uses
+                .as_ref()
+                .is_some_and(|tus| tus.iter().any(|t| t.name == "read")))
+        });
+        assert!(found, "历史中应保留 read 的 tool_use");
     }
 
     #[test]
@@ -2323,7 +2163,7 @@ mod tests {
     }
 
     #[test]
-    fn test_history_images_dropped_with_placeholder() {
+    fn test_history_images_passed_through() {
         use super::super::types::Message as AnthropicMessage;
 
         // 历史里一条 user 消息带 2 张图 + 一行文字；当前消息是纯文本
@@ -2360,19 +2200,16 @@ mod tests {
 
         let result = convert_request(&req, "AI_EDITOR", false).unwrap();
 
-        // 历史里第一条 user 应该不含图，但 content 头部应有占位符
+        // 历史里第一条 user 应原样带上 2 张图，且不再注入"omitted"占位符
         let history = &result.conversation_state.history;
         let first = match &history[0] {
             Message::User(h) => h,
             _ => panic!("expected User"),
         };
-        assert!(first.user_input_message.images.is_empty(), "历史图片应被丢弃");
+        assert_eq!(first.user_input_message.images.len(), 2, "历史图片应透传");
         assert!(
-            first
-                .user_input_message
-                .content
-                .contains("[2 image(s) omitted from history]"),
-            "应在历史文本里追加占位符，实际: {:?}",
+            !first.user_input_message.content.contains("omitted from history"),
+            "不应再有 omitted 占位符，实际: {:?}",
             first.user_input_message.content
         );
         // 原始文字也得保留
@@ -2769,7 +2606,7 @@ mod tests {
         use super::super::types::Message as AnthropicMessage;
 
         // 测试仅包含 tool_use 的 assistant 消息（无 text 块）
-        // Kiro API 要求 content 字段不能为空
+        // 新端点已接受空 content，不再用占位符兜底
         let msg = AnthropicMessage {
             role: "assistant".to_string(),
             content: serde_json::json!([
@@ -2779,14 +2616,10 @@ mod tests {
 
         let result = convert_assistant_message(&msg, &mut HashMap::new()).expect("应该成功转换");
 
-        // 验证 content 不为空（使用占位符）
-        assert!(
-            !result.assistant_response_message.content.is_empty(),
-            "content 不应为空"
-        );
+        // 仅 tool_use 时 content 为空（不再占位）
         assert_eq!(
-            result.assistant_response_message.content, " ",
-            "仅 tool_use 时应使用 ' ' 占位符"
+            result.assistant_response_message.content, "",
+            "仅 tool_use 时 content 应为空"
         );
 
         // 验证 tool_uses 被正确保留
@@ -2900,40 +2733,6 @@ mod tests {
         } else {
             panic!("应该是 Assistant 消息");
         }
-    }
-
-    #[test]
-    fn test_merge_consecutive_assistant_messages() {
-        // 测试连续 assistant 消息被正确合并（Issue #79）
-        use super::super::types::Message as AnthropicMessage;
-
-        let msg1 = AnthropicMessage {
-            role: "assistant".to_string(),
-            content: serde_json::json!([
-                {"type": "thinking", "thinking": "Let me think about this..."},
-                {"type": "text", "text": " "}
-            ]),
-        };
-
-        let msg2 = AnthropicMessage {
-            role: "assistant".to_string(),
-            content: serde_json::json!([
-                {"type": "thinking", "thinking": "I should read the file."},
-                {"type": "text", "text": "Let me read that file."},
-                {"type": "tool_use", "id": "toolu_01ABC", "name": "read_file", "input": {"path": "/test.txt"}}
-            ]),
-        };
-
-        let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
-        let result = merge_assistant_messages(&messages, &mut HashMap::new()).expect("合并应成功");
-
-        let content = &result.assistant_response_message.content;
-        assert!(content.contains("<thinking>"), "应包含 thinking 标签");
-        assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
-
-        let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
-        assert_eq!(tool_uses.len(), 1);
-        assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
     }
 
     #[test]
