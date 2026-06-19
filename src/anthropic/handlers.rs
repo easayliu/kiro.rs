@@ -359,6 +359,11 @@ pub async fn post_messages(
                     "request_too_large",
                     e.to_string(),
                 ),
+                ConversionError::DocumentTooLarge { .. } => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request_too_large",
+                    e.to_string(),
+                ),
             };
             tracing::warn!("请求转换失败: {}", e);
             return (status, Json(ErrorResponse::new(error_type, message))).into_response();
@@ -1191,6 +1196,11 @@ pub async fn post_messages_cc(
                     "消息列表为空".to_string(),
                 ),
                 ConversionError::ImageTooLarge { .. } => (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request_too_large",
+                    e.to_string(),
+                ),
+                ConversionError::DocumentTooLarge { .. } => (
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "request_too_large",
                     e.to_string(),

@@ -238,6 +238,10 @@ impl KiroProvider {
         preferred_credential: Option<u64>,
     ) -> anyhow::Result<BufferedApiCallResult> {
         const BODY_READ_MAX_ATTEMPTS: usize = 3;
+        // body 读取已持续这么久才 EOF，判定为"长生成撞上游响应时长上限"而非短促瞬态：
+        // 实测上游在 ~220-274s 处主动掐断仍在产出的流（非空闲驱逐、与本地 720s 超时无关），
+        // 重试只会让同一长生成从头再跑一遍、再撞同一堵墙，白费凭据与时间。阈值取上限下方留足余量。
+        const LONG_RESPONSE_EOF_NO_RETRY: Duration = Duration::from_secs(180);
         let mut last_error: Option<anyhow::Error> = None;
 
         for attempt in 0..BODY_READ_MAX_ATTEMPTS {
@@ -250,6 +254,7 @@ impl KiroProvider {
                 .await?;
             let credential_id = result.credential_id;
 
+            let body_started = Instant::now();
             match result.response.bytes().await {
                 Ok(body) => {
                     return Ok(BufferedApiCallResult {
@@ -258,6 +263,7 @@ impl KiroProvider {
                     });
                 }
                 Err(e) => {
+                    let body_elapsed = body_started.elapsed();
                     // 拼接完整错误源链，区分 timeout / connect reset / 上游提前 EOF / h2 RST
                     let mut chain = e.to_string();
                     let mut src = std::error::Error::source(&e);
@@ -272,12 +278,26 @@ impl KiroProvider {
                         is_connect = e.is_connect(),
                         is_body = e.is_body(),
                         is_decode = e.is_decode(),
+                        body_elapsed_secs = body_elapsed.as_secs_f64(),
                         "读取响应体失败（上游瞬态，body 重试 {}/{}）: {}",
                         attempt + 1,
                         BODY_READ_MAX_ATTEMPTS,
                         chain
                     );
                     last_error = Some(anyhow::Error::new(e));
+
+                    // 长生成撞上游响应时长上限：重试注定再次撞墙，直接放弃剩余重试省凭据/省时。
+                    if body_elapsed >= LONG_RESPONSE_EOF_NO_RETRY {
+                        tracing::warn!(
+                            cred_id = credential_id,
+                            body_elapsed_secs = body_elapsed.as_secs_f64(),
+                            "body 读取持续 {:.0}s 才中断，判定为长生成撞上游响应时长上限，跳过剩余 {} 次重试",
+                            body_elapsed.as_secs_f64(),
+                            BODY_READ_MAX_ATTEMPTS - (attempt + 1)
+                        );
+                        break;
+                    }
+
                     if attempt + 1 < BODY_READ_MAX_ATTEMPTS {
                         sleep(Self::retry_delay(attempt)).await;
                     }

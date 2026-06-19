@@ -297,6 +297,12 @@ pub enum ConversionError {
         height: u32,
         max_side: u32,
     },
+    /// 当前消息文档解码大小超出上游限制
+    DocumentTooLarge {
+        name: String,
+        size: usize,
+        max_size: usize,
+    },
 }
 
 impl std::fmt::Display for ConversionError {
@@ -312,6 +318,17 @@ impl std::fmt::Display for ConversionError {
                 f,
                 "图片 {}×{} 像素超过上游限制（长边 ≤ {}），请缩放（推荐长边 ≤ 1568）",
                 width, height, max_side
+            ),
+            ConversionError::DocumentTooLarge {
+                name,
+                size,
+                max_size,
+            } => write!(
+                f,
+                "文档 '{}' 大小 {:.2}MB 超过上游限制（≤ {:.1}MB），请压缩或拆分",
+                name,
+                *size as f64 / 1_000_000.0,
+                *max_size as f64 / 1_000_000.0
             ),
         }
     }
@@ -436,6 +453,19 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
                     max_side: KIRO_MAX_IMAGE_SIDE,
                 });
             }
+        }
+    }
+
+    // 5.6. 当前消息文档大小预校验：上游对单文档有 4.5MB 硬上限，超过会以
+    // DOCUMENT_SIZE_EXCEEDED 拒绝。提前拦截给出可读错误，避免触发上游 400。
+    for doc in &documents {
+        let size = base64_decoded_len(&doc.source.bytes);
+        if size > KIRO_MAX_DOCUMENT_SIZE {
+            return Err(ConversionError::DocumentTooLarge {
+                name: doc.name.clone(),
+                size,
+                max_size: KIRO_MAX_DOCUMENT_SIZE,
+            });
         }
     }
 
@@ -890,6 +920,24 @@ const TOOL_USE_ID_MAX_LEN: usize = 64;
 /// "Improperly formed request"）。Anthropic 官方推荐长边 ≤ 1568 像素以达到最佳效果，
 /// 这里只在硬上限处拦截，把"推荐值"放在错误提示里告知用户。
 pub const KIRO_MAX_IMAGE_SIDE: u32 = 8000;
+
+/// 单文档解码后字节上限。上游对单个 document 的硬上限为 4.5MB，超过会以
+/// 400 `DOCUMENT_SIZE_EXCEEDED`（"Document 'document' exceeds maximum size of 4.5MB"）拒绝。
+/// 实测边界为十进制 4,500,000 字节（非 4.5 MiB）：4_500_000 通过大小校验、4_550_000 被拒。
+/// 提前在转换阶段拦截，避免触发上游错误。
+pub const KIRO_MAX_DOCUMENT_SIZE: usize = 4_500_000; // 4.5 MB（十进制，实测上游边界）
+
+/// 估算 base64 解码后的字节数（标准带填充编码，`data` 字段无空白）。
+/// 不做完整解码，按 `len/4*3 - padding` 计算，足够用于大小阈值判断。
+fn base64_decoded_len(s: &str) -> usize {
+    let s = s.trim_end();
+    let len = s.len();
+    if len < 4 {
+        return 0;
+    }
+    let padding = s.bytes().rev().take_while(|&b| b == b'=').count();
+    len / 4 * 3 - padding.min(2)
+}
 
 /// 解析 base64 图片头部，返回 (width, height)
 ///
@@ -2469,6 +2517,61 @@ mod tests {
                 assert_eq!(max_side, KIRO_MAX_IMAGE_SIDE);
             }
             other => panic!("expected ImageTooLarge, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_base64_decoded_len() {
+        // "AAAA" → 3 字节；"AAA=" → 2 字节；"AA==" → 1 字节
+        assert_eq!(base64_decoded_len("AAAA"), 3);
+        assert_eq!(base64_decoded_len("AAA="), 2);
+        assert_eq!(base64_decoded_len("AA=="), 1);
+        assert_eq!(base64_decoded_len(""), 0);
+        // N 字节明文编码长度恒为 4*ceil(N/3)，解码估算应等于 N
+        for n in [1usize, 100, 4096, 4 * 1024 * 1024] {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(vec![0u8; n]);
+            assert_eq!(base64_decoded_len(&b64), n, "n={n}");
+        }
+    }
+
+    #[test]
+    fn test_convert_request_document_too_large() {
+        use super::super::types::Message as AnthropicMessage;
+        // 构造一个解码后超过 4.5MB 的 PDF document，应被预校验拦截
+        let bytes = vec![0u8; KIRO_MAX_DOCUMENT_SIZE + 1];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 16,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "text", "text": "读它"},
+                    {"type": "document", "source": {"type":"base64","media_type":"application/pdf","data": b64}, "title": "big.pdf"}
+                ]),
+            }],
+            system: None,
+            stream: false,
+            tools: None,
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let err = convert_request(&req, "AI_EDITOR", false).unwrap_err();
+        match err {
+            ConversionError::DocumentTooLarge {
+                name,
+                size,
+                max_size,
+            } => {
+                assert_eq!(name, "big");
+                assert!(size > KIRO_MAX_DOCUMENT_SIZE);
+                assert_eq!(max_size, KIRO_MAX_DOCUMENT_SIZE);
+            }
+            other => panic!("expected DocumentTooLarge, got {:?}", other),
         }
     }
 
