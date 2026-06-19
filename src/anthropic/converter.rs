@@ -525,9 +525,16 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
     }
 
     // 12. 构建当前消息
-    // 保留文本内容，即使有工具结果也不丢弃用户文本
-    // kiro API 不接受空 content（Smithy @length(min:1)），仅有 tool_results 时用占位符兜底
-    let content = if text_content.is_empty() && has_tool_results {
+    // 保留文本内容，即使有工具结果也不丢弃用户文本。
+    let content = if !text_content.is_empty() {
+        text_content
+    } else if !documents.is_empty() || !images.is_empty() {
+        // Bedrock 要求带 documents（PDF 等）/images 的消息必须包含 text block，否则 400
+        // "A text block must be included when using documents"。注意：纯空白（如单个空格）
+        // 会被上游 trim 视为无效 text block，必须用非空白字符兜底（实测 "." 即可通过）。
+        ".".to_string()
+    } else if has_tool_results {
+        // 仅有 tool_results：kiro API 不接受空 content（Smithy @length(min:1)），空格即可满足。
         " ".to_string()
     } else {
         text_content
@@ -2573,6 +2580,42 @@ mod tests {
             }
             other => panic!("expected DocumentTooLarge, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_convert_request_document_without_text_gets_placeholder() {
+        use super::super::types::Message as AnthropicMessage;
+        // 仅发送 PDF document、无任何文本：Bedrock 要求带 documents 必须含 text block，
+        // 否则 400 "A text block must be included when using documents"。
+        // 转换后 current_message.content 应被兜底为非空占位符。
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.4 fake");
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 16,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {"type": "document", "source": {"type":"base64","media_type":"application/pdf","data": b64}, "title": "report.pdf"}
+                ]),
+            }],
+            system: None,
+            stream: false,
+            tools: None,
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req, "AI_EDITOR", false).unwrap();
+        let user_input = &result.conversation_state.current_message.user_input_message;
+        // 必须是非空白占位符：纯空白会被 Bedrock 视为无效 text block 仍触发 400。
+        assert!(
+            !user_input.content.trim().is_empty(),
+            "带 document 的消息文本不应为空白，否则触发 Bedrock 400"
+        );
+        assert_eq!(user_input.documents.len(), 1);
+        assert_eq!(user_input.documents[0].name, "report");
     }
 
     #[test]
