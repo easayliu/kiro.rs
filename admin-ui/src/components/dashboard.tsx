@@ -25,6 +25,8 @@ import {
   Activity,
   CircleDollarSign,
   Power,
+  BarChart3,
+  Users,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -36,6 +38,7 @@ import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { ProxyGroupsDialog } from '@/components/proxy-groups-dialog'
+import { StatsView } from '@/components/stats-view'
 import {
   useCredentials,
   useDeleteCredential,
@@ -57,6 +60,8 @@ import {
   useDefaultConcurrencyLimit,
   useSetDefaultConcurrencyLimit,
   useBillingStats,
+  useStatsSummary,
+  useStatsTimeseries,
 } from '@/hooks/use-credentials'
 import type { CacheScope } from '@/api/credentials'
 import {
@@ -80,7 +85,21 @@ import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import { RelativeTime } from '@/components/relative-time'
-import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
+import type { CredentialStatusItem, StatGroup } from '@/types/api'
+
+// 业界标准分页：返回页码序列，过多时用省略号收拢（首页/末页恒显，当前页两侧各留 1）
+function getPageList(current: number, total: number, sibling = 1): (number | 'dots')[] {
+  const totalSlots = sibling * 2 + 5 // 首 + 末 + 当前 + 2*sibling + 2 省略
+  if (total <= totalSlots) return Array.from({ length: total }, (_, i) => i + 1)
+  const left = Math.max(current - sibling, 1)
+  const right = Math.min(current + sibling, total)
+  const out: (number | 'dots')[] = [1]
+  if (left > 2) out.push('dots')
+  for (let i = left; i <= right; i++) if (i !== 1 && i !== total) out.push(i)
+  if (right < total - 1) out.push('dots')
+  out.push(total)
+  return out
+}
 
 type FilterKey = 'all' | 'available' | 'faulty' | 'throttled' | 'disabled'
 
@@ -99,7 +118,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(new Map())
-  const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(() => storage.loadBalanceCache())
   const [loadingBalanceIds, setLoadingBalanceIds] = useState<Set<number>>(new Set())
   const [queryingInfo, setQueryingInfo] = useState(false)
   const [queryInfoProgress, setQueryInfoProgress] = useState({ current: 0, total: 0 })
@@ -181,6 +199,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   const queryClient = useQueryClient()
   const readOnly = useIsReadOnly()
+  // 顶部视图切换：凭据控制台 / 统计分析（持久化，刷新后停留在当前标签）
+  const [view, setView] = useState<'credentials' | 'stats'>(() =>
+    localStorage.getItem('kiro-view') === 'stats' ? 'stats' : 'credentials',
+  )
+  useEffect(() => {
+    localStorage.setItem('kiro-view', view)
+  }, [view])
   const { data, isLoading, error, refetch } = useCredentials()
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
@@ -194,6 +219,33 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data: defaultConcurrencyData } = useDefaultConcurrencyLimit()
   const setDefaultConcurrencyMutation = useSetDefaultConcurrencyLimit()
   const { data: billingStats } = useBillingStats()
+  // 近 7 天每凭据用量（请求/成本/截断/TTFT），按 id 映射给卡片
+  const { data: statsSummary } = useStatsSummary({ hours: 168 })
+  const usageMap = useMemo(() => {
+    const m = new Map<number, StatGroup>()
+    statsSummary?.by_credential?.forEach(g => {
+      const id = Number(g.key)
+      if (!Number.isNaN(id)) m.set(id, g)
+    })
+    return m
+  }, [statsSummary])
+  // 近 7 天每凭据 TTFT 时序（按天分桶，轻量），透视成 id → 有序数组供卡片画 sparkline
+  const { data: ttftTs } = useStatsTimeseries({ hours: 168, bucket: 'day', groupBy: 'credential' })
+  const ttftSeriesMap = useMemo(() => {
+    const byId = new Map<number, { bucket: number; v: number }[]>()
+    ttftTs?.forEach(r => {
+      const id = Number(r.group)
+      if (Number.isNaN(id)) return
+      if (!byId.has(id)) byId.set(id, [])
+      byId.get(id)!.push({ bucket: r.bucket, v: r.avg_ttft_ms })
+    })
+    const m = new Map<number, number[]>()
+    byId.forEach((arr, id) => {
+      arr.sort((a, b) => a.bucket - b.bucket)
+      m.set(id, arr.map(x => x.v))
+    })
+    return m
+  }, [ttftTs])
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const { data: cacheScopeData, isLoading: isLoadingCacheScope } = useCacheScope()
@@ -213,7 +265,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const disabledCredentialCount = allCreds.filter(c => c.disabled).length
   const faultyCredentialCount = allCreds.filter(c => !c.disabled && !isThrottledNow(c) && (c.failureCount > 0 || c.refreshFailureCount > 0)).length
   const activeCredential = data?.currentId ? allCreds.find(c => c.id === data.currentId) : undefined
-  const activeBalance = data?.currentId ? balanceMap.get(data.currentId) : undefined
+  // 余额来自服务端列表（credential.balance）—— kiro.db 为单一真相源
+  const balanceOf = (c: CredentialStatusItem) => c.balance
+  const activeBalance = activeCredential?.balance
 
   const filteredCreds = useMemo(() => {
     const q = search.trim().toLowerCase()
@@ -258,11 +312,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
     if (sortKey === 'usage-desc' || sortKey === 'usage-asc') {
       // 按已用 credits 绝对值（currentUsage）排序。用量数据仅对查询过余额的
-      // 凭证可用，未查询的（balanceMap 无记录）无论升降序都排到末尾。
+      // 凭证可用，未查询过余额的（credential.balance 为空）无论升降序都排到末尾。
       const desc = sortKey === 'usage-desc'
       return [...filtered].sort((a, b) => {
-        const ua = balanceMap.get(a.id)?.currentUsage
-        const ub = balanceMap.get(b.id)?.currentUsage
+        const ua = balanceOf(a)?.currentUsage
+        const ub = balanceOf(b)?.currentUsage
         if (ua == null && ub == null) {
           if (a.priority !== b.priority) return a.priority - b.priority
           return a.id - b.id
@@ -306,14 +360,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
     const direction = sortKey === 'plan-desc' ? -1 : 1
     return [...filtered].sort((a, b) => {
       const rankDelta =
-        (tierRank(balanceMap.get(a.id)?.subscriptionTitle) -
-          tierRank(balanceMap.get(b.id)?.subscriptionTitle)) * direction
+        (tierRank(balanceOf(a)?.subscriptionTitle) -
+          tierRank(balanceOf(b)?.subscriptionTitle)) * direction
       if (rankDelta !== 0) return rankDelta
       // Stable secondary order: priority asc, then id asc
       if (a.priority !== b.priority) return a.priority - b.priority
       return a.id - b.id
     })
-  }, [allCreds, filter, search, sortKey, balanceMap])
+  }, [allCreds, filter, search, sortKey])
 
   const totalPages = Math.max(1, Math.ceil(filteredCreds.length / itemsPerPage))
   const safePage = Math.min(currentPage, totalPages)
@@ -327,17 +381,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const selectedEnabledCount = selectedIds.size - selectedDisabledCount
 
   useEffect(() => { setCurrentPage(1) }, [filter, search, allCreds.length])
-  useEffect(() => { storage.saveBalanceCache(balanceMap) }, [balanceMap])
   useEffect(() => {
     if (!data?.credentials) {
-      setBalanceMap(new Map()); setLoadingBalanceIds(new Set()); return
+      setLoadingBalanceIds(new Set()); return
     }
     const validIds = new Set(data.credentials.map(c => c.id))
-    setBalanceMap(prev => {
-      const next = new Map<number, BalanceResponse>()
-      prev.forEach((v, id) => validIds.has(id) && next.set(id, v))
-      return next.size === prev.size ? prev : next
-    })
     setLoadingBalanceIds(prev => {
       if (prev.size === 0) return prev
       const next = new Set<number>()
@@ -357,10 +405,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setSelectedCredentialId(id); setBalanceDialogOpen(true)
   }
 
+  // 弹窗查到最新余额：失效凭据列表，使卡片的值/时间戳从服务端同步刷新
+  const handleBalanceLoaded = () => {
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
+  }
+
   const handleRefresh = () => { refetch(); toast.success('已刷新凭据列表') }
 
   const handleLogout = () => {
-    storage.removeApiKey(); storage.clearBalanceCache(); queryClient.clear(); onLogout()
+    storage.removeApiKey(); queryClient.clear(); onLogout()
   }
 
   const toggleSelect = (id: number) => {
@@ -487,9 +540,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
       const id = ids[i]
       setLoadingBalanceIds(prev => { const next = new Set(prev); next.add(id); return next })
       try {
-        const balance = await getCredentialBalance(id)
+        await getCredentialBalance(id)
         successCount++
-        setBalanceMap(prev => { const next = new Map(prev); next.set(id, balance); return next })
       } catch { failCount++ }
       finally {
         setLoadingBalanceIds(prev => { const next = new Set(prev); next.delete(id); return next })
@@ -497,6 +549,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
       setQueryInfoProgress({ current: i + 1, total: ids.length })
     }
     setQueryingInfo(false)
+    // 余额已更新到服务端缓存，失效列表让卡片从服务端同步刷新
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
     if (failCount === 0) toast.success(`查询完成：成功 ${successCount}/${ids.length}`)
     else toast.warning(`查询完成：成功 ${successCount} 个，失败 ${failCount} 个`)
   }
@@ -891,6 +945,29 @@ export function Dashboard({ onLogout }: DashboardProps) {
               )}
             </div>
           </div>
+          {/* 视图切换：凭据 / 统计 */}
+          <div className="inline-flex items-center gap-0.5 rounded-xl border border-border bg-muted/40 p-0.5">
+            <button
+              onClick={() => setView('credentials')}
+              className={cn(
+                'inline-flex cursor-pointer items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition-colors',
+                view === 'credentials' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground',
+              )}
+            >
+              <Users className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">凭据</span>
+            </button>
+            <button
+              onClick={() => setView('stats')}
+              className={cn(
+                'inline-flex cursor-pointer items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition-colors',
+                view === 'stats' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground',
+              )}
+            >
+              <BarChart3 className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">统计</span>
+            </button>
+          </div>
           <div className="flex items-center gap-0.5">
             <MobileIconBtn onClick={toggleDarkMode} label={darkMode ? '浅色模式' : '深色模式'}>
               {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
@@ -913,6 +990,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
             paddingRight: 'max(1rem, env(safe-area-inset-right))',
           }}
         >
+          {view === 'stats' ? (
+            <StatsView />
+          ) : (
+          <>
           {/* ━━━━━━━━━━━━ HERO — single inline row, flex-wrap ━━━━━━━━━━━━ */}
           <section className="mb-5 sm:mb-6">
             <div className="flex flex-wrap items-baseline gap-x-5 gap-y-2">
@@ -1252,8 +1333,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     </DropdownMenuContent>
                   </DropdownMenu>
 
-                  <span>
-                    页 <span className="tnum text-foreground">{safePage}/{totalPages}</span>
+                  {/* 结果计数（业界标准：共 N 条 · 当前区间），替代难看的「页 1/1」 */}
+                  <span className="tnum">
+                    共 <span className="text-foreground">{filteredCreds.length}</span> 条
+                    {totalPages > 1 && (
+                      <span className="text-muted-foreground/60">
+                        {' · '}
+                        {startIndex + 1}–{Math.min(startIndex + itemsPerPage, filteredCreds.length)}
+                      </span>
+                    )}
                   </span>
                 </div>
               </div>
@@ -1292,40 +1380,71 @@ export function Dashboard({ onLogout }: DashboardProps) {
                       onViewBalance={handleViewBalance}
                       selected={selectedIds.has(credential.id)}
                       onToggleSelect={() => toggleSelect(credential.id)}
-                      balance={balanceMap.get(credential.id) || null}
+                      balance={credential.balance ?? null}
+                      usage={usageMap.get(credential.id)}
+                      ttftSeries={ttftSeriesMap.get(credential.id)}
                       loadingBalance={loadingBalanceIds.has(credential.id)}
                     />
                   ))}
                 </div>
 
                 {totalPages > 1 && (
-                  <div className="mt-8 flex flex-wrap items-center justify-center gap-3">
-                    <Button
-                      variant="ghost"
-                      size="sm"
+                  <nav
+                    className="mt-8 flex flex-wrap items-center justify-center gap-1.5"
+                    aria-label="分页"
+                  >
+                    {/* 上一页 */}
+                    <button
                       onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
                       disabled={safePage === 1}
-                      className="min-w-[80px] gap-1 text-muted-foreground hover:text-foreground"
+                      aria-label="上一页"
+                      className="inline-flex h-9 min-w-9 cursor-pointer items-center justify-center rounded-lg border border-border px-2 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
                     >
-                      <ChevronLeft className="h-4 w-4" /> 上一页
-                    </Button>
-                    <span className="tnum font-mono text-xs text-muted-foreground">
-                      <span className="font-medium text-foreground">{safePage}</span> / {totalPages}
-                    </span>
-                    <Button
-                      variant="ghost"
-                      size="sm"
+                      <ChevronLeft className="h-4 w-4" />
+                    </button>
+
+                    {/* 页码 */}
+                    {getPageList(safePage, totalPages).map((p, i) =>
+                      p === 'dots' ? (
+                        <span
+                          key={`dots-${i}`}
+                          className="inline-flex h-9 min-w-9 items-center justify-center px-1 text-sm text-muted-foreground/50"
+                        >
+                          …
+                        </span>
+                      ) : (
+                        <button
+                          key={p}
+                          onClick={() => setCurrentPage(p)}
+                          aria-current={p === safePage ? 'page' : undefined}
+                          className={cn(
+                            'tnum inline-flex h-9 min-w-9 cursor-pointer items-center justify-center rounded-lg border px-2 text-sm font-medium transition-colors',
+                            p === safePage
+                              ? 'border-primary bg-primary text-primary-foreground'
+                              : 'border-border text-muted-foreground hover:bg-muted hover:text-foreground',
+                          )}
+                        >
+                          {p}
+                        </button>
+                      ),
+                    )}
+
+                    {/* 下一页 */}
+                    <button
                       onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
                       disabled={safePage === totalPages}
-                      className="min-w-[80px] gap-1 text-muted-foreground hover:text-foreground"
+                      aria-label="下一页"
+                      className="inline-flex h-9 min-w-9 cursor-pointer items-center justify-center rounded-lg border border-border px-2 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
                     >
-                      下一页 <ChevronRight className="h-4 w-4" />
-                    </Button>
-                  </div>
+                      <ChevronRight className="h-4 w-4" />
+                    </button>
+                  </nav>
                 )}
               </>
             )}
           </section>
+          </>
+          )}
         </div>
       </main>
 
@@ -1421,7 +1540,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       )}
 
       {/* Dialogs */}
-      <BalanceDialog credentialId={selectedCredentialId} open={balanceDialogOpen} onOpenChange={setBalanceDialogOpen} />
+      <BalanceDialog credentialId={selectedCredentialId} open={balanceDialogOpen} onOpenChange={setBalanceDialogOpen} onBalanceLoaded={handleBalanceLoaded} />
       <AddCredentialDialog open={addDialogOpen} onOpenChange={setAddDialogOpen} />
       <BatchImportDialog open={batchImportDialogOpen} onOpenChange={setBatchImportDialogOpen} />
       <KamImportDialog open={kamImportDialogOpen} onOpenChange={setKamImportDialogOpen} />

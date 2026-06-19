@@ -2,7 +2,7 @@
 
 use axum::{
     Extension, Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
 };
 
@@ -30,6 +30,85 @@ pub async fn get_me(Extension(role): Extension<AdminRole>) -> impl IntoResponse 
 /// 返回进程维度累计的实际成本 / 官方折算价 / 毛利汇总
 pub async fn get_billing_stats() -> impl IntoResponse {
     Json(crate::anthropic::billing_stats().snapshot())
+}
+
+/// 时序统计查询参数。
+#[derive(Debug, serde::Deserialize)]
+pub struct StatsQuery {
+    /// 回看窗口（小时），默认 7 天，最长 90 天。
+    #[serde(default)]
+    hours: Option<u32>,
+    /// 自定义起始时间（Unix 秒）；与 `to` 同时给出时优先于 hours。
+    #[serde(default)]
+    from: Option<i64>,
+    /// 自定义结束时间（Unix 秒）。
+    #[serde(default)]
+    to: Option<i64>,
+    /// 分桶粒度："hour"（默认）或 "day"。
+    #[serde(default)]
+    bucket: Option<String>,
+    /// 分组维度："none"（默认）/ "model" / "credential"。
+    #[serde(default)]
+    group_by: Option<String>,
+    /// 模型过滤（逗号分隔）；空=不过滤。
+    #[serde(default)]
+    models: Option<String>,
+    /// 凭据过滤（逗号分隔的 id）；空=不过滤。
+    #[serde(default)]
+    credentials: Option<String>,
+}
+
+/// 解析逗号分隔的过滤参数：模型名列表 + 凭据 id 列表。
+fn parse_filters(q: &StatsQuery) -> (Vec<String>, Vec<i64>) {
+    let models = q
+        .models
+        .as_deref()
+        .map(|s| s.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default();
+    let credentials = q
+        .credentials
+        .as_deref()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse::<i64>().ok()).collect())
+        .unwrap_or_default();
+    (models, credentials)
+}
+
+/// 解析时间区间：自定义 from/to 优先（钳到最长 90 天）；否则按 hours 回看窗口。
+fn resolve_range(q: &StatsQuery) -> (i64, i64) {
+    const MAX_SPAN: i64 = 90 * 24 * 3600;
+    if let (Some(from), Some(to)) = (q.from, q.to) {
+        if to > from {
+            let from = from.max(to - MAX_SPAN); // 跨度封顶 90 天
+            return (from, to);
+        }
+    }
+    let h = q.hours.unwrap_or(168).clamp(1, 90 * 24) as i64;
+    let now = chrono::Utc::now().timestamp();
+    (now - h * 3600, now)
+}
+
+/// GET /api/admin/stats/timeseries
+/// 按时间分桶的成本/用量/延迟曲线，可按 model / credential 分组。
+pub async fn get_stats_timeseries(Query(q): Query<StatsQuery>) -> impl IntoResponse {
+    let (from_ts, to_ts) = resolve_range(&q);
+    let bucket_secs = match q.bucket.as_deref() {
+        Some("day") => 86_400,
+        _ => 3_600,
+    };
+    let group_by = crate::stats::GroupBy::parse(q.group_by.as_deref().unwrap_or("none"));
+    let (models, credentials) = parse_filters(&q);
+    let data =
+        crate::stats::query_timeseries(from_ts, to_ts, bucket_secs, group_by, models, credentials).await;
+    Json(data)
+}
+
+/// GET /api/admin/stats/summary
+/// 区间汇总：全量 + 按模型 + 按凭据。
+pub async fn get_stats_summary(Query(q): Query<StatsQuery>) -> impl IntoResponse {
+    let (from_ts, to_ts) = resolve_range(&q);
+    let (models, credentials) = parse_filters(&q);
+    let data = crate::stats::query_summary(from_ts, to_ts, models, credentials).await;
+    Json(data)
 }
 
 /// GET /api/admin/credentials

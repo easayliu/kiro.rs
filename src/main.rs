@@ -7,11 +7,13 @@ mod http_client;
 mod import;
 mod kiro;
 mod model;
+mod stats;
 pub mod token;
 
 use std::sync::Arc;
 
 use clap::Parser;
+use kiro::credential_store::CredentialStore;
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
@@ -86,15 +88,59 @@ async fn main() {
         std::process::exit(1);
     });
 
-    // 判断是否为多凭据格式（用于刷新后回写）
-    let is_multiple_format = credentials_config.is_multiple();
+    // 凭据持久化已迁移到 SQLite（credentials.db，与 credentials.json 同目录）。
+    // credentials.json 仅作为「首次迁移」的数据源与 kiro-cli 导入的落点。
+    let db_path = {
+        let p = std::path::Path::new(&credentials_path);
+        match p.parent().filter(|d| !d.as_os_str().is_empty()) {
+            Some(dir) => dir.join("kiro.db"),
+            None => std::path::PathBuf::from("kiro.db"),
+        }
+    };
+    let store = Arc::new(CredentialStore::open(&db_path).unwrap_or_else(|e| {
+        tracing::error!("打开凭据库失败: {}", e);
+        std::process::exit(1);
+    }));
 
-    // 转换为按优先级排序的凭据列表
-    let mut credentials_list = credentials_config.into_sorted_credentials();
+    // 首次启动（库为空）：把 credentials.json 迁移入库（去重 + 跳过死号）。
+    match store.is_empty() {
+        Ok(true) => {
+            let json_creds = credentials_config.into_sorted_credentials();
+            if !json_creds.is_empty() {
+                match store.migrate_from_json(json_creds) {
+                    Ok(rep) => tracing::info!(
+                        "凭据已从 credentials.json 迁移入库: 导入 {}、去重跳过 {}、死号跳过 {}",
+                        rep.imported,
+                        rep.deduped,
+                        rep.skipped_dead
+                    ),
+                    Err(e) => {
+                        tracing::error!("凭据迁移失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!("检查凭据库失败: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    // 凭据真相源 = SQLite，按优先级载入。
+    let mut credentials_list = store.load_all().unwrap_or_else(|e| {
+        tracing::error!("从凭据库载入失败: {}", e);
+        std::process::exit(1);
+    });
 
     // 检查 KIRO_API_KEY 环境变量，自动创建 API Key 凭据
     if let Ok(kiro_api_key) = std::env::var("KIRO_API_KEY") {
-        if !kiro_api_key.is_empty() {
+        // 去重：库里已有同 kiroApiKey 的凭据则不重复注入（避免每次启动累积）。
+        let already = credentials_list
+            .iter()
+            .any(|c| c.kiro_api_key.as_deref() == Some(kiro_api_key.as_str()));
+        if !kiro_api_key.is_empty() && !already {
             tracing::info!("检测到 KIRO_API_KEY 环境变量，添加 API Key 凭据（最高优先级）");
             let api_key_cred = KiroCredentials {
                 kiro_api_key: Some(kiro_api_key),
@@ -137,7 +183,7 @@ async fn main() {
         credentials_list,
         proxy_config.clone(),
         Some(credentials_path.into()),
-        is_multiple_format,
+        Some(store),
     )
     .unwrap_or_else(|e| {
         tracing::error!("创建 Token 管理器失败: {}", e);
@@ -146,9 +192,11 @@ async fn main() {
     let token_manager = Arc::new(token_manager);
     let kiro_provider = KiroProvider::with_proxy(token_manager.clone(), proxy_config.clone());
 
-    // 初始化计费累计统计持久化：落盘到凭据缓存同目录的 billing_stats.json。
+    // 统一持久化到同目录的 kiro.db：计费累计 + 请求时序统计（与凭据/余额同库）。
     if let Some(dir) = token_manager.cache_dir() {
-        anthropic::init_billing_stats(dir.join("billing_stats.json"));
+        anthropic::init_billing_stats(dir.join("kiro.db"));
+        // 请求级时序统计：request_stats 表，保留 30 天，供 admin 出曲线。
+        stats::init(dir.join("kiro.db"), 30);
     }
 
     // 初始化 count_tokens 配置

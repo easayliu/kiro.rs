@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 /// 落盘防抖间隔：两次写盘至少间隔该时长。
@@ -36,8 +37,8 @@ pub struct BillingStats {
     /// 与 requests 之比即「截断命中率」，用于判断上游默认输出上限是否偏低。
     max_tokens_truncated: AtomicU64,
 
-    /// 落盘文件路径（未配置时不持久化，仅进程内累计）。
-    path: Mutex<Option<PathBuf>>,
+    /// SQLite 连接（kiro.db；未配置时不持久化，仅进程内累计）。
+    db: Mutex<Option<Connection>>,
     /// 上次落盘时间（用于 debounce）。
     last_save_at: Mutex<Option<Instant>>,
     /// 是否有未落盘的更新。
@@ -52,11 +53,30 @@ pub fn global() -> &'static BillingStats {
     GLOBAL.get_or_init(BillingStats::default)
 }
 
-/// 初始化持久化：设定落盘文件路径，并从磁盘加载已有累计值。
+/// 初始化持久化：打开 kiro.db 并加载已有累计值。
 ///
-/// 在进程启动时调用一次（通常在确定凭据缓存目录后）。重复调用会覆盖路径并重新加载。
+/// 在进程启动时调用一次。`path` 为统一的 kiro.db 路径。
 pub fn init_persistence(path: PathBuf) {
     global().init(path);
+}
+
+/// 打开 kiro.db 连接并建表（终身累计单行表）。
+fn open_db(path: &PathBuf) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS billing_totals (
+            id                   INTEGER PRIMARY KEY CHECK (id = 1),
+            requests             INTEGER NOT NULL DEFAULT 0,
+            actual_micro         INTEGER NOT NULL DEFAULT 0,
+            official_micro       INTEGER NOT NULL DEFAULT 0,
+            margin_micro         INTEGER NOT NULL DEFAULT 0,
+            max_tokens_truncated INTEGER NOT NULL DEFAULT 0
+        ) STRICT;",
+    )?;
+    Ok(conn)
 }
 
 /// 将 USD 金额换算为微美元（四舍五入）。
@@ -77,31 +97,61 @@ struct PersistedStats {
 }
 
 impl BillingStats {
-    /// 设定落盘路径并加载磁盘上已有累计值。
+    /// 打开 kiro.db、建表、加载已有累计值（表空时一次性从旧 billing_stats.json 迁移）。
     fn init(&self, path: PathBuf) {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            match serde_json::from_str::<PersistedStats>(&content) {
-                Ok(p) => {
-                    self.requests.store(p.requests, Ordering::Relaxed);
-                    self.actual_cost_micro
-                        .store(p.actual_cost_micro, Ordering::Relaxed);
-                    self.official_price_micro
-                        .store(p.official_price_micro, Ordering::Relaxed);
-                    self.margin_micro.store(p.margin_micro, Ordering::Relaxed);
-                    self.max_tokens_truncated
-                        .store(p.max_tokens_truncated, Ordering::Relaxed);
-                    tracing::info!(
-                        requests = p.requests,
-                        margin_usd = p.margin_micro as f64 / 1_000_000.0,
-                        "已从磁盘加载计费累计统计"
-                    );
-                }
-                Err(e) => tracing::warn!("解析计费统计缓存失败，将忽略: {}", e),
+        let conn = match open_db(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("计费统计库打开失败，仅进程内累计: {}", e);
+                return;
             }
+        };
+
+        // 1) 优先从表加载。
+        let loaded = conn
+            .query_row(
+                "SELECT requests, actual_micro, official_micro, margin_micro, max_tokens_truncated
+                 FROM billing_totals WHERE id = 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .unwrap_or(None);
+
+        if let Some((req, act, off, mar, trunc)) = loaded {
+            self.requests.store(req as u64, Ordering::Relaxed);
+            self.actual_cost_micro.store(act, Ordering::Relaxed);
+            self.official_price_micro.store(off, Ordering::Relaxed);
+            self.margin_micro.store(mar, Ordering::Relaxed);
+            self.max_tokens_truncated.store(trunc as u64, Ordering::Relaxed);
+            tracing::info!(requests = req, "已从 SQLite 加载计费累计统计");
+        } else if let Some(p) = path
+            .parent()
+            .and_then(|d| std::fs::read_to_string(d.join("billing_stats.json")).ok())
+            .and_then(|c| serde_json::from_str::<PersistedStats>(&c).ok())
+        {
+            // 2) 表空 + 旧 JSON 存在 → 一次性迁移。
+            self.requests.store(p.requests, Ordering::Relaxed);
+            self.actual_cost_micro.store(p.actual_cost_micro, Ordering::Relaxed);
+            self.official_price_micro.store(p.official_price_micro, Ordering::Relaxed);
+            self.margin_micro.store(p.margin_micro, Ordering::Relaxed);
+            self.max_tokens_truncated.store(p.max_tokens_truncated, Ordering::Relaxed);
+            tracing::info!(requests = p.requests, "已从 billing_stats.json 迁移计费累计入库");
         }
-        *self.path.lock() = Some(path);
+
+        *self.db.lock() = Some(conn);
         *self.last_save_at.lock() = Some(Instant::now());
         self.dirty.store(false, Ordering::Relaxed);
+        // 落一行，确保 id=1 存在（迁移或全新启动时）。
+        self.save();
     }
 
     /// 记录一次请求的计费结果。在每请求收尾路径调用一次。
@@ -125,8 +175,8 @@ impl BillingStats {
     fn save_debounced(&self) {
         self.dirty.store(true, Ordering::Relaxed);
 
-        // 未配置落盘路径则跳过（仅进程内累计）。
-        if self.path.lock().is_none() {
+        // 未配置持久化则跳过（仅进程内累计）。
+        if self.db.lock().is_none() {
             return;
         }
 
@@ -139,31 +189,38 @@ impl BillingStats {
         }
     }
 
-    /// 立即落盘当前累计值。
+    /// 立即落盘当前累计值（UPSERT 单行 id=1）。
     fn save(&self) {
-        let path = match self.path.lock().clone() {
-            Some(p) => p,
+        let guard = self.db.lock();
+        let conn = match guard.as_ref() {
+            Some(c) => c,
             None => return,
         };
 
-        let persisted = PersistedStats {
-            requests: self.requests.load(Ordering::Relaxed),
-            actual_cost_micro: self.actual_cost_micro.load(Ordering::Relaxed),
-            official_price_micro: self.official_price_micro.load(Ordering::Relaxed),
-            margin_micro: self.margin_micro.load(Ordering::Relaxed),
-            max_tokens_truncated: self.max_tokens_truncated.load(Ordering::Relaxed),
-        };
-
-        match serde_json::to_string_pretty(&persisted) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    tracing::warn!("保存计费统计缓存失败: {}", e);
-                } else {
-                    *self.last_save_at.lock() = Some(Instant::now());
-                    self.dirty.store(false, Ordering::Relaxed);
-                }
+        let r = conn.execute(
+            "INSERT INTO billing_totals
+                (id, requests, actual_micro, official_micro, margin_micro, max_tokens_truncated)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                requests = excluded.requests,
+                actual_micro = excluded.actual_micro,
+                official_micro = excluded.official_micro,
+                margin_micro = excluded.margin_micro,
+                max_tokens_truncated = excluded.max_tokens_truncated",
+            rusqlite::params![
+                self.requests.load(Ordering::Relaxed) as i64,
+                self.actual_cost_micro.load(Ordering::Relaxed),
+                self.official_price_micro.load(Ordering::Relaxed),
+                self.margin_micro.load(Ordering::Relaxed),
+                self.max_tokens_truncated.load(Ordering::Relaxed) as i64,
+            ],
+        );
+        match r {
+            Ok(_) => {
+                *self.last_save_at.lock() = Some(Instant::now());
+                self.dirty.store(false, Ordering::Relaxed);
             }
-            Err(e) => tracing::warn!("序列化计费统计失败: {}", e),
+            Err(e) => tracing::warn!("保存计费累计失败: {}", e),
         }
     }
 

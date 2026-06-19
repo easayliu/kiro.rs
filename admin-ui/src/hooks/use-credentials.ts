@@ -36,8 +36,15 @@ import {
   getDefaultConcurrencyLimit,
   setDefaultConcurrencyLimit,
   getBillingStats,
+  getStatsTimeseries,
+  getStatsSummary,
 } from '@/api/credentials'
-import type { AddCredentialRequest, UpsertProxyGroupRequest } from '@/types/api'
+import type {
+  AddCredentialRequest,
+  UpsertProxyGroupRequest,
+  StatsBucket,
+  StatsGroupBy,
+} from '@/types/api'
 
 // 查询当前调用方角色
 export function useMe() {
@@ -420,5 +427,51 @@ export function useBillingStats() {
     queryKey: ['billing-stats'],
     queryFn: getBillingStats,
     refetchInterval: 30000,
+  })
+}
+
+// 时序曲线（hours 或自定义 from/to；可叠加 models/credentials 过滤，60 秒轮询）
+export function useStatsTimeseries(params: {
+  hours?: number
+  from?: number
+  to?: number
+  bucket: StatsBucket
+  groupBy: StatsGroupBy
+  models?: string[]
+  credentials?: number[]
+  enabled?: boolean
+}) {
+  const mk = (params.models ?? []).join(',')
+  const ck = (params.credentials ?? []).join(',')
+  return useQuery({
+    queryKey: [
+      'stats-timeseries',
+      params.hours ?? null,
+      params.from ?? null,
+      params.to ?? null,
+      params.bucket,
+      params.groupBy,
+      mk,
+      ck,
+    ],
+    queryFn: () => getStatsTimeseries(params),
+    enabled: params.enabled ?? true,
+    refetchInterval: 60000,
+  })
+}
+
+// 区间汇总（hours 或自定义 from/to；可叠加 models/credentials 过滤，60 秒轮询）
+export function useStatsSummary(
+  range: { hours?: number; from?: number; to?: number },
+  filters?: { models?: string[]; credentials?: number[] },
+  enabled = true,
+) {
+  const mk = (filters?.models ?? []).join(',')
+  const ck = (filters?.credentials ?? []).join(',')
+  return useQuery({
+    queryKey: ['stats-summary', range.hours ?? null, range.from ?? null, range.to ?? null, mk, ck],
+    queryFn: () => getStatsSummary(range, filters),
+    enabled,
+    refetchInterval: 60000,
   })
 }

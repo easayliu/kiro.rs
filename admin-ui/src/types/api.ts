@@ -49,6 +49,10 @@ export interface CredentialStatusItem {
   concurrencyCurrent?: number
   /** overage（超额计费）上次下发状态（不存在=从未下发，状态未知） */
   overage?: boolean
+  /** 缓存的余额（来自服务端 balance_cache，非实时查询；用于列表直接内联显示） */
+  balance?: BalanceResponse
+  /** 余额缓存时间（Unix 秒） */
+  balanceCachedAt?: number
 }
 
 // 余额响应
@@ -232,4 +236,55 @@ export interface BillingStatsResponse {
   official_price_usd: number
   /** 累计毛利（USD，official − actual，可为负） */
   margin_usd: number
+}
+
+// ━━━━━━━━━━ 时序统计（曲线 / 分析） ━━━━━━━━━━
+
+/** 曲线分桶粒度 */
+export type StatsBucket = 'hour' | 'day'
+/** 曲线分组维度 */
+export type StatsGroupBy = 'none' | 'model' | 'credential'
+
+/** 一个时间桶的聚合点 */
+export interface StatsTimeBucket {
+  /** 桶起始时间（Unix 秒） */
+  bucket: number
+  /** 分组键（分组时存在）：model 名 或 credential id */
+  group?: string
+  requests: number
+  actual_usd: number
+  official_usd: number
+  margin_usd: number
+  input_tokens: number
+  cache_read: number
+  cache_creation: number
+  output_tokens: number
+  /** 该桶内 max_tokens 截断请求数 */
+  truncated: number
+  avg_ttft_ms: number
+  avg_elapsed_ms: number
+}
+
+/** 一个分组（或全量）的区间汇总 */
+export interface StatGroup {
+  /** 分组键：model 名 / credential id；全量为空串 */
+  key: string
+  requests: number
+  actual_usd: number
+  official_usd: number
+  margin_usd: number
+  input_tokens: number
+  cache_read: number
+  cache_creation: number
+  output_tokens: number
+  truncated: number
+  avg_ttft_ms: number
+  avg_elapsed_ms: number
+}
+
+/** 区间汇总：全量 + 按模型 + 按凭据 */
+export interface StatsSummaryResponse {
+  total: StatGroup
+  by_model: StatGroup[]
+  by_credential: StatGroup[]
 }

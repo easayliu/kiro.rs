@@ -34,8 +34,11 @@ parking_lot = "0.12"  # 高性能同步原语
 subtle = "2.6"        # 常量时间比较（防止时序攻击）
 rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断
-rusqlite = { version = "0.34", features = ["bundled"], optional = true }
+rusqlite = { version = "0.34", features = ["bundled"] }  # 核心：凭据 + 时序统计持久化
 
 [features]
-default = ["import-kiro-cli"]
-import-kiro-cli = ["dep:rusqlite"]
+default = ["import-kiro-cli", "stats"]
+# 从 kiro-cli SQLite 导入凭据（gate src/import.rs）。rusqlite 已是核心依赖。
+import-kiro-cli = []
+# 请求级时序统计（SQLite 落盘，供 admin 出成本/用量曲线）。gate src/stats。
+stats = []

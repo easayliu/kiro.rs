@@ -97,6 +97,13 @@ pub struct CredentialStatusItem {
     /// overage（超额计费）上次下发状态（None=从未下发，前端显示为未知）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overage: Option<bool>,
+    /// 缓存的余额（来自 balance_cache，**非实时**上游查询；可能为旧值）。
+    /// 前端可直接内联显示，无需逐个点开触发查询。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<BalanceResponse>,
+    /// 余额缓存时间（Unix 秒），配合前端显示「更新于 X 前」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance_cached_at: Option<i64>,
 }
 
 // ============ 操作请求 ============

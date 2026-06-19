@@ -1,7 +1,6 @@
 //! Admin API 业务逻辑服务
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -32,6 +31,22 @@ use super::types::{
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
 
+/// 打开 kiro.db 连接并建余额缓存表（data 为上游余额响应 JSON）。
+fn open_balance_db(path: &std::path::Path) -> rusqlite::Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS balance_cache (
+            credential_id INTEGER PRIMARY KEY,
+            cached_at     INTEGER NOT NULL,
+            data          TEXT    NOT NULL
+        ) STRICT;",
+    )?;
+    Ok(conn)
+}
+
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedBalance {
@@ -48,22 +63,28 @@ pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     cache_tracker: Arc<CacheTracker>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
-    cache_path: Option<PathBuf>,
+    /// 余额缓存持久化连接（kiro.db）。None 时仅进程内缓存。
+    db: Option<Mutex<rusqlite::Connection>>,
 }
 
 impl AdminService {
     pub fn new(token_manager: Arc<MultiTokenManager>, cache_tracker: Arc<CacheTracker>) -> Self {
-        let cache_path = token_manager
-            .cache_dir()
-            .map(|d| d.join("kiro_balance_cache.json"));
+        let dir = token_manager.cache_dir();
+        let db = dir.as_ref().and_then(|d| match open_balance_db(&d.join("kiro.db")) {
+            Ok(c) => Some(Mutex::new(c)),
+            Err(e) => {
+                tracing::error!("余额缓存库打开失败，仅进程内缓存: {}", e);
+                None
+            }
+        });
 
-        let balance_cache = Self::load_balance_cache_from(&cache_path);
+        let balance_cache = Self::load_balance_cache(&db, dir.as_deref());
 
         Self {
             token_manager,
             cache_tracker,
             balance_cache: Mutex::new(balance_cache),
-            cache_path,
+            db,
         }
     }
 
@@ -71,10 +92,21 @@ impl AdminService {
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
 
+        // 内联缓存余额：直接读 balance_cache 快照（不打上游），前端免逐个查询。
+        let balances: HashMap<u64, (BalanceResponse, i64)> = {
+            let cache = self.balance_cache.lock();
+            cache
+                .iter()
+                .map(|(id, c)| (*id, (c.data.clone(), c.cached_at as i64)))
+                .collect()
+        };
+
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
-            .map(|entry| CredentialStatusItem {
+            .map(|entry| {
+                let cached_balance = balances.get(&entry.id);
+                CredentialStatusItem {
                 id: entry.id,
                 priority: entry.priority,
                 disabled: entry.disabled,
@@ -98,6 +130,9 @@ impl AdminService {
                 concurrency_limit: entry.concurrency_limit,
                 concurrency_current: entry.concurrency_current,
                 overage: entry.overage,
+                balance: cached_balance.map(|(b, _)| b.clone()),
+                balance_cached_at: cached_balance.map(|(_, t)| *t),
+                }
             })
             .collect();
 
@@ -739,58 +774,103 @@ impl AdminService {
 
     // ============ 余额缓存持久化 ============
 
-    fn load_balance_cache_from(cache_path: &Option<PathBuf>) -> HashMap<u64, CachedBalance> {
-        let path = match cache_path {
-            Some(p) => p,
+    /// 从 kiro.db 载入余额缓存（丢弃过期项）。表空时一次性从旧 kiro_balance_cache.json 迁移。
+    fn load_balance_cache(
+        db: &Option<Mutex<rusqlite::Connection>>,
+        dir: Option<&std::path::Path>,
+    ) -> HashMap<u64, CachedBalance> {
+        let db = match db {
+            Some(d) => d,
             None => return HashMap::new(),
         };
+        let conn = db.lock();
 
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => return HashMap::new(),
-        };
-
-        // 文件中使用字符串 key 以兼容 JSON 格式
-        let map: HashMap<String, CachedBalance> = match serde_json::from_str(&content) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("解析余额缓存失败，将忽略: {}", e);
-                return HashMap::new();
-            }
-        };
-
-        let now = Utc::now().timestamp() as f64;
-        map.into_iter()
-            .filter_map(|(k, v)| {
-                let id = k.parse::<u64>().ok()?;
-                // 丢弃超过 TTL 的条目
-                if (now - v.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    Some((id, v))
-                } else {
-                    None
+        // 一次性迁移：表空 + 旧 JSON 存在 → 导入。
+        let empty = conn
+            .query_row("SELECT COUNT(*) FROM balance_cache", [], |r| r.get::<_, i64>(0))
+            .map(|n| n == 0)
+            .unwrap_or(true);
+        if empty {
+            if let Some(content) =
+                dir.and_then(|d| std::fs::read_to_string(d.join("kiro_balance_cache.json")).ok())
+            {
+                if let Ok(map) = serde_json::from_str::<HashMap<String, CachedBalance>>(&content) {
+                    for (k, v) in &map {
+                        if let (Ok(id), Ok(data)) = (k.parse::<u64>(), serde_json::to_string(&v.data))
+                        {
+                            let _ = conn.execute(
+                                "INSERT OR REPLACE INTO balance_cache (credential_id, cached_at, data) VALUES (?1,?2,?3)",
+                                rusqlite::params![id as i64, v.cached_at as i64, data],
+                            );
+                        }
+                    }
+                    if !map.is_empty() {
+                        tracing::info!("已从 kiro_balance_cache.json 迁移 {} 条余额缓存入库", map.len());
+                    }
                 }
-            })
-            .collect()
+            }
+        }
+
+        // 全部载入（**不**按 TTL 丢弃）：持久化的余额重启后仍要能内联显示「最后已知值」。
+        // TTL 仅用于 get_balance 决定是否去上游重拉——过期项留在内存供显示，下次显式查询时刷新。
+        let mut out = HashMap::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT credential_id, cached_at, data FROM balance_cache")
+        {
+            let rows = stmt.query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let cached_at: i64 = row.get(1)?;
+                let data: String = row.get(2)?;
+                Ok((id as u64, cached_at, data))
+            });
+            if let Ok(rows) = rows {
+                for r in rows.flatten() {
+                    let (id, cached_at, data) = r;
+                    if let Ok(parsed) = serde_json::from_str::<BalanceResponse>(&data) {
+                        out.insert(id, CachedBalance { cached_at: cached_at as f64, data: parsed });
+                    }
+                }
+            }
+        }
+        out
     }
 
+    /// 把当前余额缓存全量落库（事务内 DELETE + INSERT，数据量为凭据数级别）。
     fn save_balance_cache(&self) {
-        let path = match &self.cache_path {
-            Some(p) => p,
+        let db = match &self.db {
+            Some(d) => d,
             None => return,
         };
 
-        // 持有锁期间完成序列化和写入，防止并发损坏
-        let cache = self.balance_cache.lock();
-        let map: HashMap<String, &CachedBalance> =
-            cache.iter().map(|(k, v)| (k.to_string(), v)).collect();
+        let snapshot: Vec<(u64, i64, String)> = {
+            let cache = self.balance_cache.lock();
+            cache
+                .iter()
+                .filter_map(|(id, v)| {
+                    serde_json::to_string(&v.data)
+                        .ok()
+                        .map(|data| (*id, v.cached_at as i64, data))
+                })
+                .collect()
+        };
 
-        match serde_json::to_string_pretty(&map) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
-                    tracing::warn!("保存余额缓存失败: {}", e);
-                }
+        let mut conn = db.lock();
+        let tx = match conn.transaction() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("余额缓存写事务失败: {}", e);
+                return;
             }
-            Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
+        };
+        if tx.execute("DELETE FROM balance_cache", []).is_ok() {
+            for (id, cached_at, data) in &snapshot {
+                let _ = tx.execute(
+                    "INSERT INTO balance_cache (credential_id, cached_at, data) VALUES (?1,?2,?3)",
+                    rusqlite::params![*id as i64, cached_at, data],
+                );
+            }
+        }
+        if let Err(e) = tx.commit() {
+            tracing::warn!("保存余额缓存失败: {}", e);
         }
     }
 

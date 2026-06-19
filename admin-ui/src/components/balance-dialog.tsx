@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import {
   Dialog,
   DialogContent,
@@ -7,15 +8,25 @@ import {
 import { Progress } from '@/components/ui/progress'
 import { useCredentialBalance } from '@/hooks/use-credentials'
 import { parseError } from '@/lib/utils'
+import type { BalanceResponse } from '@/types/api'
 
 interface BalanceDialogProps {
   credentialId: number | null
   open: boolean
   onOpenChange: (open: boolean) => void
+  /** 查询到最新余额后回传父组件（用于刷新卡片的余额值与时间戳） */
+  onBalanceLoaded?: (id: number, balance: BalanceResponse) => void
 }
 
-export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialogProps) {
+export function BalanceDialog({ credentialId, open, onOpenChange, onBalanceLoaded }: BalanceDialogProps) {
   const { data: balance, isLoading, error } = useCredentialBalance(credentialId)
+
+  // 余额查询成功 → 回传父组件，让卡片同步刷新（值 + 更新时间）
+  useEffect(() => {
+    if (balance && credentialId != null) {
+      onBalanceLoaded?.(credentialId, balance)
+    }
+  }, [balance, credentialId, onBalanceLoaded])
 
   const formatDate = (timestamp: number | null) => {
     if (!timestamp) return '未知'

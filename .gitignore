@@ -11,3 +11,14 @@
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json
+/billing_stats.json
+# 请求时序统计 SQLite（含 WAL/SHM 旁文件）
+/stats.db
+/stats.db-wal
+/stats.db-shm
+/credentials.db
+/credentials.db-wal
+/credentials.db-shm
+/kiro.db
+/kiro.db-wal
+/kiro.db-shm

@@ -23,6 +23,10 @@ import type {
   DefaultConcurrencyLimitResponse,
   MeResponse,
   BillingStatsResponse,
+  StatsBucket,
+  StatsGroupBy,
+  StatsTimeBucket,
+  StatsSummaryResponse,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -337,5 +341,46 @@ export async function setDefaultConcurrencyLimit(
 // 获取计费累计统计
 export async function getBillingStats(): Promise<BillingStatsResponse> {
   const { data } = await api.get<BillingStatsResponse>('/billing-stats')
+  return data
+}
+
+// 获取时序曲线（按 model / credential 分组，可叠加 models/credentials 过滤）
+export async function getStatsTimeseries(params: {
+  hours?: number
+  from?: number
+  to?: number
+  bucket: StatsBucket
+  groupBy: StatsGroupBy
+  models?: string[]
+  credentials?: number[]
+}): Promise<StatsTimeBucket[]> {
+  const { data } = await api.get<StatsTimeBucket[]>('/stats/timeseries', {
+    params: {
+      hours: params.hours,
+      from: params.from,
+      to: params.to,
+      bucket: params.bucket,
+      group_by: params.groupBy,
+      models: params.models?.length ? params.models.join(',') : undefined,
+      credentials: params.credentials?.length ? params.credentials.join(',') : undefined,
+    },
+  })
+  return data
+}
+
+// 获取区间汇总（全量 + 按模型 + 按凭据，可叠加 models/credentials 过滤）
+export async function getStatsSummary(
+  range: { hours?: number; from?: number; to?: number },
+  filters?: { models?: string[]; credentials?: number[] },
+): Promise<StatsSummaryResponse> {
+  const { data } = await api.get<StatsSummaryResponse>('/stats/summary', {
+    params: {
+      hours: range.hours,
+      from: range.from,
+      to: range.to,
+      models: filters?.models?.length ? filters.models.join(',') : undefined,
+      credentials: filters?.credentials?.length ? filters.credentials.join(',') : undefined,
+    },
+  })
   return data
 }

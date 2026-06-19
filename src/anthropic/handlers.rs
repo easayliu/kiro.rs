@@ -518,6 +518,7 @@ async fn handle_stream_request(
     // TTFT 原点钉在「向上游发出请求」时刻，覆盖上游等首 token 的等待（见 ApiCallResult）。
     ctx.set_ttft_origin(api_result.upstream_request_at);
     ctx.set_cache_usage(cache_context);
+    ctx.set_credential_id(api_result.credential_id as i64);
     // 计费完成后（流末尾 contextUsageEvent）把缩放后的 billed 累计回写缓存，供下次命中守恒。
     ctx.set_billing_writeback(cache_tracker.clone(), cache_writeback);
 
@@ -1058,6 +1059,22 @@ async fn handle_non_stream_request(
     // 进程维度累计实际成本/官方价/毛利，供 admin 只读接口查询（无锁原子，零热路径开销）。
     let truncated = stop_reason == "max_tokens";
     super::billing_stats().record(actual, official, margin, truncated);
+    // 请求级时序统计（非流式无 TTFT，记 0）。
+    crate::stats::record(crate::stats::RequestStat {
+        ts: 0,
+        model: model.to_string(),
+        credential_id: api_result.credential_id as i64,
+        actual_micro: (actual * 1_000_000.0).round() as i64,
+        official_micro: (official * 1_000_000.0).round() as i64,
+        margin_micro: (margin * 1_000_000.0).round() as i64,
+        input_tokens: billing.uncached_input_tokens.max(1) as i64,
+        cache_read: billing.cache_read_input_tokens as i64,
+        cache_creation: billing.cache_creation_input_tokens as i64,
+        output_tokens: output_tokens as i64,
+        ttft_ms: 0,
+        elapsed_ms: request_start.elapsed().as_millis() as i64,
+        truncated,
+    });
     tracing::info!(
         model = %model,
         input_tokens = billed_input_tokens,
@@ -1362,6 +1379,7 @@ async fn handle_stream_request_buffered(
     // TTFT 原点钉在「向上游发出请求」时刻，覆盖上游等首 token 的等待（见 ApiCallResult）。
     ctx.set_ttft_origin(api_result.upstream_request_at);
     ctx.set_cache_usage(cache_context);
+    ctx.set_credential_id(api_result.credential_id as i64);
     // 计费完成后（流末尾 contextUsageEvent）把缩放后的 billed 累计回写缓存，供下次命中守恒。
     ctx.set_billing_writeback(cache_tracker.clone(), cache_writeback);
 

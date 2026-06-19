@@ -17,8 +17,12 @@ import {
   CircleDollarSign,
   Boxes,
   X,
+  Scissors,
+  Clock,
+  KeyRound,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { LineChart, Line } from 'recharts'
 import { RelativeTime } from '@/components/relative-time'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
@@ -41,7 +45,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
+import type { CredentialStatusItem, BalanceResponse, StatGroup } from '@/types/api'
 import {
   useSetDisabled,
   useSetPriority,
@@ -66,6 +70,10 @@ interface CredentialCardProps {
   onToggleSelect: () => void
   balance: BalanceResponse | null
   loadingBalance: boolean
+  /** 近 N 天该凭据的用量聚合（来自 stats summary by_credential），无则不显示用量行 */
+  usage?: StatGroup
+  /** 近 N 天每桶平均首字 TTFT 序列（来自 stats timeseries by_credential），用于 sparkline */
+  ttftSeries?: number[]
 }
 
 // 计算生效的 RPM 上限：凭据级 0 / 正整数覆盖全局；undefined 回退全局；
@@ -85,6 +93,30 @@ function resolveEffectiveConcurrency(credLimit: number | undefined, defaultLimit
   if (defaultLimit === 0) return 0
   if (typeof defaultLimit === 'number' && defaultLimit > 0) return defaultLimit
   return 0
+}
+
+// 小额 USD 简短格式（卡片用）
+function fmtUsd(v: number): string {
+  const abs = Math.abs(v)
+  const d = abs >= 100 ? 1 : abs >= 1 ? 2 : 3
+  return `${v < 0 ? '-' : ''}$${abs.toFixed(d)}`
+}
+// 毫秒简短：>1s 显示秒
+function fmtMs(v: number): string {
+  return v >= 1000 ? `${(v / 1000).toFixed(1)}s` : `${Math.round(v)}ms`
+}
+// 认证方式短标签
+function authLabel(m?: string | null): string | null {
+  if (!m) return null
+  const v = m.toLowerCase()
+  if (v === 'api_key' || v === 'apikey') return 'API'
+  if (v === 'idc' || v === 'builder-id' || v === 'iam') return 'IdC'
+  if (v === 'social') return 'Social'
+  return m
+}
+// unix 秒 → ISO（喂给 RelativeTime）；无则 undefined
+function unixToIso(sec?: number | null): string | undefined {
+  return typeof sec === 'number' ? new Date(sec * 1000).toISOString() : undefined
 }
 
 // 把剩余毫秒格式化为简短中文（"45s" / "2m" / "1h12m"）
@@ -107,6 +139,8 @@ export function CredentialCard({
   onToggleSelect,
   balance,
   loadingBalance,
+  usage,
+  ttftSeries,
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
@@ -300,6 +334,21 @@ export function CredentialCard({
   const tier = resolveTier(balance?.subscriptionTitle)
   const displayName = credential.email || `凭据 #${credential.id}`
   const initial = (credential.email?.[0] || '#').toUpperCase()
+  // 额度重置：剩余天数（粗粒度，未来时间）
+  const resetInDays =
+    balance?.nextResetAt != null
+      ? Math.max(0, Math.ceil((balance.nextResetAt * 1000 - Date.now()) / 86_400_000))
+      : null
+  // 截断率（近 N 天）
+  const truncRate =
+    usage && usage.requests > 0 ? (usage.truncated / usage.requests) * 100 : 0
+  // Token 健康：剩余有效期（ms）。仅在临期/过期/刷新失败时高亮提示，正常态不占行。
+  const expiryMs = credential.expiresAt
+    ? new Date(credential.expiresAt).getTime() - Date.now()
+    : null
+  const tokenIssue =
+    (credential.refreshFailureCount ?? 0) > 0 ||
+    (expiryMs != null && expiryMs < 30 * 60 * 1000)
 
   const throttledRemainingMs = credential.throttledUntil
     ? Math.max(0, Date.parse(credential.throttledUntil) - Date.now())
@@ -419,6 +468,15 @@ export function CredentialCard({
             </h3>
             <div className="mt-1 flex min-w-0 items-center gap-x-2 overflow-hidden whitespace-nowrap font-mono text-2xs text-muted-foreground">
               <span className="tnum shrink-0">#{String(credential.id).padStart(3, '0')}</span>
+              {authLabel(credential.authMethod) && (
+                <span
+                  className="inline-flex shrink-0 items-center gap-0.5"
+                  title={`认证方式: ${credential.authMethod}`}
+                >
+                  <KeyRound className="h-2.5 w-2.5 shrink-0" />
+                  {authLabel(credential.authMethod)}
+                </span>
+              )}
               {balance?.subscriptionTitle && (
                 <span className={cn('shrink-0 font-medium', tier.labelText)}>{balance.subscriptionTitle}</span>
               )}
@@ -536,6 +594,21 @@ export function CredentialCard({
                 />
               )}
             </div>
+            {/* 余额新鲜度 + 额度重置（缓存值，非实时；让用户知道数据时效） */}
+            {balance && (credential.balanceCachedAt || resetInDays != null) && (
+              <div className="mt-1 flex items-center gap-1.5 font-mono text-[11px] text-muted-foreground">
+                {credential.balanceCachedAt && (
+                  <span title="余额为缓存值，非实时；点「余额」可拉取最新">
+                    更新于 <RelativeTime value={unixToIso(credential.balanceCachedAt)} />
+                  </span>
+                )}
+                {credential.balanceCachedAt && resetInDays != null && (
+                  <span className="text-muted-foreground/40">·</span>
+                )}
+                {resetInDays != null && <span title="额度重置时间">{resetInDays}天后重置</span>}
+              </div>
+            )}
+
             {/* 超额行固定占位：无超额时也保留高度，保证各卡片元信息行垂直对齐 */}
             <div className="mt-1 flex h-4 items-center gap-1.5 text-[11px] text-warn">
               {balance && hasActualOverage && (
@@ -562,8 +635,56 @@ export function CredentialCard({
             </div>
           </div>
 
-          {/* Meta — 两行语义分组：① 身份/活动  ② 限流器（仅生效时显示，整体换行不孤字） */}
+          {/* Meta — 语义分组：⓪ 近7天用量  ① 身份/活动  ② 限流器  ③ Token健康(异常才显示) */}
           <div className="space-y-1 text-xs">
+            {/* Row ⓪ — 近 7 天用量：请求 · 成本 · 截断率 · 首字（有统计才显示） */}
+            {usage && usage.requests > 0 && (
+              <div
+                className="flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-muted-foreground"
+                title="近 7 天用量"
+              >
+                <span className="inline-flex items-center gap-1" title="近7天请求数">
+                  <Activity className="h-3 w-3" />
+                  <span className="text-foreground">{usage.requests}</span>
+                </span>
+                <span className="text-muted-foreground/40">·</span>
+                <span className="inline-flex items-center gap-1" title="近7天实际成本">
+                  <CircleDollarSign className="h-3 w-3" />
+                  <span className="text-foreground">{fmtUsd(usage.actual_usd)}</span>
+                </span>
+                <span className="text-muted-foreground/40">·</span>
+                <span
+                  className={cn('inline-flex items-center gap-1', truncRate >= 10 && 'text-warn')}
+                  title="近7天截断率（stop_reason=max_tokens）"
+                >
+                  <Scissors className="h-3 w-3" />
+                  {truncRate.toFixed(0)}%
+                </span>
+                <span className="text-muted-foreground/40">·</span>
+                <span className="inline-flex items-center gap-1" title="近7天首字 TTFT 趋势 / 平均">
+                  {ttftSeries && ttftSeries.length >= 2 ? (
+                    <LineChart
+                      width={56}
+                      height={16}
+                      data={ttftSeries.map((v, i) => ({ i, v }))}
+                      margin={{ top: 3, right: 1, bottom: 3, left: 1 }}
+                    >
+                      <Line
+                        type="monotone"
+                        dataKey="v"
+                        stroke="#f59e0b"
+                        strokeWidth={1.5}
+                        dot={false}
+                        isAnimationActive={false}
+                      />
+                    </LineChart>
+                  ) : (
+                    <Clock className="h-3 w-3" />
+                  )}
+                  {fmtMs(usage.avg_ttft_ms)}
+                </span>
+              </div>
+            )}
             {/* Row ① — 优先级 · 成功/失败 · 最近使用 */}
             <div className="flex items-center gap-x-2">
             {/* 优先级（可编辑） */}
@@ -657,6 +778,32 @@ export function CredentialCard({
                     <Activity className="h-3 w-3" />
                     {concurrencyCurrent}/{effectiveConcurrency}
                   </span>
+                )}
+              </div>
+            )}
+
+            {/* Row ③ — Token 健康：仅在临期/过期/刷新失败时显示（正常态不占行） */}
+            {tokenIssue && (
+              <div className="flex items-center gap-x-2 font-mono">
+                {expiryMs != null && (
+                  <span
+                    className={cn(
+                      'inline-flex items-center gap-1',
+                      expiryMs <= 0 ? 'text-bad' : 'text-warn',
+                    )}
+                    title="Token 过期时间"
+                  >
+                    <Clock className="h-3 w-3" />
+                    {expiryMs <= 0 ? 'token 已过期' : `token ${formatRemaining(expiryMs)}后过期`}
+                  </span>
+                )}
+                {(credential.refreshFailureCount ?? 0) > 0 && (
+                  <>
+                    <span className="text-muted-foreground/40">·</span>
+                    <span className="text-bad" title="Token 刷新连续失败次数">
+                      刷新失败 {credential.refreshFailureCount}
+                    </span>
+                  </>
                 )}
               </div>
             )}

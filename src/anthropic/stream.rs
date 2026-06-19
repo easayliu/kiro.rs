@@ -672,6 +672,8 @@ pub struct StreamContext {
     /// 一旦为 true，说明思考经独立事件下发，`assistantResponseEvent` 的正文即纯文本，
     /// 无需再走 `<thinking>` 文本标签扫描（那是老 CodeWhisperer 端点的内联格式）。
     reasoning_seen: bool,
+    /// 命中的凭据 id（由 handler 注入），用于按凭据维度的时序统计。
+    credential_id: Option<i64>,
 }
 
 impl StreamContext {
@@ -706,7 +708,13 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
             reasoning_seen: false,
+            credential_id: None,
         }
+    }
+
+    /// 注入命中的凭据 id（供按凭据维度的时序统计）。
+    pub fn set_credential_id(&mut self, id: i64) {
+        self.credential_id = Some(id);
     }
 
     /// 注入 prompt caching 结果
@@ -1463,6 +1471,22 @@ impl StreamContext {
             .first_byte_at
             .map(|t| t.saturating_duration_since(ttft_base).as_millis() as u64)
             .unwrap_or(0);
+        // 请求级时序统计（非阻塞入队，供 admin 出曲线/分析）。
+        crate::stats::record(crate::stats::RequestStat {
+            ts: 0,
+            model: self.model.clone(),
+            credential_id: self.credential_id.unwrap_or(0),
+            actual_micro: (actual * 1_000_000.0).round() as i64,
+            official_micro: (official * 1_000_000.0).round() as i64,
+            margin_micro: (margin * 1_000_000.0).round() as i64,
+            input_tokens: billing.uncached_input_tokens.max(1) as i64,
+            cache_read: billing.cache_read_input_tokens as i64,
+            cache_creation: billing.cache_creation_input_tokens as i64,
+            output_tokens: self.output_tokens as i64,
+            ttft_ms: ttft_ms as i64,
+            elapsed_ms: self.start.elapsed().as_millis() as i64,
+            truncated,
+        });
         tracing::info!(
             model = %self.model,
             input_tokens = billing.uncached_input_tokens.max(1),
@@ -1544,6 +1568,11 @@ impl BufferedStreamContext {
     /// 设置 TTFT 计时原点（透传到内部 StreamContext）
     pub fn set_ttft_origin(&mut self, origin: Instant) {
         self.inner.set_ttft_origin(origin);
+    }
+
+    /// 注入命中的凭据 id（透传到内部 StreamContext，用于按凭据维度的时序统计）
+    pub fn set_credential_id(&mut self, id: i64) {
+        self.inner.set_credential_id(id);
     }
 
     /// 标记上游首字节到达时刻（透传到内部 StreamContext，用于 TTFT 统计）
