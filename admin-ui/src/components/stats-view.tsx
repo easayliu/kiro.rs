@@ -12,7 +12,8 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
-import { Activity, Check, ChevronDown, CircleDollarSign, Clock, Scissors, Search } from 'lucide-react'
+import { useQueryClient } from '@tanstack/react-query'
+import { Activity, Check, ChevronDown, CircleDollarSign, Clock, RefreshCw, Scissors, Search } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useCredentials, useStatsSummary, useStatsTimeseries } from '@/hooks/use-credentials'
 import type { StatGroup, StatsBucket } from '@/types/api'
@@ -116,8 +117,14 @@ export function StatsView() {
     return { tsRange: { hours: r.hours }, bucket: r.bucket }
   }, [range, customFrom, customTo])
 
+  const queryClient = useQueryClient()
+  const refresh = () => {
+    queryClient.invalidateQueries({ queryKey: ['stats-timeseries'] })
+    queryClient.invalidateQueries({ queryKey: ['stats-summary'] })
+  }
+
   const filters = { models: modelFilter, credentials: credFilter }
-  const { data: series = [], isLoading } = useStatsTimeseries({
+  const { data: series = [], isLoading, isFetching } = useStatsTimeseries({
     ...tsRange,
     bucket,
     groupBy: 'none',
@@ -164,6 +171,14 @@ export function StatsView() {
           <div className="-mx-1 max-w-full overflow-x-auto px-1 no-scrollbar">
             <SegBar value={range} options={RANGE_OPTIONS} onChange={setRange} />
           </div>
+          <button
+            onClick={refresh}
+            disabled={isFetching}
+            title="刷新统计"
+            className="inline-flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-lg border border-border text-muted-foreground transition-colors hover:text-foreground disabled:cursor-default disabled:opacity-60"
+          >
+            <RefreshCw className={cn('h-4 w-4', isFetching && 'animate-spin')} />
+          </button>
           {range === 'custom' && (
             <div className="flex flex-col gap-1.5 text-xs sm:flex-row sm:items-center">
               <input
@@ -456,7 +471,83 @@ function GroupFilter({
   )
 }
 
-// 明细表
+// 明细表（列排序 + 分页）
+type TableSortKey =
+  | 'name'
+  | 'requests'
+  | 'actual_usd'
+  | 'official_usd'
+  | 'margin_usd'
+  | 'output_tokens'
+  | 'trunc'
+  | 'avg_ttft_ms'
+const TABLE_PAGE_SIZE = 10
+
+const truncRateOf = (r: StatGroup) => (r.requests > 0 ? (r.truncated / r.requests) * 100 : 0)
+
+function pageList(current: number, total: number): (number | 'dots')[] {
+  if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1)
+  const out: (number | 'dots')[] = [1]
+  const l = Math.max(2, current - 1)
+  const r = Math.min(total - 1, current + 1)
+  if (l > 2) out.push('dots')
+  for (let i = l; i <= r; i++) out.push(i)
+  if (r < total - 1) out.push('dots')
+  out.push(total)
+  return out
+}
+
+function TablePager({
+  page,
+  totalPages,
+  onChange,
+}: {
+  page: number
+  totalPages: number
+  onChange: (p: number) => void
+}) {
+  const btn = 'inline-flex h-7 min-w-7 cursor-pointer items-center justify-center rounded-md border px-1.5 text-xs transition-colors'
+  return (
+    <div className="mt-3 flex flex-wrap items-center justify-center gap-1">
+      <button
+        onClick={() => onChange(Math.max(1, page - 1))}
+        disabled={page === 1}
+        className={cn(btn, 'border-border text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-40')}
+      >
+        ‹
+      </button>
+      {pageList(page, totalPages).map((p, i) =>
+        p === 'dots' ? (
+          <span key={`d${i}`} className="inline-flex h-7 min-w-7 items-center justify-center text-xs text-muted-foreground/50">
+            …
+          </span>
+        ) : (
+          <button
+            key={p}
+            onClick={() => onChange(p)}
+            className={cn(
+              btn,
+              'tnum',
+              p === page
+                ? 'border-primary bg-primary text-primary-foreground'
+                : 'border-border text-muted-foreground hover:bg-muted hover:text-foreground',
+            )}
+          >
+            {p}
+          </button>
+        ),
+      )}
+      <button
+        onClick={() => onChange(Math.min(totalPages, page + 1))}
+        disabled={page === totalPages}
+        className={cn(btn, 'border-border text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-40')}
+      >
+        ›
+      </button>
+    </div>
+  )
+}
+
 function BreakdownTable({
   title,
   rows,
@@ -466,24 +557,81 @@ function BreakdownTable({
   rows: StatGroup[]
   labelOf: (key: string) => string
 }) {
+  const [sortKey, setSortKey] = useState<TableSortKey>('official_usd')
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
+  const [page, setPage] = useState(1)
+
+  const sorted = useMemo(() => {
+    const val = (r: StatGroup): number | string =>
+      sortKey === 'name'
+        ? labelOf(r.key)
+        : sortKey === 'trunc'
+          ? truncRateOf(r)
+          : (r[sortKey] as number)
+    return [...rows].sort((a, b) => {
+      const va = val(a)
+      const vb = val(b)
+      const c =
+        typeof va === 'string' || typeof vb === 'string'
+          ? String(va).localeCompare(String(vb))
+          : va - vb
+      return sortDir === 'asc' ? c : -c
+    })
+  }, [rows, sortKey, sortDir, labelOf])
+
+  const totalPages = Math.max(1, Math.ceil(sorted.length / TABLE_PAGE_SIZE))
+  const safePage = Math.min(page, totalPages)
+  const pageRows = sorted.slice((safePage - 1) * TABLE_PAGE_SIZE, safePage * TABLE_PAGE_SIZE)
+  useEffect(() => {
+    setPage(1)
+  }, [sortKey, sortDir, rows.length])
+
+  const onSort = (k: TableSortKey) => {
+    if (k === sortKey) setSortDir(d => (d === 'asc' ? 'desc' : 'asc'))
+    else {
+      setSortKey(k)
+      setSortDir(k === 'name' ? 'asc' : 'desc')
+    }
+  }
+
+  const cols: { key: TableSortKey; label: string; right?: boolean }[] = [
+    { key: 'name', label: '名称' },
+    { key: 'requests', label: '请求', right: true },
+    { key: 'actual_usd', label: '实际成本', right: true },
+    { key: 'official_usd', label: '官方价', right: true },
+    { key: 'margin_usd', label: '毛利', right: true },
+    { key: 'output_tokens', label: '输出 token', right: true },
+    { key: 'trunc', label: '截断率', right: true },
+    { key: 'avg_ttft_ms', label: '首字', right: true },
+  ]
+
   return (
-    <ChartCard title={title} subtitle="区间汇总">
+    <ChartCard title={title} subtitle={`区间汇总 · 共 ${rows.length}`}>
       <div className="-mx-1 overflow-x-auto">
         <table className="w-full min-w-[640px] text-sm">
           <thead>
             <tr className="border-b border-border text-left font-mono text-2xs uppercase tracking-wider text-muted-foreground">
-              <th className="px-2 py-2 font-medium">名称</th>
-              <th className="px-2 py-2 text-right font-medium">请求</th>
-              <th className="px-2 py-2 text-right font-medium">实际成本</th>
-              <th className="px-2 py-2 text-right font-medium">官方价</th>
-              <th className="px-2 py-2 text-right font-medium">毛利</th>
-              <th className="px-2 py-2 text-right font-medium">输出 token</th>
-              <th className="px-2 py-2 text-right font-medium">截断率</th>
-              <th className="px-2 py-2 text-right font-medium">首字</th>
+              {cols.map(c => (
+                <th key={c.key} className={cn('px-2 py-2 font-medium', c.right && 'text-right')}>
+                  <button
+                    onClick={() => onSort(c.key)}
+                    className={cn(
+                      'inline-flex cursor-pointer items-center gap-0.5 hover:text-foreground',
+                      c.right && 'flex-row-reverse',
+                      sortKey === c.key && 'text-foreground',
+                    )}
+                  >
+                    <span>{c.label}</span>
+                    <span className="text-[8px] leading-none">
+                      {sortKey === c.key ? (sortDir === 'asc' ? '▲' : '▼') : ''}
+                    </span>
+                  </button>
+                </th>
+              ))}
             </tr>
           </thead>
           <tbody>
-            {rows.map(r => (
+            {pageRows.map(r => (
               <tr key={r.key} className="border-b border-border/50 last:border-0">
                 <td className="px-2 py-2 font-medium">{labelOf(r.key)}</td>
                 <td className="tnum px-2 py-2 text-right">{fmtNum(r.requests)}</td>
@@ -493,15 +641,14 @@ function BreakdownTable({
                   {fmtUsd(r.margin_usd)}
                 </td>
                 <td className="tnum px-2 py-2 text-right">{fmtTokens(r.output_tokens)}</td>
-                <td className="tnum px-2 py-2 text-right">
-                  {r.requests > 0 ? ((r.truncated / r.requests) * 100).toFixed(1) : '0.0'}%
-                </td>
+                <td className="tnum px-2 py-2 text-right">{truncRateOf(r).toFixed(1)}%</td>
                 <td className="tnum px-2 py-2 text-right">{fmtMs(r.avg_ttft_ms)}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+      {totalPages > 1 && <TablePager page={safePage} totalPages={totalPages} onChange={setPage} />}
     </ChartCard>
   )
 }
@@ -523,7 +670,7 @@ function SegBar<T extends string>({
           key={o.key}
           onClick={() => onChange(o.key)}
           className={cn(
-            'cursor-pointer rounded-lg px-2.5 py-1 text-xs font-medium transition-colors',
+            'shrink-0 cursor-pointer whitespace-nowrap rounded-lg px-2.5 py-1 text-xs font-medium transition-colors',
             value === o.key
               ? 'bg-background text-foreground shadow-sm'
               : 'text-muted-foreground hover:text-foreground',
