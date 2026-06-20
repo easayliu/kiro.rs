@@ -29,6 +29,8 @@ import {
   Power,
   BarChart3,
   Users,
+  PanelLeftClose,
+  PanelLeftOpen,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -205,6 +207,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
     if (prefers) document.documentElement.classList.add('dark')
     return prefers
   })
+
+  // 侧栏折叠（桌面端）：默认展开，收起为图标轨；状态持久化
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    if (typeof window === 'undefined') return false
+    return localStorage.getItem('kiro-sidebar-collapsed') === '1'
+  })
+  const toggleSidebar = () => {
+    setSidebarCollapsed(v => {
+      const next = !v
+      localStorage.setItem('kiro-sidebar-collapsed', next ? '1' : '0')
+      return next
+    })
+  }
 
   const queryClient = useQueryClient()
   const readOnly = useIsReadOnly()
@@ -919,9 +934,22 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   return (
     <div className="relative min-h-screen bg-background text-foreground">
-      {/* Top header — shared across mobile & desktop */}
+      {/* Desktop icon rail — Stripe-style collapsible sidebar (hover to expand) */}
+      <Sidebar
+        view={view}
+        onChange={setView}
+        readOnly={readOnly}
+        darkMode={darkMode}
+        collapsed={sidebarCollapsed}
+        onToggleTheme={toggleDarkMode}
+        onRefresh={handleRefresh}
+        onLogout={handleLogout}
+        onToggleCollapse={toggleSidebar}
+      />
+
+      {/* Top header — mobile only (desktop nav lives in the icon rail) */}
       <header
-        className="sticky top-0 z-30 border-b border-border bg-background/80 backdrop-blur-xl"
+        className="sticky top-0 z-30 border-b border-border bg-background/80 backdrop-blur-xl lg:hidden"
         style={{ paddingTop: 'env(safe-area-inset-top)' }}
       >
         <div
@@ -962,7 +990,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* Main */}
       <main
-        className="relative z-10 min-h-screen pb-20 lg:pb-10"
+        className={cn(
+          'relative z-10 min-h-screen pb-20 transition-[padding] duration-200 lg:pb-10',
+          sidebarCollapsed ? 'lg:pl-14' : 'lg:pl-60',
+        )}
         style={{ paddingBottom: 'max(5rem, env(safe-area-inset-bottom))' }}
       >
         <div
@@ -976,11 +1007,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <StatsView />
           ) : (
           <>
-          {/* ━━━━━━━━━━━━ HERO — single inline row, flex-wrap ━━━━━━━━━━━━ */}
+          {/* ━━━━━━━━━━━━ PAGE HEADER — title · active credential · policies ━━━━━━━━━━━━ */}
           <section className="mb-5 sm:mb-6">
             <div className="flex flex-wrap items-baseline gap-x-5 gap-y-2">
-              {/* Title + ratio */}
-              <h1 className="flex items-baseline gap-2 text-balance tracking-tight">
+              <h1 className="flex shrink-0 items-baseline gap-2 tracking-tight">
                 <span className="text-2xl font-semibold sm:text-3xl">凭据控制台</span>
                 <span className="tnum text-base font-semibold sm:text-lg">
                   <span className={cn(availableCount > 0 ? 'text-foreground' : 'text-muted-foreground')}>{availableCount}</span>
@@ -1041,7 +1071,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <section>
 
             {/* Sticky toolbar — single row */}
-            <div className="sticky top-12 z-20 -mx-4 mb-4 border-b border-border bg-background/92 px-4 py-2.5 backdrop-blur-md sm:-mx-8 sm:top-14 sm:px-8 lg:-mx-12 lg:px-12">
+            <div className="sticky top-12 z-20 -mx-4 mb-4 border-b border-border bg-background/92 px-4 py-2.5 backdrop-blur-md sm:-mx-8 sm:top-14 sm:px-8 lg:-mx-12 lg:top-0 lg:px-12">
               <div className="flex flex-wrap items-center gap-x-2 gap-y-2">
                 {/* Search — fills the row on mobile, capped & left-aligned on desktop */}
                 <div className="relative order-1 min-w-0 flex-1 lg:max-w-xs">
@@ -1417,7 +1447,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
       {/* Mobile selection bar */}
       {selectedIds.size > 0 && (
         <div
-          className="fixed inset-x-0 bottom-0 z-40 border-t border-border bg-background/95 shadow-pop backdrop-blur-xl animate-in fade-in slide-in-from-bottom-2 duration-300"
+          className={cn(
+            'fixed inset-x-0 bottom-0 z-40 border-t border-border bg-background/95 shadow-pop backdrop-blur-xl animate-in fade-in slide-in-from-bottom-2 duration-300',
+            sidebarCollapsed ? 'lg:left-14' : 'lg:left-60',
+          )}
           style={{ paddingBottom: 'max(0.5rem, env(safe-area-inset-bottom))' }}
         >
           <div className="mx-auto flex max-w-[1440px] items-center gap-2 px-4 pt-2 sm:px-8 lg:px-12">
@@ -1947,6 +1980,143 @@ export function Dashboard({ onLogout }: DashboardProps) {
 }
 
 // ─── Primitives ───
+
+// Stripe 式常驻展开侧边栏：桌面端（lg+）固定 240px，图标 + 文字始终可见。
+// 顶部账户头（logo + 名称 + Guest 徽章）→ 分组导航（主导航 / 系统）→ 底部账户操作。
+function Sidebar({
+  view, onChange, readOnly, darkMode, collapsed,
+  onToggleTheme, onRefresh, onLogout, onToggleCollapse,
+}: {
+  view: 'credentials' | 'stats'
+  onChange: (v: 'credentials' | 'stats') => void
+  readOnly: boolean
+  darkMode: boolean
+  collapsed: boolean
+  onToggleTheme: () => void
+  onRefresh: () => void
+  onLogout: () => void
+  onToggleCollapse: () => void
+}) {
+  return (
+    <aside
+      className={cn(
+        'fixed inset-y-0 left-0 z-40 hidden flex-col border-r border-border bg-surface transition-[width] duration-200 ease-out lg:flex',
+        collapsed ? 'w-14' : 'w-60',
+      )}
+      style={{ paddingTop: 'env(safe-area-inset-top)', paddingBottom: 'env(safe-area-inset-bottom)' }}
+    >
+      {/* Account header */}
+      <div className={cn('flex h-14 shrink-0 items-center gap-2.5', collapsed ? 'justify-center px-0' : 'px-4')}>
+        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground">
+          <span className="font-mono text-xs font-bold">K</span>
+        </div>
+        {!collapsed && (
+          <>
+            <div className="flex min-w-0 items-baseline gap-1.5">
+              <span className="text-sm font-semibold tracking-tight">Kiro</span>
+              <span className="text-xs text-muted-foreground">Admin</span>
+            </div>
+            {readOnly && (
+              <span
+                title="当前以游客身份登录，仅可只读浏览"
+                className="ml-auto inline-flex items-center rounded-full border border-warn/40 bg-warn-soft px-1.5 py-0.5 font-mono text-2xs font-semibold uppercase tracking-wider text-warn"
+              >
+                Guest
+              </span>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* Primary nav — 主组不带标题（Stripe 语汇），分组靠留白 + 次级小标题 */}
+      <nav className={cn('flex-1 overflow-y-auto py-3', collapsed ? 'px-2' : 'px-3')}>
+        <NavSection collapsed={collapsed}>
+          <NavItem
+            collapsed={collapsed}
+            icon={<Users />}
+            label="凭据"
+            active={view === 'credentials'}
+            onClick={() => onChange('credentials')}
+          />
+          <NavItem
+            collapsed={collapsed}
+            icon={<BarChart3 />}
+            label="统计"
+            active={view === 'stats'}
+            onClick={() => onChange('stats')}
+          />
+        </NavSection>
+
+        <NavSection collapsed={collapsed} label="系统">
+          <NavItem
+            collapsed={collapsed}
+            icon={darkMode ? <Sun /> : <Moon />}
+            label={darkMode ? '浅色模式' : '深色模式'}
+            onClick={onToggleTheme}
+          />
+          <NavItem collapsed={collapsed} icon={<RefreshCw />} label="刷新数据" onClick={onRefresh} />
+        </NavSection>
+      </nav>
+
+      {/* Footer: 折叠开关 + 退出（靠留白区隔，不画硬分割线） */}
+      <div className={cn('flex flex-col gap-0.5 pb-3 pt-1', collapsed ? 'px-2' : 'px-3')}>
+        <NavItem
+          collapsed={collapsed}
+          icon={collapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
+          label={collapsed ? '展开侧栏' : '收起侧栏'}
+          onClick={onToggleCollapse}
+        />
+        <NavItem collapsed={collapsed} icon={<LogOut />} label="退出登录" onClick={onLogout} tone="bad" />
+      </div>
+    </aside>
+  )
+}
+
+// 侧栏分组：可选小号 uppercase 段标题 + 一组导航项。
+// 主组不传 label（Stripe 首组无标题）；次级组（如「系统」）才配标题；折叠时隐藏标题。
+function NavSection({ label, collapsed, children }: { label?: string; collapsed?: boolean; children: ReactNode }) {
+  return (
+    <div className="mb-4 last:mb-0">
+      {label && !collapsed && <div className="label-eyebrow px-2.5 pb-1.5">{label}</div>}
+      <div className="flex flex-col gap-0.5">{children}</div>
+    </div>
+  )
+}
+
+// 侧栏导航项：active 用 blurple 浅底高亮 + 品牌色文字图标（Stripe 圆角整行高亮）；
+// tone='bad' 给退出登录的危险 hover；collapsed 时仅图标居中，文字转为 tooltip。
+function NavItem({ icon, label, active, onClick, tone = 'default', collapsed }: {
+  icon: ReactNode
+  label: string
+  active?: boolean
+  onClick?: () => void
+  tone?: 'default' | 'bad'
+  collapsed?: boolean
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={label}
+      aria-label={label}
+      aria-current={active ? 'page' : undefined}
+      className={cn(
+        'flex h-9 w-full cursor-pointer items-center rounded-md text-sm transition-colors [&_svg]:h-[18px] [&_svg]:w-[18px]',
+        collapsed ? 'justify-center px-0' : 'gap-3 px-2.5',
+        active
+          ? 'bg-muted font-semibold text-foreground'
+          : tone === 'bad'
+            ? 'font-medium text-muted-foreground hover:bg-bad-soft hover:text-bad'
+            : 'font-medium text-muted-foreground hover:bg-muted hover:text-foreground',
+      )}
+    >
+      {/* Stripe：导航激活态淡灰底 + 深色文字，仅图标点缀品牌色（色彩留给交互/数据） */}
+      <span className={cn('flex h-[18px] w-[18px] shrink-0 items-center justify-center', active && 'text-primary')}>
+        {icon}
+      </span>
+      {!collapsed && <span className="truncate">{label}</span>}
+    </button>
+  )
+}
 
 function MobileIconBtn({
   children, onClick, label, title,

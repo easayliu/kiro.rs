@@ -241,7 +241,7 @@ export function StatsView() {
               label="凭据"
               candidates={credOptions}
               labelOf={credLabel}
-              colorOf={() => '#6366f1'}
+              colorOf={() => '#635bff'}
               selected={new Set(credFilter.map(String))}
               setSelected={s => setCredFilter([...s].map(Number))}
               totalCount={credOptions.length}
@@ -283,7 +283,7 @@ export function StatsView() {
       {isLoading && <div className="py-10 text-center font-mono text-xs text-muted-foreground">加载中…</div>}
 
       {!isLoading && series.length === 0 && (
-        <div className="rounded-2xl border border-dashed border-border py-16 text-center">
+        <div className="rounded-xl border border-dashed border-border py-16 text-center">
           <p className="text-sm font-medium">该时间范围内暂无统计数据</p>
           <p className="mt-1 font-mono text-xs text-muted-foreground">发起若干请求后曲线会自动出现</p>
         </div>
@@ -301,8 +301,8 @@ export function StatsView() {
                     <stop offset="100%" stopColor="#94a3b8" stopOpacity={0} />
                   </linearGradient>
                   <linearGradient id="gAct" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#6366f1" stopOpacity={0.4} />
-                    <stop offset="100%" stopColor="#6366f1" stopOpacity={0} />
+                    <stop offset="0%" stopColor="#635bff" stopOpacity={0.4} />
+                    <stop offset="100%" stopColor="#635bff" stopOpacity={0} />
                   </linearGradient>
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
@@ -311,7 +311,7 @@ export function StatsView() {
                 <Tooltip contentStyle={tooltipStyle} formatter={(v: number) => fmtUsd(v)} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Area name="官方价" type="monotone" dataKey="official_usd" stroke="#94a3b8" fill="url(#gOff)" strokeWidth={1.5} />
-                <Area name="实际成本" type="monotone" dataKey="actual_usd" stroke="#6366f1" fill="url(#gAct)" strokeWidth={1.5} />
+                <Area name="实际成本" type="monotone" dataKey="actual_usd" stroke="#635bff" fill="url(#gAct)" strokeWidth={1.5} />
                 <Line name="毛利" type="monotone" dataKey="margin_usd" stroke="#10b981" strokeWidth={1.8} dot={false} />
               </ComposedChart>
             </ResponsiveContainer>
@@ -341,7 +341,7 @@ export function StatsView() {
                 <YAxis tick={{ fontSize: 11, fill: AXIS }} stroke={GRID} width={48} tickFormatter={fmtCompact} />
                 <Tooltip contentStyle={tooltipStyle} formatter={(v: number) => fmtNum(v)} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Area name="输入" type="monotone" dataKey="input_tokens" stackId="t" stroke="#6366f1" fill="#6366f1" fillOpacity={0.5} />
+                <Area name="输入" type="monotone" dataKey="input_tokens" stackId="t" stroke="#635bff" fill="#635bff" fillOpacity={0.5} />
                 <Area name="缓存读" type="monotone" dataKey="cache_read" stackId="t" stroke="#06b6d4" fill="#06b6d4" fillOpacity={0.5} />
                 <Area name="缓存写" type="monotone" dataKey="cache_creation" stackId="t" stroke="#f59e0b" fill="#f59e0b" fillOpacity={0.5} />
                 <Area name="输出" type="monotone" dataKey="output_tokens" stackId="t" stroke="#10b981" fill="#10b981" fillOpacity={0.5} />
@@ -712,7 +712,7 @@ function Kpi({
   tone?: 'ok' | 'bad'
 }) {
   return (
-    <div className="rounded-2xl border border-border bg-card p-3 sm:p-4">
+    <div className="rounded-xl bg-surface p-3 shadow-stripe dark:ring-1 dark:ring-border sm:p-4">
       <div className="flex items-center gap-1.5 font-mono text-2xs uppercase tracking-wider text-muted-foreground">
         {icon}
         {label}
@@ -740,7 +740,7 @@ function ChartCard({
   children: React.ReactNode
 }) {
   return (
-    <div className="rounded-2xl border border-border bg-card p-3 sm:p-4">
+    <div className="rounded-xl bg-surface p-3 shadow-stripe dark:ring-1 dark:ring-border sm:p-4">
       <div className="mb-2 flex items-baseline justify-between">
         <h3 className="text-sm font-semibold tracking-tight">{title}</h3>
         {subtitle && <span className="font-mono text-2xs text-muted-foreground">{subtitle}</span>}

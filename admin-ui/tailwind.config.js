@@ -82,6 +82,11 @@ export default {
         card: '0 1px 2px 0 rgba(0, 0, 0, 0.04)',
         elev: '0 1px 3px 0 rgba(0, 0, 0, 0.08), 0 1px 2px -1px rgba(0, 0, 0, 0.06)',
         pop: '0 8px 24px -8px rgba(0, 0, 0, 0.18), 0 2px 6px -2px rgba(0, 0, 0, 0.08)',
+        // Stripe 官方卡片阴影：第一层 1px 发丝边（即"边框"）+ navy 色调柔光
+        stripe:
+          '0 0 0 1px rgba(50, 50, 93, 0.1), 0 2px 5px 0 rgba(50, 50, 93, 0.08), 0 1px 1.5px 0 rgba(0, 0, 0, 0.07)',
+        'stripe-lg':
+          '0 0 0 1px rgba(50, 50, 93, 0.1), 0 7px 14px 0 rgba(50, 50, 93, 0.1), 0 3px 6px 0 rgba(0, 0, 0, 0.08)',
       },
     },
   },

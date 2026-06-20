@@ -461,16 +461,11 @@ export function CredentialCard({
     <>
       <div
         className={cn(
-          'group relative flex flex-col overflow-hidden rounded-xl border bg-surface transition-shadow duration-200 hover:shadow-md',
-          selected
-            ? 'border-primary ring-2 ring-primary/20'
-            : overageCapExceeded
-              ? 'border-bad/50 ring-1 ring-bad/20'
-              : isOverageBilling
-                ? 'border-warn/50 ring-1 ring-warn/20'
-                : credential.isCurrent
-                  ? 'border-primary/40'
-                  : 'border-border',
+          // Stripe：无边框，靠柔和阴影 + 发丝边定义卡片。数据态（超额/活跃）只靠卡内
+          // 红/琥珀文字·徽章·进度条表达，不再画整卡彩色外框（色彩在数据里，不在卡片外框）。
+          // 仅「多选选中」这一交互态保留 ring；暗色下阴影不可见，默认补一条 hairline ring。
+          'group relative flex flex-col overflow-hidden rounded-xl bg-surface shadow-stripe transition-shadow duration-200 hover:shadow-stripe-lg',
+          selected ? 'ring-2 ring-primary' : 'dark:ring-1 dark:ring-border',
           credential.disabled && 'opacity-75',
         )}
       >
