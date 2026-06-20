@@ -53,10 +53,21 @@ function fmtUsd(v: number): string {
 function fmtNum(v: number): string {
   return v.toLocaleString('en-US')
 }
-function fmtTokens(v: number): string {
-  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(2)}M`
-  if (v >= 1_000) return `${(v / 1_000).toFixed(1)}k`
+// 紧凑整数（去掉多余的 .00），用于 token / 请求数等窄轴刻度，避免 100.00M 这类长串被裁
+function fmtCompact(v: number): string {
+  const trim = (n: number) => `${Number(n.toFixed(1))}`
+  if (v >= 1_000_000_000) return `${trim(v / 1_000_000_000)}B`
+  if (v >= 1_000_000) return `${trim(v / 1_000_000)}M`
+  if (v >= 1_000) return `${trim(v / 1_000)}k`
   return `${v}`
+}
+// 成本轴刻度专用紧凑写法（$1.2k / $3.4M）；KPI/tooltip/表格仍用精确的 fmtUsd
+function fmtUsdAxis(v: number): string {
+  const a = Math.abs(v)
+  const s = v < 0 ? '-' : ''
+  if (a >= 1_000_000) return `${s}$${Number((a / 1_000_000).toFixed(1))}M`
+  if (a >= 1_000) return `${s}$${Number((a / 1_000).toFixed(1))}k`
+  return `${s}$${Number(a.toFixed(a >= 1 ? 0 : 2))}`
 }
 function fmtMs(v: number): string {
   if (v >= 1000) return `${(v / 1000).toFixed(1)}s`
@@ -296,7 +307,7 @@ export function StatsView() {
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
                 <XAxis dataKey="time" tick={{ fontSize: 11, fill: AXIS }} stroke={GRID} minTickGap={24} />
-                <YAxis tick={{ fontSize: 11, fill: AXIS }} stroke={GRID} width={56} tickFormatter={v => fmtUsd(v)} />
+                <YAxis tick={{ fontSize: 11, fill: AXIS }} stroke={GRID} width={56} tickFormatter={fmtUsdAxis} />
                 <Tooltip contentStyle={tooltipStyle} formatter={(v: number) => fmtUsd(v)} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Area name="官方价" type="monotone" dataKey="official_usd" stroke="#94a3b8" fill="url(#gOff)" strokeWidth={1.5} />
@@ -311,7 +322,7 @@ export function StatsView() {
               <ComposedChart data={overview} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
                 <XAxis dataKey="time" tick={{ fontSize: 11, fill: AXIS }} stroke={GRID} minTickGap={24} />
-                <YAxis yAxisId="l" tick={{ fontSize: 11, fill: AXIS }} stroke={GRID} width={40} />
+                <YAxis yAxisId="l" tick={{ fontSize: 11, fill: AXIS }} stroke={GRID} width={40} tickFormatter={fmtCompact} />
                 <YAxis yAxisId="r" orientation="right" tick={{ fontSize: 11, fill: AXIS }} stroke={GRID} width={40} unit="%" />
                 <Tooltip contentStyle={tooltipStyle} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
@@ -327,7 +338,7 @@ export function StatsView() {
               <AreaChart data={overview} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
                 <XAxis dataKey="time" tick={{ fontSize: 11, fill: AXIS }} stroke={GRID} minTickGap={24} />
-                <YAxis tick={{ fontSize: 11, fill: AXIS }} stroke={GRID} width={48} tickFormatter={fmtTokens} />
+                <YAxis tick={{ fontSize: 11, fill: AXIS }} stroke={GRID} width={48} tickFormatter={fmtCompact} />
                 <Tooltip contentStyle={tooltipStyle} formatter={(v: number) => fmtNum(v)} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Area name="输入" type="monotone" dataKey="input_tokens" stackId="t" stroke="#6366f1" fill="#6366f1" fillOpacity={0.5} />
@@ -616,7 +627,7 @@ function BreakdownTable({
           <thead>
             <tr className="border-b border-border text-left font-mono text-2xs uppercase tracking-wider text-muted-foreground">
               {cols.map(c => (
-                <th key={c.key} className={cn('px-2 py-2 font-medium', c.right && 'text-right')}>
+                <th key={c.key} className={cn('whitespace-nowrap px-2 py-2 font-medium', c.right && 'text-right')}>
                   <button
                     onClick={() => onSort(c.key)}
                     className={cn(
@@ -644,7 +655,7 @@ function BreakdownTable({
                 <td className={cn('tnum px-2 py-2 text-right', r.margin_usd < 0 ? 'text-bad' : 'text-ok')}>
                   {fmtUsd(r.margin_usd)}
                 </td>
-                <td className="tnum px-2 py-2 text-right">{fmtTokens(r.output_tokens)}</td>
+                <td className="tnum px-2 py-2 text-right">{fmtCompact(r.output_tokens)}</td>
                 <td className={cn('tnum px-2 py-2 text-right', r.failures > 0 && 'text-bad')}>
                   {errRateOf(r).toFixed(1)}%
                 </td>
