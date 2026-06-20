@@ -13,7 +13,7 @@ import {
   YAxis,
 } from 'recharts'
 import { useQueryClient } from '@tanstack/react-query'
-import { Activity, Check, ChevronDown, CircleDollarSign, Clock, RefreshCw, Scissors, Search } from 'lucide-react'
+import { Activity, AlertTriangle, Check, ChevronDown, CircleDollarSign, Clock, RefreshCw, Search } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useCredentials, useStatsSummary, useStatsTimeseries } from '@/hooks/use-credentials'
 import type { StatGroup, StatsBucket } from '@/types/api'
@@ -153,7 +153,8 @@ export function StatsView() {
       series.map(r => ({
         ...r,
         time: fmtTime(r.bucket, bucket),
-        truncRate: r.requests > 0 ? (r.truncated / r.requests) * 100 : 0,
+        // 错误率分母含失败本身：失败 / (成功 + 失败)。
+        errRate: r.requests + r.failures > 0 ? (r.failures / (r.requests + r.failures)) * 100 : 0,
         inputTotal: r.input_tokens + r.cache_read + r.cache_creation,
       })),
     [series, bucket],
@@ -260,9 +261,10 @@ export function StatsView() {
           tone={total && total.margin_usd < 0 ? 'bad' : 'ok'}
         />
         <Kpi
-          label="截断率"
-          value={`${total && total.requests > 0 ? ((total.truncated / total.requests) * 100).toFixed(1) : '0.0'}%`}
-          icon={<Scissors className="h-3.5 w-3.5" />}
+          label="错误率"
+          value={`${total && total.requests + total.failures > 0 ? ((total.failures / (total.requests + total.failures)) * 100).toFixed(1) : '0.0'}%`}
+          icon={<AlertTriangle className="h-3.5 w-3.5" />}
+          tone={total && total.failures > 0 ? 'bad' : undefined}
         />
         <Kpi label="平均首字" value={fmtMs(total?.avg_ttft_ms ?? 0)} icon={<Clock className="h-3.5 w-3.5" />} />
       </section>
@@ -304,7 +306,7 @@ export function StatsView() {
             </ResponsiveContainer>
           </ChartCard>
 
-          <ChartCard title="请求量 / 截断率" subtitle="次 · %">
+          <ChartCard title="请求量 / 错误率" subtitle="次 · %">
             <ResponsiveContainer width="100%" height={240}>
               <ComposedChart data={overview} margin={{ top: 8, right: 8, left: -8, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke={GRID} vertical={false} />
@@ -314,7 +316,8 @@ export function StatsView() {
                 <Tooltip contentStyle={tooltipStyle} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Bar yAxisId="l" name="请求" dataKey="requests" fill="#3b82f6" radius={[3, 3, 0, 0]} maxBarSize={28} />
-                <Line yAxisId="r" name="截断率%" type="monotone" dataKey="truncRate" stroke="#ef4444" strokeWidth={1.8} dot={false} />
+                <Bar yAxisId="l" name="失败" dataKey="failures" fill="#f97316" radius={[3, 3, 0, 0]} maxBarSize={28} />
+                <Line yAxisId="r" name="错误率%" type="monotone" dataKey="errRate" stroke="#f97316" strokeWidth={1.8} dot={false} />
               </ComposedChart>
             </ResponsiveContainer>
           </ChartCard>
@@ -479,11 +482,12 @@ type TableSortKey =
   | 'official_usd'
   | 'margin_usd'
   | 'output_tokens'
-  | 'trunc'
+  | 'err'
   | 'avg_ttft_ms'
 const TABLE_PAGE_SIZE = 10
 
-const truncRateOf = (r: StatGroup) => (r.requests > 0 ? (r.truncated / r.requests) * 100 : 0)
+const errRateOf = (r: StatGroup) =>
+  r.requests + r.failures > 0 ? (r.failures / (r.requests + r.failures)) * 100 : 0
 
 function pageList(current: number, total: number): (number | 'dots')[] {
   if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1)
@@ -565,8 +569,8 @@ function BreakdownTable({
     const val = (r: StatGroup): number | string =>
       sortKey === 'name'
         ? labelOf(r.key)
-        : sortKey === 'trunc'
-          ? truncRateOf(r)
+        : sortKey === 'err'
+          ? errRateOf(r)
           : (r[sortKey] as number)
     return [...rows].sort((a, b) => {
       const va = val(a)
@@ -601,7 +605,7 @@ function BreakdownTable({
     { key: 'official_usd', label: '官方价', right: true },
     { key: 'margin_usd', label: '毛利', right: true },
     { key: 'output_tokens', label: '输出 token', right: true },
-    { key: 'trunc', label: '截断率', right: true },
+    { key: 'err', label: '错误率', right: true },
     { key: 'avg_ttft_ms', label: '首字', right: true },
   ]
 
@@ -641,7 +645,9 @@ function BreakdownTable({
                   {fmtUsd(r.margin_usd)}
                 </td>
                 <td className="tnum px-2 py-2 text-right">{fmtTokens(r.output_tokens)}</td>
-                <td className="tnum px-2 py-2 text-right">{truncRateOf(r).toFixed(1)}%</td>
+                <td className={cn('tnum px-2 py-2 text-right', r.failures > 0 && 'text-bad')}>
+                  {errRateOf(r).toFixed(1)}%
+                </td>
                 <td className="tnum px-2 py-2 text-right">{fmtMs(r.avg_ttft_ms)}</td>
               </tr>
             ))}

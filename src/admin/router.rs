@@ -7,7 +7,8 @@ use axum::{
 
 use super::{
     handlers::{
-        add_credential, batch_set_concurrency_limit, batch_set_credential_group,
+        add_credential, batch_delete_credentials, batch_set_concurrency_limit,
+        batch_set_credential_group,
         batch_set_disabled, batch_set_overage,
         batch_set_priority, batch_set_rpm_limit, delete_credential, delete_proxy_group,
         force_refresh_token,
@@ -78,6 +79,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/balance", get(get_credential_balance))
         .route("/credentials/{id}/models", get(get_credential_models))
         .route("/credentials/{id}/group", post(set_credential_group))
+        .route("/credentials/delete/batch", post(batch_delete_credentials))
         .route("/credentials/group/batch", post(batch_set_credential_group))
         .route("/credentials/priority/batch", post(batch_set_priority))
         .route("/credentials/rpm-limit/batch", post(batch_set_rpm_limit))

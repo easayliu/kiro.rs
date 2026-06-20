@@ -37,8 +37,11 @@ pub struct RequestStat {
     pub ttft_ms: i64,
     /// 总耗时（毫秒）。
     pub elapsed_ms: i64,
-    /// stop_reason == "max_tokens"（输出被截断）。
-    pub truncated: bool,
+    /// 请求结果状态码：`0` = 成功（正常完成）；
+    /// 非 0 = 失败请求（上游 API 错误），存上游 HTTP status（如 400/401/429/500），
+    /// 无 HTTP 响应的内部错误用映射码（无可用凭据 503、其它 502）。
+    /// 失败行的 token/成本/延迟均为 0，仅用于错误率统计，不污染成功侧聚合。
+    pub status_code: i64,
 }
 
 /// 曲线分组维度。
@@ -68,6 +71,8 @@ pub struct TimeBucket {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     pub requests: i64,
+    /// 失败请求数（status_code != 0，上游 API 错误）。
+    pub failures: i64,
     pub actual_usd: f64,
     pub official_usd: f64,
     pub margin_usd: f64,
@@ -75,7 +80,6 @@ pub struct TimeBucket {
     pub cache_read: i64,
     pub cache_creation: i64,
     pub output_tokens: i64,
-    pub truncated: i64,
     pub avg_ttft_ms: i64,
     pub avg_elapsed_ms: i64,
 }
@@ -86,6 +90,8 @@ pub struct StatGroup {
     /// 分组键：model 名 / credential id；全量汇总时为空串。
     pub key: String,
     pub requests: i64,
+    /// 失败请求数（status_code != 0，上游 API 错误）。
+    pub failures: i64,
     pub actual_usd: f64,
     pub official_usd: f64,
     pub margin_usd: f64,
@@ -93,7 +99,6 @@ pub struct StatGroup {
     pub cache_read: i64,
     pub cache_creation: i64,
     pub output_tokens: i64,
-    pub truncated: i64,
     pub avg_ttft_ms: i64,
     pub avg_elapsed_ms: i64,
 }
@@ -166,7 +171,8 @@ mod imp {
                 output_tokens  INTEGER NOT NULL,
                 ttft_ms        INTEGER NOT NULL,
                 elapsed_ms     INTEGER NOT NULL,
-                truncated      INTEGER NOT NULL CHECK (truncated IN (0, 1))
+                -- 0=成功；非0=失败请求(上游 API 错误)的状态码。失败行其余指标均为 0。
+                status_code    INTEGER NOT NULL DEFAULT 0
             ) STRICT;
             -- 时序分桶 / 总量汇总 / 过期清理：均以 ts 区间为主过滤条件。
             CREATE INDEX IF NOT EXISTS idx_request_stats_ts ON request_stats(ts);
@@ -175,7 +181,27 @@ mod imp {
             CREATE INDEX IF NOT EXISTS idx_request_stats_model_ts ON request_stats(model, ts);
             -- 按凭据汇总同理。
             CREATE INDEX IF NOT EXISTS idx_request_stats_cred_ts ON request_stats(credential_id, ts);",
-        )
+        )?;
+        // 迁移：老库（status_code 列出现前建的表）补列，默认 0=成功。
+        // STRICT 表允许 ADD COLUMN ... NOT NULL DEFAULT。
+        let has_status = conn
+            .prepare("SELECT 1 FROM pragma_table_info('request_stats') WHERE name = 'status_code'")?
+            .exists([])?;
+        if !has_status {
+            conn.execute_batch(
+                "ALTER TABLE request_stats ADD COLUMN status_code INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            tracing::info!("统计库已迁移：request_stats 新增 status_code 列");
+        }
+        // 迁移：删除已废弃的 truncated 列（kiro 不支持 max_tokens 截断，指标无意义）。
+        let has_truncated = conn
+            .prepare("SELECT 1 FROM pragma_table_info('request_stats') WHERE name = 'truncated'")?
+            .exists([])?;
+        if has_truncated {
+            conn.execute_batch("ALTER TABLE request_stats DROP COLUMN truncated;")?;
+            tracing::info!("统计库已迁移：request_stats 删除废弃的 truncated 列");
+        }
+        Ok(())
     }
 
     pub fn init(path: PathBuf, retention_days: u32) {
@@ -260,7 +286,7 @@ mod imp {
                 "INSERT INTO request_stats
                     (ts, model, credential_id, actual_micro, official_micro, margin_micro,
                      input_tokens, cache_read, cache_creation, output_tokens,
-                     ttft_ms, elapsed_ms, truncated)
+                     ttft_ms, elapsed_ms, status_code)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             ) {
                 Ok(s) => s,
@@ -283,7 +309,7 @@ mod imp {
                     s.output_tokens,
                     s.ttft_ms,
                     s.elapsed_ms,
-                    s.truncated as i64,
+                    s.status_code,
                 ]);
             }
         }
@@ -354,13 +380,16 @@ mod imp {
         let has_group = group_by != GroupBy::None;
         let (where_sql, params) = build_filter(from_ts, to_ts, models, credentials);
         let sql = format!(
+            // requests 只数成功（status_code=0）；failures 数失败（!=0）。
+            // 成本/token/truncated 失败行均为 0，SUM 不受影响；延迟 AVG 用 CASE
+            // 过滤成功行（CASE 无 ELSE → 失败行为 NULL，AVG 自动忽略）。
             "SELECT ({bucket_div}) AS bucket, {grp_sel}
-                COUNT(*) AS requests,
+                SUM(CASE WHEN status_code = 0 THEN 1 ELSE 0 END) AS requests,
+                SUM(CASE WHEN status_code <> 0 THEN 1 ELSE 0 END) AS failures,
                 SUM(actual_micro), SUM(official_micro), SUM(margin_micro),
                 SUM(input_tokens), SUM(cache_read), SUM(cache_creation), SUM(output_tokens),
-                SUM(truncated),
-                CAST(COALESCE(AVG(ttft_ms),0) AS INTEGER),
-                CAST(COALESCE(AVG(elapsed_ms),0) AS INTEGER)
+                CAST(COALESCE(AVG(CASE WHEN status_code = 0 THEN ttft_ms END),0) AS INTEGER),
+                CAST(COALESCE(AVG(CASE WHEN status_code = 0 THEN elapsed_ms END),0) AS INTEGER)
              FROM request_stats
              WHERE {where_sql}
              GROUP BY bucket{grp_by}
@@ -394,14 +423,14 @@ mod imp {
                 bucket: row.get(0)?,
                 group,
                 requests: row.get(1 + off)?,
-                actual_usd: micro_to_usd(row.get(2 + off)?),
-                official_usd: micro_to_usd(row.get(3 + off)?),
-                margin_usd: micro_to_usd(row.get(4 + off)?),
-                input_tokens: row.get(5 + off)?,
-                cache_read: row.get(6 + off)?,
-                cache_creation: row.get(7 + off)?,
-                output_tokens: row.get(8 + off)?,
-                truncated: row.get(9 + off)?,
+                failures: row.get(2 + off)?,
+                actual_usd: micro_to_usd(row.get(3 + off)?),
+                official_usd: micro_to_usd(row.get(4 + off)?),
+                margin_usd: micro_to_usd(row.get(5 + off)?),
+                input_tokens: row.get(6 + off)?,
+                cache_read: row.get(7 + off)?,
+                cache_creation: row.get(8 + off)?,
+                output_tokens: row.get(9 + off)?,
                 avg_ttft_ms: row.get(10 + off)?,
                 avg_elapsed_ms: row.get(11 + off)?,
             })
@@ -416,26 +445,26 @@ mod imp {
     }
 
     /// 汇总聚合 SELECT 主体（不含分组键列），列序与 [`map_group`] 对应。
-    const AGG_COLS: &str = "COUNT(*),
+    const AGG_COLS: &str = "SUM(CASE WHEN status_code = 0 THEN 1 ELSE 0 END),
+        SUM(CASE WHEN status_code <> 0 THEN 1 ELSE 0 END),
         SUM(actual_micro), SUM(official_micro), SUM(margin_micro),
         SUM(input_tokens), SUM(cache_read), SUM(cache_creation), SUM(output_tokens),
-        SUM(truncated),
-        CAST(COALESCE(AVG(ttft_ms),0) AS INTEGER),
-        CAST(COALESCE(AVG(elapsed_ms),0) AS INTEGER)";
+        CAST(COALESCE(AVG(CASE WHEN status_code = 0 THEN ttft_ms END),0) AS INTEGER),
+        CAST(COALESCE(AVG(CASE WHEN status_code = 0 THEN elapsed_ms END),0) AS INTEGER)";
 
     /// 把聚合行（从 `base` 列开始的 11 列）映射成 StatGroup（key 由调用方填）。
     fn map_group(row: &rusqlite::Row, base: usize, key: String) -> rusqlite::Result<StatGroup> {
         Ok(StatGroup {
             key,
             requests: row.get(base)?,
-            actual_usd: micro_to_usd(row.get(base + 1)?),
-            official_usd: micro_to_usd(row.get(base + 2)?),
-            margin_usd: micro_to_usd(row.get(base + 3)?),
-            input_tokens: row.get(base + 4)?,
-            cache_read: row.get(base + 5)?,
-            cache_creation: row.get(base + 6)?,
-            output_tokens: row.get(base + 7)?,
-            truncated: row.get(base + 8)?,
+            failures: row.get(base + 1)?,
+            actual_usd: micro_to_usd(row.get(base + 2)?),
+            official_usd: micro_to_usd(row.get(base + 3)?),
+            margin_usd: micro_to_usd(row.get(base + 4)?),
+            input_tokens: row.get(base + 5)?,
+            cache_read: row.get(base + 6)?,
+            cache_creation: row.get(base + 7)?,
+            output_tokens: row.get(base + 8)?,
             avg_ttft_ms: row.get(base + 9)?,
             avg_elapsed_ms: row.get(base + 10)?,
         })

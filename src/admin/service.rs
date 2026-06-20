@@ -14,6 +14,7 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse,
+    BatchDeleteCredentialsRequest, BatchDeleteCredentialsResponse,
     BatchSetCredentialGroupFailure, BatchSetCredentialGroupRequest,
     BatchSetCredentialGroupResponse, BatchSetDisabledRequest, BatchSetDisabledResponse,
     BatchSetPriorityRequest, BatchSetPriorityResponse, BatchSetRpmLimitRequest,
@@ -132,6 +133,7 @@ impl AdminService {
                 overage: entry.overage,
                 balance: cached_balance.map(|(b, _)| b.clone()),
                 balance_cached_at: cached_balance.map(|(_, t)| *t),
+                created_at: entry.created_at,
                 }
             })
             .collect();
@@ -356,6 +358,7 @@ impl AdminService {
             rpm_limit: None,
             concurrency_limit: None,
             overage: None,
+            created_at: None, // 由 DB 默认 unixepoch() 填充；add_credential 内会补当前时间供即时展示
         };
 
         // 调用 token_manager 添加凭据
@@ -579,6 +582,46 @@ impl AdminService {
         self.token_manager
             .set_group(id, req.group)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 批量删除凭据（仅删除已禁用项；底层走单事务批量删除）
+    pub fn batch_delete_credentials(
+        &self,
+        req: BatchDeleteCredentialsRequest,
+    ) -> Result<BatchDeleteCredentialsResponse, AdminServiceError> {
+        if req.credential_ids.is_empty() {
+            return Err(AdminServiceError::InvalidParameter(
+                "credentialIds 不能为空".to_string(),
+            ));
+        }
+        let total = req.credential_ids.len();
+        let result = self
+            .token_manager
+            .delete_credential_batch(&req.credential_ids);
+
+        // 清理已删除凭据的余额缓存
+        if !result.succeeded.is_empty() {
+            {
+                let mut cache = self.balance_cache.lock();
+                for id in &result.succeeded {
+                    cache.remove(id);
+                }
+            }
+            self.save_balance_cache();
+        }
+
+        Ok(BatchDeleteCredentialsResponse {
+            total,
+            succeeded: result.succeeded,
+            failed: result
+                .failed
+                .into_iter()
+                .map(|f| BatchSetCredentialGroupFailure {
+                    id: f.id,
+                    error: f.error,
+                })
+                .collect(),
+        })
     }
 
     /// 批量设置凭据优先级

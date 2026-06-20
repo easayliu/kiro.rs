@@ -134,6 +134,11 @@ pub struct KiroCredentials {
     /// - `Some(false)`：上次下发 DISABLED
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overage: Option<bool>,
+
+    /// 凭据添加时间（Unix 秒）。由 DB `created_at` 列填充（默认 unixepoch()）；
+    /// 仅作展示用，不参与认证逻辑。导入的凭据 JSON 无此字段时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -621,6 +626,7 @@ mod tests {
             rpm_limit: None,
             concurrency_limit: None,
             overage: None,
+            created_at: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -743,6 +749,7 @@ mod tests {
             rpm_limit: None,
             concurrency_limit: None,
             overage: None,
+            created_at: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -778,6 +785,7 @@ mod tests {
             rpm_limit: None,
             concurrency_limit: None,
             overage: None,
+            created_at: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -896,6 +904,7 @@ mod tests {
             rpm_limit: None,
             concurrency_limit: None,
             overage: None,
+            created_at: None,
         };
 
         let json = original.to_pretty_json().unwrap();

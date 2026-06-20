@@ -14,6 +14,7 @@ import type {
   ProxyGroupsResponse,
   UpsertProxyGroupRequest,
   BatchSetCredentialGroupResponse,
+  BatchDeleteCredentialsResponse,
   BatchSetPriorityResponse,
   BatchSetRpmLimitResponse,
   BatchSetConcurrencyLimitResponse,
@@ -157,6 +158,17 @@ export async function addCredential(
 // 删除凭据
 export async function deleteCredential(id: number): Promise<SuccessResponse> {
   const { data } = await api.delete<SuccessResponse>(`/credentials/${id}`)
+  return data
+}
+
+// 批量删除凭据（仅删除已禁用项，后端单事务批量删除）
+export async function batchDeleteCredentials(
+  credentialIds: number[],
+): Promise<BatchDeleteCredentialsResponse> {
+  const { data } = await api.post<BatchDeleteCredentialsResponse>(
+    '/credentials/delete/batch',
+    { credentialIds },
+  )
   return data
 }
 

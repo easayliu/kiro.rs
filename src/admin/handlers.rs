@@ -9,7 +9,8 @@ use axum::{
 use super::{
     middleware::{AdminRole, AdminState},
     types::{
-        AddCredentialRequest, BatchSetConcurrencyLimitRequest, BatchSetCredentialGroupRequest,
+        AddCredentialRequest, BatchDeleteCredentialsRequest, BatchSetConcurrencyLimitRequest,
+        BatchSetCredentialGroupRequest,
         BatchSetDisabledRequest,
         BatchSetOverageRequest, BatchSetPriorityRequest, BatchSetRpmLimitRequest, MeResponse,
         SetCacheSkipRateRequest, SetConcurrencyLimitRequest,
@@ -426,6 +427,18 @@ pub async fn set_credential_group(
             };
             Json(SuccessResponse::new(msg)).into_response()
         }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/delete/batch
+/// 批量删除凭据（仅删除已禁用项）
+pub async fn batch_delete_credentials(
+    State(state): State<AdminState>,
+    Json(payload): Json<BatchDeleteCredentialsRequest>,
+) -> impl IntoResponse {
+    match state.service.batch_delete_credentials(payload) {
+        Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

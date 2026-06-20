@@ -17,9 +17,9 @@ import {
   CircleDollarSign,
   Boxes,
   X,
-  Scissors,
   Clock,
   KeyRound,
+  AlertTriangle,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { LineChart, Line } from 'recharts'
@@ -96,11 +96,6 @@ function resolveEffectiveConcurrency(credLimit: number | undefined, defaultLimit
 }
 
 // 小额 USD 简短格式（卡片用）
-function fmtUsd(v: number): string {
-  const abs = Math.abs(v)
-  const d = abs >= 100 ? 1 : abs >= 1 ? 2 : 3
-  return `${v < 0 ? '-' : ''}$${abs.toFixed(d)}`
-}
 // 毫秒简短：>1s 显示秒
 function fmtMs(v: number): string {
   return v >= 1000 ? `${(v / 1000).toFixed(1)}s` : `${Math.round(v)}ms`
@@ -151,6 +146,8 @@ export function CredentialCard({
   const [concurrencyInputValue, setConcurrencyInputValue] = useState('')
   // 懒加载可用模型：仅在"可用模型"子菜单首次展开后才发起请求
   const [modelsRequested, setModelsRequested] = useState(false)
+  // 「详情」展开：默认收起，点击在卡内展开次要数据（近7天用量、添加时间、限流器、余额时效等）
+  const [showDetails, setShowDetails] = useState(false)
 
   const readOnly = useIsReadOnly()
   const setDisabled = useSetDisabled()
@@ -339,9 +336,6 @@ export function CredentialCard({
     balance?.nextResetAt != null
       ? Math.max(0, Math.ceil((balance.nextResetAt * 1000 - Date.now()) / 86_400_000))
       : null
-  // 截断率（近 N 天）
-  const truncRate =
-    usage && usage.requests > 0 ? (usage.truncated / usage.requests) * 100 : 0
   // Token 健康：剩余有效期（ms）。仅在临期/过期/刷新失败时高亮提示，正常态不占行。
   const expiryMs = credential.expiresAt
     ? new Date(credential.expiresAt).getTime() - Date.now()
@@ -381,6 +375,45 @@ export function CredentialCard({
         ? 'text-warn'
         : 'text-foreground'
 
+  // 近7天错误率（来自 stats by_credential）：失败 / (成功 + 失败)。
+  // 有失败时卡面红字常驻（健康告警），无失败时收进详情。
+  const usageTotal = usage ? usage.requests + usage.failures : 0
+  const errRate = usageTotal > 0 ? (usage!.failures / usageTotal) * 100 : 0
+  const hasErrors = !!usage && usage.failures > 0
+  // 代理出口（凭据级 proxyUrl，脱去 user:pass 仅留 scheme+host，避免泄露口令）
+  const proxyDisplay = credential.proxyUrl
+    ? credential.proxyUrl.replace(/\/\/[^@/]*@/, '//')
+    : null
+
+  // 限流是否处于告警态（≥70% 或耗尽）。告警态常驻卡面；非告警态（正常占用）收进详情。
+  const limiterActive = rpmActive || concurrencyActive
+  const limiterWarn =
+    (rpmActive && rpmUsageRatio >= 0.7) || (concurrencyActive && concurrencyUsageRatio >= 0.7)
+  // 限流器展示行：RPM · 并发（卡面告警态与详情非告警态复用同一份标记，避免重复）。
+  const limiterRow = (
+    <div className="flex items-center gap-x-2">
+      {rpmActive && (
+        <span
+          className={cn('inline-flex items-center gap-1 tnum font-mono', rpmColorClass)}
+          title={`RPM ${rpmCurrent}/${effectiveRpm} · 60s 窗口${typeof credential.rpmLimit !== 'number' ? '（默认）' : ''}`}
+        >
+          <Gauge className="h-3 w-3" />
+          {rpmCurrent}/{effectiveRpm}
+        </span>
+      )}
+      {rpmActive && concurrencyActive && <span className="text-muted-foreground/40">·</span>}
+      {concurrencyActive && (
+        <span
+          className={cn('inline-flex items-center gap-1 tnum font-mono', concurrencyColorClass)}
+          title={`并发 ${concurrencyCurrent}/${effectiveConcurrency} 在途${typeof credential.concurrencyLimit !== 'number' ? '（默认）' : ''}`}
+        >
+          <Activity className="h-3 w-3" />
+          {concurrencyCurrent}/{effectiveConcurrency}
+        </span>
+      )}
+    </div>
+  )
+
   const barColor =
     !balance
       ? 'bg-muted'
@@ -403,7 +436,8 @@ export function CredentialCard({
     FreeSubscription: 'Free 订阅（自动禁用）',
   }
 
-  // Status label for the subtitle row
+  // 副标题状态：只在异常态显示（禁用/限流/失败）。「活跃」是常态、且已由卡片高亮边框
+  // 与开关表达，不再占字。
   const statusLabel = credential.disabled
     ? (credential.disabledReason
         ? disabledReasonLabels[credential.disabledReason] || credential.disabledReason
@@ -412,18 +446,12 @@ export function CredentialCard({
       ? `限流冷却 剩${formatRemaining(throttledRemainingMs)}`
       : hasFailures
         ? '异常'
-        : credential.isCurrent
-          ? '活跃'
-          : null
+        : null
   const statusClass = credential.disabled
     ? 'text-bad'
     : isThrottled
       ? 'text-warn'
-      : hasFailures
-        ? 'text-warn'
-        : credential.isCurrent
-          ? 'text-foreground'
-          : 'text-muted-foreground'
+      : 'text-warn'
 
   return (
     <>
@@ -478,7 +506,12 @@ export function CredentialCard({
                 </span>
               )}
               {balance?.subscriptionTitle && (
-                <span className={cn('shrink-0 font-medium', tier.labelText)}>{balance.subscriptionTitle}</span>
+                <span
+                  className={cn('shrink-0 font-medium', tier.labelText)}
+                  title={balance.subscriptionTitle}
+                >
+                  {balance.subscriptionTitle.replace(/^KIRO\s+/i, '')}
+                </span>
               )}
               <span
                 className="inline-flex shrink-0 items-center"
@@ -504,7 +537,6 @@ export function CredentialCard({
               {statusLabel && (
                 <span className={cn('shrink-0 font-medium', statusClass)}>{statusLabel}</span>
               )}
-              {credential.hasProfileArn && <span className="shrink-0">ARN</span>}
               {credential.group && (
                 <span
                   className="inline-flex min-w-0 items-center gap-0.5 text-foreground"
@@ -594,21 +626,6 @@ export function CredentialCard({
                 />
               )}
             </div>
-            {/* 余额新鲜度 + 额度重置（缓存值，非实时；让用户知道数据时效） */}
-            {balance && (credential.balanceCachedAt || resetInDays != null) && (
-              <div className="mt-1 flex items-center gap-1.5 font-mono text-[11px] text-muted-foreground">
-                {credential.balanceCachedAt && (
-                  <span title="余额为缓存值，非实时；点「余额」可拉取最新">
-                    更新于 <RelativeTime value={unixToIso(credential.balanceCachedAt)} />
-                  </span>
-                )}
-                {credential.balanceCachedAt && resetInDays != null && (
-                  <span className="text-muted-foreground/40">·</span>
-                )}
-                {resetInDays != null && <span title="额度重置时间">{resetInDays}天后重置</span>}
-              </div>
-            )}
-
             {/* 超额行固定占位：无超额时也保留高度，保证各卡片元信息行垂直对齐 */}
             <div className="mt-1 flex h-4 items-center gap-1.5 text-[11px] text-warn">
               {balance && hasActualOverage && (
@@ -635,57 +652,9 @@ export function CredentialCard({
             </div>
           </div>
 
-          {/* Meta — 语义分组：⓪ 近7天用量  ① 身份/活动  ② 限流器  ③ Token健康(异常才显示) */}
+          {/* Meta — 常驻只留「活动」一行 + 异常告警；其余次要数据收进「详情」展开 */}
           <div className="space-y-1 text-xs">
-            {/* Row ⓪ — 近 7 天用量：请求 · 成本 · 截断率 · 首字（有统计才显示） */}
-            {usage && usage.requests > 0 && (
-              <div
-                className="flex flex-wrap items-center gap-x-2 gap-y-0.5 font-mono text-muted-foreground"
-                title="近 7 天用量"
-              >
-                <span className="inline-flex items-center gap-1" title="近7天请求数">
-                  <Activity className="h-3 w-3" />
-                  <span className="text-foreground">{usage.requests}</span>
-                </span>
-                <span className="text-muted-foreground/40">·</span>
-                <span className="inline-flex items-center gap-1" title="近7天实际成本">
-                  <CircleDollarSign className="h-3 w-3" />
-                  <span className="text-foreground">{fmtUsd(usage.actual_usd)}</span>
-                </span>
-                <span className="text-muted-foreground/40">·</span>
-                <span
-                  className={cn('inline-flex items-center gap-1', truncRate >= 10 && 'text-warn')}
-                  title="近7天截断率（stop_reason=max_tokens）"
-                >
-                  <Scissors className="h-3 w-3" />
-                  {truncRate.toFixed(0)}%
-                </span>
-                <span className="text-muted-foreground/40">·</span>
-                <span className="inline-flex items-center gap-1" title="近7天首字 TTFT 趋势 / 平均">
-                  {ttftSeries && ttftSeries.length >= 2 ? (
-                    <LineChart
-                      width={56}
-                      height={16}
-                      data={ttftSeries.map((v, i) => ({ i, v }))}
-                      margin={{ top: 3, right: 1, bottom: 3, left: 1 }}
-                    >
-                      <Line
-                        type="monotone"
-                        dataKey="v"
-                        stroke="#f59e0b"
-                        strokeWidth={1.5}
-                        dot={false}
-                        isAnimationActive={false}
-                      />
-                    </LineChart>
-                  ) : (
-                    <Clock className="h-3 w-3" />
-                  )}
-                  {fmtMs(usage.avg_ttft_ms)}
-                </span>
-              </div>
-            )}
-            {/* Row ① — 优先级 · 成功/失败 · 最近使用 */}
+            {/* 活动（常驻）：优先级 · 成功/失败 · 最近使用 */}
             <div className="flex items-center gap-x-2">
             {/* 优先级（可编辑） */}
             {readOnly ? (
@@ -751,38 +720,21 @@ export function CredentialCard({
             </span>
             </div>
 
-            {/* Row ② — 限流器：RPM · 并发（任一生效才整体出现，作为一个分组一起换行） */}
-            {(rpmActive || concurrencyActive) && (
-              <div className="flex items-center gap-x-2">
-                {/* RPM 滑动窗口指示器 */}
-                {rpmActive && (
-                  <span
-                    className={cn('inline-flex items-center gap-1 tnum font-mono', rpmColorClass)}
-                    title={`RPM ${rpmCurrent}/${effectiveRpm} · 60s 窗口${typeof credential.rpmLimit !== 'number' ? '（默认）' : ''}`}
-                  >
-                    <Gauge className="h-3 w-3" />
-                    {rpmCurrent}/{effectiveRpm}
-                  </span>
-                )}
-
-                {rpmActive && concurrencyActive && (
-                  <span className="text-muted-foreground/40">·</span>
-                )}
-
-                {/* 并发在途指示器 */}
-                {concurrencyActive && (
-                  <span
-                    className={cn('inline-flex items-center gap-1 tnum font-mono', concurrencyColorClass)}
-                    title={`并发 ${concurrencyCurrent}/${effectiveConcurrency} 在途${typeof credential.concurrencyLimit !== 'number' ? '（默认）' : ''}`}
-                  >
-                    <Activity className="h-3 w-3" />
-                    {concurrencyCurrent}/{effectiveConcurrency}
-                  </span>
-                )}
+            {/* 近7天错误率：有失败才红字常驻（健康告警）；无失败收进详情 */}
+            {hasErrors && (
+              <div
+                className="flex items-center gap-1 font-mono text-bad"
+                title={`近7天 ${usageTotal} 次请求中 ${usage!.failures} 次失败（上游 API 错误）`}
+              >
+                <AlertTriangle className="h-3 w-3" />
+                错误率 {errRate.toFixed(1)}% · {usage!.failures} 次失败
               </div>
             )}
 
-            {/* Row ③ — Token 健康：仅在临期/过期/刷新失败时显示（正常态不占行） */}
+            {/* 限流告警态（常驻，仅 ≥70%/耗尽时；正常占用收进详情） */}
+            {limiterWarn && limiterRow}
+
+            {/* Token 健康：仅在临期/过期/刷新失败时常驻显示（正常态收进详情） */}
             {tokenIssue && (
               <div className="flex items-center gap-x-2 font-mono">
                 {expiryMs != null && (
@@ -806,6 +758,146 @@ export function CredentialCard({
                   </>
                 )}
               </div>
+            )}
+
+            {/* 详情切换 */}
+            <button
+              onClick={() => setShowDetails(v => !v)}
+              className="inline-flex cursor-pointer items-center gap-0.5 font-mono text-muted-foreground transition-colors hover:text-foreground"
+              aria-expanded={showDetails}
+            >
+              {showDetails ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+              详情
+            </button>
+
+            {/* 详情展开区：键值对齐的 properties list（标签左 / 值右） */}
+            {showDetails && (
+              <dl className="grid grid-cols-[auto_1fr] items-center gap-x-4 gap-y-1.5 rounded-md bg-muted/30 px-2.5 py-2 font-mono text-2xs">
+                {usage && usage.requests > 0 && (
+                  <>
+                    <dt className="text-muted-foreground">近7天请求</dt>
+                    <dd className="tnum justify-self-end text-foreground">{usage.requests}</dd>
+                    <dt className="text-muted-foreground">首字延迟</dt>
+                    <dd
+                      className="flex items-center justify-end gap-1 justify-self-end text-foreground"
+                      title="近7天首字 TTFT 趋势 / 平均"
+                    >
+                      {ttftSeries && ttftSeries.length >= 2 && (
+                        <LineChart
+                          width={56}
+                          height={16}
+                          data={ttftSeries.map((v, i) => ({ i, v }))}
+                          margin={{ top: 3, right: 1, bottom: 3, left: 1 }}
+                        >
+                          <Line
+                            type="monotone"
+                            dataKey="v"
+                            stroke="#f59e0b"
+                            strokeWidth={1.5}
+                            dot={false}
+                            isAnimationActive={false}
+                          />
+                        </LineChart>
+                      )}
+                      <span className="tnum">{fmtMs(usage.avg_ttft_ms)}</span>
+                    </dd>
+                    <dt className="text-muted-foreground">平均耗时</dt>
+                    <dd className="tnum justify-self-end text-foreground" title="近7天平均总耗时">
+                      {fmtMs(usage.avg_elapsed_ms)}
+                    </dd>
+                    {!hasErrors && (
+                      <>
+                        <dt className="text-muted-foreground">错误率</dt>
+                        <dd className="tnum justify-self-end text-foreground">{errRate.toFixed(1)}%</dd>
+                      </>
+                    )}
+                  </>
+                )}
+
+                {/* 限流器（非告警态；告警态已在卡面常驻） */}
+                {limiterActive && !limiterWarn && rpmActive && (
+                  <>
+                    <dt className="text-muted-foreground">RPM</dt>
+                    <dd
+                      className={cn('tnum justify-self-end', rpmColorClass)}
+                      title={`RPM ${rpmCurrent}/${effectiveRpm} · 60s 窗口${typeof credential.rpmLimit !== 'number' ? '（默认）' : ''}`}
+                    >
+                      {rpmCurrent}/{effectiveRpm}
+                    </dd>
+                  </>
+                )}
+                {limiterActive && !limiterWarn && concurrencyActive && (
+                  <>
+                    <dt className="text-muted-foreground">并发在途</dt>
+                    <dd
+                      className={cn('tnum justify-self-end', concurrencyColorClass)}
+                      title={`并发 ${concurrencyCurrent}/${effectiveConcurrency} 在途${typeof credential.concurrencyLimit !== 'number' ? '（默认）' : ''}`}
+                    >
+                      {concurrencyCurrent}/{effectiveConcurrency}
+                    </dd>
+                  </>
+                )}
+
+                {/* Token 到期（正常态；异常态已在卡面常驻） */}
+                {!tokenIssue && expiryMs != null && (
+                  <>
+                    <dt className="text-muted-foreground">Token</dt>
+                    <dd className="justify-self-end text-foreground">{formatRemaining(expiryMs)}后过期</dd>
+                  </>
+                )}
+
+                {balance && credential.balanceCachedAt && (
+                  <>
+                    <dt className="text-muted-foreground">余额更新</dt>
+                    <dd
+                      className="justify-self-end text-foreground"
+                      title="余额为缓存值，非实时；点「余额」可拉取最新"
+                    >
+                      <RelativeTime value={unixToIso(credential.balanceCachedAt)} />
+                    </dd>
+                  </>
+                )}
+                {resetInDays != null && (
+                  <>
+                    <dt className="text-muted-foreground">额度重置</dt>
+                    <dd className="justify-self-end text-foreground">{resetInDays}天后</dd>
+                  </>
+                )}
+                {balance && (
+                  <>
+                    <dt className="text-muted-foreground">剩余额度</dt>
+                    <dd className="tnum justify-self-end text-foreground">{balance.remaining.toFixed(2)}</dd>
+                  </>
+                )}
+
+                {credential.createdAt != null && (
+                  <>
+                    <dt className="text-muted-foreground">添加于</dt>
+                    <dd className="justify-self-end text-foreground">
+                      <RelativeTime value={unixToIso(credential.createdAt)} />
+                    </dd>
+                  </>
+                )}
+
+                {proxyDisplay && (
+                  <>
+                    <dt className="text-muted-foreground">代理出口</dt>
+                    <dd
+                      className="max-w-[12rem] justify-self-end truncate text-foreground"
+                      title={proxyDisplay}
+                    >
+                      {proxyDisplay}
+                    </dd>
+                  </>
+                )}
+
+                {credential.hasProfileArn && (
+                  <>
+                    <dt className="text-muted-foreground">Profile ARN</dt>
+                    <dd className="justify-self-end text-foreground">已配置</dd>
+                  </>
+                )}
+              </dl>
             )}
           </div>
         </div>

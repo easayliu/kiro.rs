@@ -131,6 +131,22 @@ impl CredentialStore {
         upsert_with(&conn, cred)
     }
 
+    /// 批量 upsert（按 id 冲突更新），单事务，**只写传入的这些行、不删任何行**。
+    /// 供批量 set-* 定向回写「仅被改动的行」，避免 [`sync_all`](Self::sync_all) 全表重写。
+    /// 空集合为 no-op。
+    pub fn upsert_batch(&self, creds: &[KiroCredentials]) -> anyhow::Result<()> {
+        if creds.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        for cred in creds {
+            upsert_with(&tx, cred)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// 全量同步：把内存中的凭据集落库（upsert 全部 + 删除集合外的行），单事务原子。
     /// 供批量 admin 操作 / 删除后回写（频率低，几千行事务亦在毫秒级）。
     pub fn sync_all(&self, creds: &[KiroCredentials]) -> anyhow::Result<()> {
@@ -152,6 +168,31 @@ impl CredentialStore {
                 upsert_with(&tx, cred)?;
             }
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 批量删除凭据（按 id 集合），单事务 `DELETE ... WHERE id IN (...)`。
+    /// 同事务一并清理这些凭据的 `credential_stats` 残留行。空集合为 no-op。
+    pub fn delete_batch(&self, ids: &[u64]) -> anyhow::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let id_i64: Vec<i64> = ids.iter().map(|i| *i as i64).collect();
+        let placeholders = id_i64.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let params_ref: Vec<&dyn rusqlite::ToSql> =
+            id_i64.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
+
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            &format!("DELETE FROM credentials WHERE id IN ({placeholders})"),
+            params_ref.as_slice(),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM credential_stats WHERE credential_id IN ({placeholders})"),
+            params_ref.as_slice(),
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -289,7 +330,7 @@ impl CredentialStore {
 const COLS: &str = "id, access_token, refresh_token, profile_arn, expires_at, auth_method,
     kiro_api_key, client_id, client_secret, region, auth_region, api_region, machine_id,
     client_mode, proxy_url, proxy_username, proxy_password, group_name, email,
-    subscription_title, priority, disabled, rpm_limit, concurrency_limit, overage";
+    subscription_title, priority, disabled, rpm_limit, concurrency_limit, overage, created_at";
 
 /// 把一行映射回 `KiroCredentials`（列序同 [`COLS`]）。
 fn row_to_cred(row: &Row) -> rusqlite::Result<KiroCredentials> {
@@ -299,6 +340,7 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<KiroCredentials> {
     let rpm: Option<i64> = row.get(22)?;
     let conc: Option<i64> = row.get(23)?;
     let overage_i: Option<i64> = row.get(24)?;
+    let created_at: Option<i64> = row.get(25)?;
 
     Ok(KiroCredentials {
         id: row.get::<_, i64>(0).map(|v| v as u64).ok(),
@@ -326,6 +368,7 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<KiroCredentials> {
         rpm_limit: rpm.map(|v| v as u32),
         concurrency_limit: conc.map(|v| v as u32),
         overage: overage_i.map(|v| v != 0),
+        created_at,
     })
 }
 
@@ -496,6 +539,52 @@ mod tests {
         let all = s.load_all().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, Some(2));
+    }
+
+    #[test]
+    fn upsert_batch_writes_only_given_rows() {
+        let s = store();
+        s.upsert(&oauth(1, "rt-1")).unwrap();
+        s.upsert(&oauth(2, "rt-2")).unwrap();
+        s.upsert(&oauth(3, "rt-3")).unwrap();
+
+        // 只改 #1 #3 的 priority，定向回写这两行，不动 #2、不删任何行
+        let mut a = oauth(1, "rt-1");
+        a.priority = 11;
+        let mut c = oauth(3, "rt-3");
+        c.priority = 33;
+        s.upsert_batch(&[a, c]).unwrap();
+
+        let all = s.load_all().unwrap();
+        assert_eq!(all.len(), 3);
+        let p = |id: u64| all.iter().find(|c| c.id == Some(id)).unwrap().priority;
+        assert_eq!(p(1), 11);
+        assert_eq!(p(2), 0); // 未传入，保持原值
+        assert_eq!(p(3), 33);
+        // 空集合为 no-op
+        s.upsert_batch(&[]).unwrap();
+        assert_eq!(s.load_all().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn delete_batch_removes_rows_and_stats() {
+        let s = store();
+        s.upsert(&oauth(1, "rt-1")).unwrap();
+        s.upsert(&oauth(2, "rt-2")).unwrap();
+        s.upsert(&oauth(3, "rt-3")).unwrap();
+        s.save_credential_stats(&[(1, 9, None), (2, 8, None)]).unwrap();
+
+        s.delete_batch(&[1, 2]).unwrap();
+
+        let all = s.load_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, Some(3));
+        // #1 #2 的统计残留行一并清除
+        let stats = s.load_credential_stats().unwrap();
+        assert!(stats.iter().all(|(id, _, _)| *id != 1 && *id != 2));
+        // 空集合为 no-op
+        s.delete_batch(&[]).unwrap();
+        assert_eq!(s.load_all().unwrap().len(), 1);
     }
 
     #[test]

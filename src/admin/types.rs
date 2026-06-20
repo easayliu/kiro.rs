@@ -104,6 +104,9 @@ pub struct CredentialStatusItem {
     /// 余额缓存时间（Unix 秒），配合前端显示「更新于 X 前」。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance_cached_at: Option<i64>,
+    /// 凭据添加时间（Unix 秒）；None=老库迁移前无记录。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
 }
 
 // ============ 操作请求 ============
@@ -457,6 +460,22 @@ pub struct BatchSetCredentialGroupResponse {
 pub struct BatchSetCredentialGroupFailure {
     pub id: u64,
     pub error: String,
+}
+
+/// 批量删除凭据请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDeleteCredentialsRequest {
+    pub credential_ids: Vec<u64>,
+}
+
+/// 批量删除凭据响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDeleteCredentialsResponse {
+    pub total: usize,
+    pub succeeded: Vec<u64>,
+    pub failed: Vec<BatchSetCredentialGroupFailure>,
 }
 
 /// 批量设置凭据优先级请求

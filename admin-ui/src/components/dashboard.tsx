@@ -42,6 +42,7 @@ import { StatsView } from '@/components/stats-view'
 import {
   useCredentials,
   useDeleteCredential,
+  useBatchDeleteCredentials,
   useResetFailure,
   useLoadBalancingMode,
   useSetLoadBalancingMode,
@@ -59,7 +60,6 @@ import {
   useSetDefaultRpmLimit,
   useDefaultConcurrencyLimit,
   useSetDefaultConcurrencyLimit,
-  useBillingStats,
   useStatsSummary,
   useStatsTimeseries,
 } from '@/hooks/use-credentials'
@@ -208,6 +208,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }, [view])
   const { data, isLoading, error, refetch } = useCredentials()
   const { mutate: deleteCredential } = useDeleteCredential()
+  const { mutateAsync: batchDeleteCredentials } = useBatchDeleteCredentials()
   const { mutate: resetFailure } = useResetFailure()
   const batchSetPriorityMutation = useBatchSetPriority()
   const batchSetRpmLimitMutation = useBatchSetRpmLimit()
@@ -218,8 +219,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const setDefaultRpmMutation = useSetDefaultRpmLimit()
   const { data: defaultConcurrencyData } = useDefaultConcurrencyLimit()
   const setDefaultConcurrencyMutation = useSetDefaultConcurrencyLimit()
-  const { data: billingStats } = useBillingStats()
-  // 近 7 天每凭据用量（请求/成本/截断/TTFT），按 id 映射给卡片
+  // 近 7 天每凭据用量（请求/成本/TTFT），按 id 映射给卡片
   const { data: statsSummary } = useStatsSummary({ hours: 168 })
   const usageMap = useMemo(() => {
     const m = new Map<number, StatGroup>()
@@ -447,20 +447,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
     const skippedCount = selectedIds.size - disabledIds.length
     const skippedText = skippedCount > 0 ? `（将跳过 ${skippedCount} 个未禁用凭据）` : ''
     if (!confirm(`确定要删除 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。${skippedText}`)) return
-    let successCount = 0, failCount = 0
-    for (const id of disabledIds) {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          deleteCredential(id, {
-            onSuccess: () => { successCount++; resolve() },
-            onError: err => { failCount++; reject(err) },
-          })
-        })
-      } catch {}
-    }
     const tail = skippedCount > 0 ? `，已跳过 ${skippedCount} 个未禁用凭据` : ''
-    if (failCount === 0) toast.success(`成功删除 ${successCount} 个已禁用凭据${tail}`)
-    else toast.warning(`删除已禁用凭据：成功 ${successCount} 个，失败 ${failCount} 个${tail}`)
+    try {
+      const res = await batchDeleteCredentials(disabledIds)
+      if (res.failed.length === 0) toast.success(`成功删除 ${res.succeeded.length} 个已禁用凭据${tail}`)
+      else toast.warning(`删除已禁用凭据：成功 ${res.succeeded.length} 个，失败 ${res.failed.length} 个${tail}`)
+    } catch {
+      toast.error('批量删除失败')
+    }
     deselectAll()
   }
 
@@ -946,28 +940,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </div>
           </div>
           {/* 视图切换：凭据 / 统计 */}
-          <div className="inline-flex items-center gap-0.5 rounded-xl border border-border bg-muted/40 p-0.5">
-            <button
-              onClick={() => setView('credentials')}
-              className={cn(
-                'inline-flex cursor-pointer items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition-colors',
-                view === 'credentials' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground',
-              )}
-            >
-              <Users className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">凭据</span>
-            </button>
-            <button
-              onClick={() => setView('stats')}
-              className={cn(
-                'inline-flex cursor-pointer items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition-colors',
-                view === 'stats' ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground',
-              )}
-            >
-              <BarChart3 className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">统计</span>
-            </button>
-          </div>
+          <ViewSwitcher view={view} onChange={setView} />
           <div className="flex items-center gap-0.5">
             <MobileIconBtn onClick={toggleDarkMode} label={darkMode ? '浅色模式' : '深色模式'}>
               {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
@@ -1054,38 +1027,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </button>
             </div>
           </section>
-
-          {/* ━━━━━━━━━━━━ BILLING SUMMARY ━━━━━━━━━━━━ */}
-          {billingStats && (
-            <section className="mb-5 sm:mb-6">
-              <div className="flex flex-col gap-3 lg:grid lg:grid-cols-10">
-                <MarginCard stats={billingStats} className="lg:col-span-4" />
-                {/* 3 辅指标：移动端 3-up 一行，桌面端 lg:contents 融入 12 栅格 */}
-                <div className="grid grid-cols-3 gap-2.5 sm:gap-3 lg:contents">
-                  <BillingStatCard
-                    className="lg:col-span-2"
-                    label="累计请求"
-                    value={billingStats.requests.toLocaleString('en-US')}
-                    icon={<Activity className="h-3.5 w-3.5" />}
-                  />
-                  <BillingStatCard
-                    className="lg:col-span-2"
-                    label="实际成本"
-                    value={formatUsd(billingStats.actual_cost_usd)}
-                    hint="上游折扣后真实成本"
-                    icon={<CircleDollarSign className="h-3.5 w-3.5" />}
-                  />
-                  <BillingStatCard
-                    className="lg:col-span-2"
-                    label="官方折算"
-                    value={formatUsd(billingStats.official_price_usd)}
-                    hint="Anthropic 零售价"
-                    icon={<Gauge className="h-3.5 w-3.5" />}
-                  />
-                </div>
-              </div>
-            </section>
-          )}
 
           {/* ━━━━━━━━━━━━ CONTENT ━━━━━━━━━━━━ */}
           <section>
@@ -1982,99 +1923,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
 // ─── Primitives ───
 
-// 格式化 USD 金额：自适应小数位（小额保留更多位以免显示为 $0.00）
-function formatUsd(usd: number): string {
-  const abs = Math.abs(usd)
-  const digits = abs >= 100 ? 2 : abs >= 1 ? 3 : 4
-  const sign = usd < 0 ? '-' : ''
-  return `${sign}$${abs.toLocaleString('en-US', {
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
-  })}`
-}
-
-// 计费焦点卡：累计毛利放大 + 成本/毛利占比条 + 品牌渐变描边
-function MarginCard({ stats, className }: {
-  stats: { requests: number; actual_cost_usd: number; official_price_usd: number; margin_usd: number }
-  className?: string
-}) {
-  const positive = stats.margin_usd >= 0
-  const official = stats.official_price_usd
-  const marginRate = official > 0 ? (stats.margin_usd / official) * 100 : 0
-  // 成本 / 毛利在官方零售价中的占比（毛利为负时仅显示成本占满）
-  const costPct = official > 0 ? Math.min(100, Math.max(0, (stats.actual_cost_usd / official) * 100)) : 0
-  const marginPct = official > 0 && positive ? Math.min(100, Math.max(0, (stats.margin_usd / official) * 100)) : 0
-  return (
-    <div
-      className={cn(
-        'relative overflow-hidden rounded-2xl border border-border bg-card p-3.5 shadow-elev sm:p-4',
-        className,
-      )}
-    >
-      <div className="relative">
-        <div className="flex items-center justify-between">
-          <span className="label-eyebrow">累计毛利 · margin</span>
-          <span
-            className={cn(
-              'tnum inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-mono text-2xs font-semibold',
-              positive ? 'bg-ok-soft text-ok' : 'bg-bad-soft text-bad',
-            )}
-          >
-            {positive ? '▲' : '▼'} {official > 0 ? `${marginRate.toFixed(1)}%` : '—'}
-          </span>
-        </div>
-        <div className={cn('tnum mt-1.5 text-2xl font-bold leading-none tracking-tight sm:text-3xl', positive ? 'text-ok' : 'text-bad')}>
-          {formatUsd(stats.margin_usd)}
-        </div>
-
-        {/* 成本 / 毛利占比条 */}
-        <div className="mt-3">
-          <div className="flex h-1.5 w-full overflow-hidden rounded-full bg-muted">
-            <div className="h-full bg-muted-foreground/40" style={{ width: `${costPct}%` }} />
-            <div className="bg-foreground h-full" style={{ width: `${marginPct}%` }} />
-          </div>
-          <div className="mt-1.5 flex items-center justify-between font-mono text-2xs text-muted-foreground">
-            <span className="inline-flex items-center gap-1.5">
-              <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/40" />
-              成本 {formatUsd(stats.actual_cost_usd)}
-            </span>
-            <span className="inline-flex items-center gap-1.5">
-              <span className="h-1.5 w-1.5 rounded-full bg-foreground" />
-              官方折算 {formatUsd(official)}
-            </span>
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// 计费辅助指标卡
-function BillingStatCard({
-  label, value, hint, icon, className,
-}: {
-  label: string
-  value: string
-  hint?: string
-  icon?: ReactNode
-  className?: string
-}) {
-  return (
-    <div className={cn('group min-w-0 rounded-2xl border border-border bg-card px-3 py-2.5 shadow-elev transition-colors hover:border-foreground/30 sm:px-4 sm:py-3.5', className)}>
-      <div className="flex items-center gap-1 overflow-hidden whitespace-nowrap text-2xs font-medium uppercase tracking-wider text-muted-foreground sm:gap-1.5">
-        {icon && <span className="shrink-0 text-muted-foreground/70 transition-colors group-hover:text-foreground">{icon}</span>}
-        <span className="truncate">{label}</span>
-      </div>
-      <div className="tnum mt-1.5 truncate text-base font-semibold leading-none tracking-tight text-foreground sm:text-xl">
-        {value}
-      </div>
-      {hint && (
-        <div className="mt-1 hidden truncate font-mono text-2xs text-muted-foreground sm:block">{hint}</div>
-      )}
-    </div>
-  )
-}
-
 function MobileIconBtn({
   children, onClick, label, title,
 }: { children: ReactNode; onClick?: () => void; label: string; title?: string }) {
@@ -2087,6 +1935,56 @@ function MobileIconBtn({
     >
       {children}
     </button>
+  )
+}
+
+// 顶部视图切换：凭据 / 统计。等宽双标签 + 滑动指示器（pill 随选中项平移），
+// 移动端同样显示文字，点按区域加大；指示器用 iOS spring 缓动平移。
+function ViewSwitcher({
+  view, onChange,
+}: {
+  view: 'credentials' | 'stats'
+  onChange: (v: 'credentials' | 'stats') => void
+}) {
+  const tabs = [
+    { key: 'credentials' as const, label: '凭据', Icon: Users },
+    { key: 'stats' as const, label: '统计', Icon: BarChart3 },
+  ]
+  return (
+    <div
+      role="tablist"
+      aria-label="视图切换"
+      className="relative inline-flex items-center rounded-xl border border-border bg-muted/40 p-0.5"
+    >
+      {/* 滑动指示器：宽度恰为半幅，随选中项左/右平移 */}
+      <span
+        aria-hidden
+        className="absolute inset-y-0.5 left-0.5 rounded-lg bg-background shadow-sm ring-1 ring-border/40 transition-transform duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]"
+        style={{
+          width: 'calc(50% - 2px)',
+          transform: view === 'stats' ? 'translateX(100%)' : 'translateX(0)',
+        }}
+      />
+      {tabs.map(({ key, label, Icon }) => {
+        const active = view === key
+        return (
+          <button
+            key={key}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            onClick={() => onChange(key)}
+            className={cn(
+              'relative z-10 inline-flex flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors',
+              active ? 'text-foreground' : 'text-muted-foreground hover:text-foreground',
+            )}
+          >
+            <Icon className="h-3.5 w-3.5 shrink-0" />
+            <span>{label}</span>
+          </button>
+        )
+      })}
+    </div>
   )
 }
 

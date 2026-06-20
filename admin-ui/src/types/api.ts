@@ -53,6 +53,8 @@ export interface CredentialStatusItem {
   balance?: BalanceResponse
   /** 余额缓存时间（Unix 秒） */
   balanceCachedAt?: number
+  /** 凭据添加时间（Unix 秒）；老库迁移前的凭据可能不存在 */
+  createdAt?: number
 }
 
 // 余额响应
@@ -192,6 +194,12 @@ export interface BatchSetPriorityResponse {
   failed: BatchSetCredentialGroupFailure[]
 }
 
+export interface BatchDeleteCredentialsResponse {
+  total: number
+  succeeded: number[]
+  failed: BatchSetCredentialGroupFailure[]
+}
+
 export interface BatchSetRpmLimitResponse {
   total: number
   succeeded: number[]
@@ -252,6 +260,8 @@ export interface StatsTimeBucket {
   /** 分组键（分组时存在）：model 名 或 credential id */
   group?: string
   requests: number
+  /** 该桶内失败请求数（上游 API 错误） */
+  failures: number
   actual_usd: number
   official_usd: number
   margin_usd: number
@@ -259,8 +269,6 @@ export interface StatsTimeBucket {
   cache_read: number
   cache_creation: number
   output_tokens: number
-  /** 该桶内 max_tokens 截断请求数 */
-  truncated: number
   avg_ttft_ms: number
   avg_elapsed_ms: number
 }
@@ -270,6 +278,8 @@ export interface StatGroup {
   /** 分组键：model 名 / credential id；全量为空串 */
   key: string
   requests: number
+  /** 失败请求数（上游 API 错误） */
+  failures: number
   actual_usd: number
   official_usd: number
   margin_usd: number
@@ -277,7 +287,6 @@ export interface StatGroup {
   cache_read: number
   cache_creation: number
   output_tokens: number
-  truncated: number
   avg_ttft_ms: number
   avg_elapsed_ms: number
 }

@@ -111,7 +111,37 @@ fn update_binding_after_call(
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
-fn map_provider_error(err: Error) -> Response {
+/// 把 provider 错误映射为下游响应，并记一条失败请求时序统计。
+///
+/// `model` 仅用于统计归类。失败统计口径只含「上游 API 错误」（call_api 返回 Err），
+/// 流中途截断不计（见 create_truncation_error_sse 分支）。status_code 取上游 HTTP
+/// 状态码；无 HTTP 响应的内部错误用映射码（无可用凭据 503、其它 502）。失败行的
+/// token/成本/延迟均为 0，只进错误率统计，不污染成功侧聚合。
+fn map_provider_error(err: Error, model: &str) -> Response {
+    // 失败请求时序统计：状态码按错误类型归类（凭据全禁 503 / 上游 HTTP 透传 / 兜底 502）。
+    let stat_status: i64 = if err.downcast_ref::<NoAvailableCredentialsError>().is_some() {
+        503
+    } else if let Some(upstream) = err.downcast_ref::<UpstreamHttpError>() {
+        upstream.status as i64
+    } else {
+        502
+    };
+    crate::stats::record(crate::stats::RequestStat {
+        ts: 0,
+        model: model.to_string(),
+        credential_id: 0,
+        actual_micro: 0,
+        official_micro: 0,
+        margin_micro: 0,
+        input_tokens: 0,
+        cache_read: 0,
+        cache_creation: 0,
+        output_tokens: 0,
+        ttft_ms: 0,
+        elapsed_ms: 0,
+        status_code: stat_status,
+    });
+
     // 内部"无可用凭据"：请求未发到上游，503 服务不可用更准确
     if let Some(no_creds) = err.downcast_ref::<NoAvailableCredentialsError>() {
         tracing::warn!(error = %err, "服务暂时不可用：所有凭据均已禁用");
@@ -489,7 +519,7 @@ async fn handle_stream_request(
                 None,
                 model,
             );
-            return map_provider_error(e);
+            return map_provider_error(e, model);
         }
     };
     update_binding_after_call(
@@ -819,7 +849,7 @@ async fn handle_non_stream_request(
                 None,
                 model,
             );
-            return map_provider_error(e);
+            return map_provider_error(e, model);
         }
     };
     update_binding_after_call(
@@ -1057,8 +1087,7 @@ async fn handle_non_stream_request(
     );
     let margin = ((official - actual) * 1_000_000.0).round() / 1_000_000.0;
     // 进程维度累计实际成本/官方价/毛利，供 admin 只读接口查询（无锁原子，零热路径开销）。
-    let truncated = stop_reason == "max_tokens";
-    super::billing_stats().record(actual, official, margin, truncated);
+    super::billing_stats().record(actual, official, margin);
     // 请求级时序统计（非流式无 TTFT，记 0）。
     crate::stats::record(crate::stats::RequestStat {
         ts: 0,
@@ -1073,7 +1102,7 @@ async fn handle_non_stream_request(
         output_tokens: output_tokens as i64,
         ttft_ms: 0,
         elapsed_ms: request_start.elapsed().as_millis() as i64,
-        truncated,
+        status_code: 0,
     });
     tracing::info!(
         model = %model,
@@ -1350,7 +1379,7 @@ async fn handle_stream_request_buffered(
                 None,
                 model,
             );
-            return map_provider_error(e);
+            return map_provider_error(e, model);
         }
     };
     update_binding_after_call(

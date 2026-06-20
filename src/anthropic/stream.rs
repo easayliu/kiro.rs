@@ -1460,8 +1460,7 @@ impl StreamContext {
         let margin = ((official - actual) * 1_000_000.0).round() / 1_000_000.0;
         // 进程维度累计实际成本/官方价/毛利，供 admin 只读接口查询（无锁原子，零热路径开销）。
         let stop_reason = self.state_manager.get_stop_reason();
-        let truncated = stop_reason == "max_tokens";
-        super::billing_stats().record(actual, official, margin, truncated);
+        super::billing_stats().record(actual, official, margin);
         // TTFT（首字耗时）：从「向上游发出请求」（ttft_origin，未注入则回退 start）到
         // 上游首字节。以发出请求为原点才能量到上游"等首 token"的等待——流式下上游常等
         // 首 token 生成好才 flush 响应头，若从响应头起算几乎恒为 0。
@@ -1485,7 +1484,7 @@ impl StreamContext {
             output_tokens: self.output_tokens as i64,
             ttft_ms: ttft_ms as i64,
             elapsed_ms: self.start.elapsed().as_millis() as i64,
-            truncated,
+            status_code: 0,
         });
         tracing::info!(
             model = %self.model,

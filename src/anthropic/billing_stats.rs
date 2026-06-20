@@ -33,9 +33,6 @@ pub struct BillingStats {
     official_price_micro: AtomicI64,
     /// 累计毛利（微美元，可为负）。
     margin_micro: AtomicI64,
-    /// 累计 stop_reason == "max_tokens" 的请求数（输出被截断/思考预算耗尽）。
-    /// 与 requests 之比即「截断命中率」，用于判断上游默认输出上限是否偏低。
-    max_tokens_truncated: AtomicU64,
 
     /// SQLite 连接（kiro.db；未配置时不持久化，仅进程内累计）。
     db: Mutex<Option<Connection>>,
@@ -68,14 +65,20 @@ fn open_db(path: &PathBuf) -> rusqlite::Result<Connection> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS billing_totals (
-            id                   INTEGER PRIMARY KEY CHECK (id = 1),
-            requests             INTEGER NOT NULL DEFAULT 0,
-            actual_micro         INTEGER NOT NULL DEFAULT 0,
-            official_micro       INTEGER NOT NULL DEFAULT 0,
-            margin_micro         INTEGER NOT NULL DEFAULT 0,
-            max_tokens_truncated INTEGER NOT NULL DEFAULT 0
+            id             INTEGER PRIMARY KEY CHECK (id = 1),
+            requests       INTEGER NOT NULL DEFAULT 0,
+            actual_micro   INTEGER NOT NULL DEFAULT 0,
+            official_micro INTEGER NOT NULL DEFAULT 0,
+            margin_micro   INTEGER NOT NULL DEFAULT 0
         ) STRICT;",
     )?;
+    // 迁移：删除已废弃的 max_tokens_truncated 列（kiro 不支持 max_tokens 截断，指标无意义）。
+    if conn
+        .prepare("SELECT 1 FROM pragma_table_info('billing_totals') WHERE name = 'max_tokens_truncated'")?
+        .exists([])?
+    {
+        conn.execute_batch("ALTER TABLE billing_totals DROP COLUMN max_tokens_truncated;")?;
+    }
     Ok(conn)
 }
 
@@ -91,9 +94,6 @@ struct PersistedStats {
     actual_cost_micro: i64,
     official_price_micro: i64,
     margin_micro: i64,
-    /// 旧缓存文件无此字段，缺失时默认 0。
-    #[serde(default)]
-    max_tokens_truncated: u64,
 }
 
 impl BillingStats {
@@ -110,7 +110,7 @@ impl BillingStats {
         // 1) 优先从表加载。
         let loaded = conn
             .query_row(
-                "SELECT requests, actual_micro, official_micro, margin_micro, max_tokens_truncated
+                "SELECT requests, actual_micro, official_micro, margin_micro
                  FROM billing_totals WHERE id = 1",
                 [],
                 |r| {
@@ -119,19 +119,17 @@ impl BillingStats {
                         r.get::<_, i64>(1)?,
                         r.get::<_, i64>(2)?,
                         r.get::<_, i64>(3)?,
-                        r.get::<_, i64>(4)?,
                     ))
                 },
             )
             .optional()
             .unwrap_or(None);
 
-        if let Some((req, act, off, mar, trunc)) = loaded {
+        if let Some((req, act, off, mar)) = loaded {
             self.requests.store(req as u64, Ordering::Relaxed);
             self.actual_cost_micro.store(act, Ordering::Relaxed);
             self.official_price_micro.store(off, Ordering::Relaxed);
             self.margin_micro.store(mar, Ordering::Relaxed);
-            self.max_tokens_truncated.store(trunc as u64, Ordering::Relaxed);
             tracing::info!(requests = req, "已从 SQLite 加载计费累计统计");
         } else if let Some(p) = path
             .parent()
@@ -143,7 +141,6 @@ impl BillingStats {
             self.actual_cost_micro.store(p.actual_cost_micro, Ordering::Relaxed);
             self.official_price_micro.store(p.official_price_micro, Ordering::Relaxed);
             self.margin_micro.store(p.margin_micro, Ordering::Relaxed);
-            self.max_tokens_truncated.store(p.max_tokens_truncated, Ordering::Relaxed);
             tracing::info!(requests = p.requests, "已从 billing_stats.json 迁移计费累计入库");
         }
 
@@ -155,9 +152,7 @@ impl BillingStats {
     }
 
     /// 记录一次请求的计费结果。在每请求收尾路径调用一次。
-    ///
-    /// `truncated`：本次 stop_reason 是否为 `max_tokens`（输出被截断 / 思考预算耗尽）。
-    pub fn record(&self, actual_usd: f64, official_usd: f64, margin_usd: f64, truncated: bool) {
+    pub fn record(&self, actual_usd: f64, official_usd: f64, margin_usd: f64) {
         self.requests.fetch_add(1, Ordering::Relaxed);
         self.actual_cost_micro
             .fetch_add(to_micro(actual_usd), Ordering::Relaxed);
@@ -165,9 +160,6 @@ impl BillingStats {
             .fetch_add(to_micro(official_usd), Ordering::Relaxed);
         self.margin_micro
             .fetch_add(to_micro(margin_usd), Ordering::Relaxed);
-        if truncated {
-            self.max_tokens_truncated.fetch_add(1, Ordering::Relaxed);
-        }
         self.save_debounced();
     }
 
@@ -199,20 +191,18 @@ impl BillingStats {
 
         let r = conn.execute(
             "INSERT INTO billing_totals
-                (id, requests, actual_micro, official_micro, margin_micro, max_tokens_truncated)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5)
+                (id, requests, actual_micro, official_micro, margin_micro)
+             VALUES (1, ?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET
                 requests = excluded.requests,
                 actual_micro = excluded.actual_micro,
                 official_micro = excluded.official_micro,
-                margin_micro = excluded.margin_micro,
-                max_tokens_truncated = excluded.max_tokens_truncated",
+                margin_micro = excluded.margin_micro",
             rusqlite::params![
                 self.requests.load(Ordering::Relaxed) as i64,
                 self.actual_cost_micro.load(Ordering::Relaxed),
                 self.official_price_micro.load(Ordering::Relaxed),
                 self.margin_micro.load(Ordering::Relaxed),
-                self.max_tokens_truncated.load(Ordering::Relaxed) as i64,
             ],
         );
         match r {
@@ -230,18 +220,11 @@ impl BillingStats {
         let official_micro = self.official_price_micro.load(Ordering::Relaxed);
         let margin_micro = self.margin_micro.load(Ordering::Relaxed);
         let requests = self.requests.load(Ordering::Relaxed);
-        let truncated = self.max_tokens_truncated.load(Ordering::Relaxed);
         BillingStatsSnapshot {
             requests,
             actual_cost_usd: actual_micro as f64 / 1_000_000.0,
             official_price_usd: official_micro as f64 / 1_000_000.0,
             margin_usd: margin_micro as f64 / 1_000_000.0,
-            max_tokens_truncated: truncated,
-            max_tokens_truncated_rate: if requests > 0 {
-                truncated as f64 / requests as f64
-            } else {
-                0.0
-            },
         }
     }
 }
@@ -257,8 +240,4 @@ pub struct BillingStatsSnapshot {
     pub official_price_usd: f64,
     /// 累计毛利（USD，可为负）。
     pub margin_usd: f64,
-    /// 累计 stop_reason == "max_tokens" 的请求数（输出被截断）。
-    pub max_tokens_truncated: u64,
-    /// 截断命中率 = max_tokens_truncated / requests（无请求时为 0）。
-    pub max_tokens_truncated_rate: f64,
 }

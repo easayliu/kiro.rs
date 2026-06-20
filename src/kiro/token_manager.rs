@@ -893,6 +893,9 @@ pub struct CredentialEntrySnapshot {
     /// overage（超额计费）上次下发状态（None=从未下发，状态未知）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overage: Option<bool>,
+    /// 凭据添加时间（Unix 秒）；None=老库迁移前无记录
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
 }
 
 /// 凭据管理器状态快照
@@ -1934,6 +1937,40 @@ impl MultiTokenManager {
         Ok(true)
     }
 
+    /// 把内存中**指定 id 集合**的凭据 upsert 到 SQLite（单事务，只写这些行、不删行）。
+    ///
+    /// 批量 set-* 用此：只回写被改动的那几行，避免 [`persist_credentials`](Self::persist_credentials)
+    /// 的全表重写。写入量为 O(改动行数) 而非 O(全表)，凭据规模增长时尤为重要。
+    ///
+    /// # Returns
+    /// - `Ok(true)` - 已写入（即使集合为空也算成功，底层 no-op）
+    /// - `Ok(false)` - 跳过（未配置 store）
+    fn persist_credentials_subset(&self, ids: &[u64]) -> anyhow::Result<bool> {
+        let store = match &self.store {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+
+        let id_set: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        let creds: Vec<KiroCredentials> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .filter(|e| id_set.contains(&e.id))
+                .map(|e| {
+                    let mut cred = e.credentials.clone();
+                    cred.canonicalize_auth_method();
+                    cred.disabled = e.disabled;
+                    cred
+                })
+                .collect()
+        };
+
+        store.upsert_batch(&creds)?;
+        tracing::debug!("已定向 upsert {} 个凭据到 SQLite", creds.len());
+        Ok(true)
+    }
+
     /// 获取缓存目录（凭据文件所在目录）
     pub fn cache_dir(&self) -> Option<PathBuf> {
         self.credentials_path
@@ -2461,6 +2498,7 @@ impl MultiTokenManager {
                     concurrency_limit: e.credentials.concurrency_limit,
                     concurrency_current: e.inflight.load(Ordering::Relaxed) as u32,
                     overage: e.credentials.overage,
+                    created_at: e.credentials.created_at,
                 })
                 .collect(),
             current_id,
@@ -2490,7 +2528,7 @@ impl MultiTokenManager {
             }
         }
         // 持久化更改
-        self.persist_credentials()?;
+        self.persist_credential(id)?;
         Ok(())
     }
 
@@ -2510,7 +2548,7 @@ impl MultiTokenManager {
         // 立即按新优先级重新选择当前凭据（无论持久化是否成功）
         self.select_highest_priority();
         // 持久化更改
-        self.persist_credentials()?;
+        self.persist_credential(id)?;
         Ok(())
     }
 
@@ -2556,7 +2594,7 @@ impl MultiTokenManager {
         }
 
         if !succeeded.is_empty() {
-            if let Err(err) = self.persist_credentials() {
+            if let Err(err) = self.persist_credentials_subset(&succeeded) {
                 let msg = err.to_string();
                 let mut entries = self.entries.lock();
                 for (id, prev_disabled, prev_fc, prev_rfc, prev_reason) in &previous {
@@ -2617,7 +2655,7 @@ impl MultiTokenManager {
         }
 
         if !succeeded.is_empty() {
-            if let Err(err) = self.persist_credentials() {
+            if let Err(err) = self.persist_credentials_subset(&succeeded) {
                 let msg = err.to_string();
                 let mut entries = self.entries.lock();
                 for (id, prev) in &previous {
@@ -2659,7 +2697,7 @@ impl MultiTokenManager {
         if rpm_limit.unwrap_or(0) > 0 {
             self.rpm_feature_enabled.store(true, Ordering::Relaxed);
         }
-        self.persist_credentials()?;
+        self.persist_credential(id)?;
         Ok(())
     }
 
@@ -2692,7 +2730,7 @@ impl MultiTokenManager {
         }
 
         if !succeeded.is_empty() {
-            if let Err(err) = self.persist_credentials() {
+            if let Err(err) = self.persist_credentials_subset(&succeeded) {
                 let msg = err.to_string();
                 let mut entries = self.entries.lock();
                 for (id, prev) in &previous {
@@ -2732,7 +2770,7 @@ impl MultiTokenManager {
         if concurrency_limit.unwrap_or(0) > 0 {
             self.concurrency_feature_enabled.store(true, Ordering::Relaxed);
         }
-        self.persist_credentials()?;
+        self.persist_credential(id)?;
         Ok(())
     }
 
@@ -2769,7 +2807,7 @@ impl MultiTokenManager {
         }
 
         if !succeeded.is_empty() {
-            if let Err(err) = self.persist_credentials() {
+            if let Err(err) = self.persist_credentials_subset(&succeeded) {
                 let msg = err.to_string();
                 let mut entries = self.entries.lock();
                 for (id, prev) in &previous {
@@ -2808,7 +2846,7 @@ impl MultiTokenManager {
             entry.credentials.group = normalized;
         }
         // 持久化更改
-        self.persist_credentials()?;
+        self.persist_credential(id)?;
         Ok(())
     }
 
@@ -2844,7 +2882,7 @@ impl MultiTokenManager {
         }
 
         if !succeeded.is_empty() {
-            if let Err(err) = self.persist_credentials() {
+            if let Err(err) = self.persist_credentials_subset(&succeeded) {
                 let msg = err.to_string();
                 // 回滚已修改的内存条目
                 let mut entries = self.entries.lock();
@@ -2890,7 +2928,7 @@ impl MultiTokenManager {
             entry.disabled_reason = None;
         }
         // 持久化更改
-        self.persist_credentials()?;
+        self.persist_credential(id)?;
         Ok(())
     }
 
@@ -3016,7 +3054,7 @@ impl MultiTokenManager {
             };
 
             if changed {
-                if let Err(e) = self.persist_credentials() {
+                if let Err(e) = self.persist_credential(id) {
                     tracing::warn!("订阅等级更新后持久化失败（不影响本次请求）: {}", e);
                 }
             }
@@ -3116,6 +3154,8 @@ impl MultiTokenManager {
 
         // 5. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
+        // 添加时间：DB INSERT 默认 unixepoch()，此处同步写入内存 entry，免重启即可展示。
+        validated_cred.created_at = Some(Utc::now().timestamp());
         validated_cred.priority = new_cred.priority;
         validated_cred.auth_method = new_cred.auth_method.map(|m| {
             if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
@@ -3156,8 +3196,8 @@ impl MultiTokenManager {
             });
         }
 
-        // 6. 持久化
-        self.persist_credentials()?;
+        // 6. 持久化（只插入新增这一行，不必全量回写）
+        self.persist_credential(new_id)?;
 
         tracing::info!("成功添加凭据 #{}", new_id);
         Ok(new_id)
@@ -3165,71 +3205,105 @@ impl MultiTokenManager {
 
     /// 删除凭据（Admin API）
     ///
-    /// # 前置条件
-    /// - 凭据必须已禁用（disabled = true）
-    ///
-    /// # 行为
-    /// 1. 验证凭据存在
-    /// 2. 验证凭据已禁用
-    /// 3. 从 entries 移除
-    /// 4. 如果删除的是当前凭据，切换到优先级最高的可用凭据
-    /// 5. 如果删除后没有凭据，将 current_id 重置为 0
-    /// 6. 持久化到文件
-    ///
-    /// # 返回
-    /// - `Ok(())` - 删除成功
-    /// - `Err(_)` - 凭据不存在、未禁用或持久化失败
+    /// 前置条件：凭据必须已禁用。语义/落库与 [`Self::delete_credential_batch`] 完全一致，
+    /// 此处仅是单 id 的便捷包装（转调 batch 后把结果映射回 `Result`），避免重复维护两套逻辑。
+    /// 失败信息沿用 batch 的措辞，admin 层 `classify_delete_error` 据此区分不存在/未禁用/内部错误。
     pub fn delete_credential(&self, id: u64) -> anyhow::Result<()> {
-        let was_current = {
+        let result = self.delete_credential_batch(&[id]);
+        if result.succeeded.contains(&id) {
+            return Ok(());
+        }
+        let err = result
+            .failed
+            .into_iter()
+            .find(|f| f.id == id)
+            .map(|f| f.error)
+            .unwrap_or_else(|| format!("删除凭据 #{} 失败", id));
+        Err(anyhow::anyhow!(err))
+    }
+
+    /// 批量删除凭据（Admin API）
+    ///
+    /// 语义与单条 [`Self::delete_credential`] 一致：仅删除**已禁用**的凭据；不存在或未禁用
+    /// 的进入 `failed`，其余删除。落库走 [`CredentialStore::delete_batch`] 单事务批量删除，
+    /// 一次 IO 完成整批。持久化失败时回滚内存（把已移除条目放回），整批转为失败。
+    pub fn delete_credential_batch(&self, ids: &[u64]) -> BatchSetGroupResult {
+        let mut succeeded = Vec::new();
+        let mut failed: Vec<BatchSetGroupFailure> = Vec::new();
+        let mut removed: Vec<CredentialEntry> = Vec::new();
+
+        {
             let mut entries = self.entries.lock();
-
-            // 查找凭据
-            let entry = entries
-                .iter()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-
-            // 检查是否已禁用
-            if !entry.disabled {
-                anyhow::bail!("只能删除已禁用的凭据（请先禁用凭据 #{}）", id);
+            // 入口去重：同一 id 重复传入只处理一次，避免「删一次 + 余下报不存在」的矛盾结果
+            let mut seen = std::collections::HashSet::new();
+            for id in ids {
+                if !seen.insert(*id) {
+                    continue;
+                }
+                match entries.iter().position(|e| e.id == *id) {
+                    Some(pos) => {
+                        if !entries[pos].disabled {
+                            failed.push(BatchSetGroupFailure {
+                                id: *id,
+                                error: format!("只能删除已禁用的凭据（请先禁用凭据 #{}）", id),
+                            });
+                            continue;
+                        }
+                        removed.push(entries.remove(pos));
+                        succeeded.push(*id);
+                    }
+                    None => failed.push(BatchSetGroupFailure {
+                        id: *id,
+                        error: format!("凭据不存在: {}", id),
+                    }),
+                }
             }
+        }
 
-            // 记录是否是当前凭据
-            let current_id = *self.current_id.lock();
-            let was_current = current_id == id;
+        if succeeded.is_empty() {
+            return BatchSetGroupResult { succeeded, failed };
+        }
 
-            // 删除凭据
-            entries.retain(|e| e.id != id);
+        // 持久化：单事务批量删除（同事务清理统计残留行）
+        if let Some(store) = &self.store {
+            if let Err(err) = store.delete_batch(&succeeded) {
+                // 回滚：把已移除的条目放回内存，整批转为失败
+                let msg = err.to_string();
+                {
+                    let mut entries = self.entries.lock();
+                    entries.extend(removed);
+                }
+                for id in &succeeded {
+                    failed.push(BatchSetGroupFailure {
+                        id: *id,
+                        error: format!("持久化失败: {}", msg),
+                    });
+                }
+                return BatchSetGroupResult { succeeded: vec![], failed };
+            }
+        }
 
-            was_current
-        };
+        // 清理已删除凭据的刷新锁桶，避免锁表残留空条目
+        {
+            let mut locks = self.refresh_locks.lock();
+            for id in &succeeded {
+                locks.remove(id);
+            }
+        }
 
-        // 清理该凭据的刷新锁桶，避免锁表残留空条目
-        self.refresh_locks.lock().remove(&id);
-
-        // 如果删除的是当前凭据，切换到优先级最高的可用凭据
+        // 删到了当前活跃凭据时切换到优先级最高的可用凭据
+        let was_current = succeeded.contains(&*self.current_id.lock());
         if was_current {
             self.select_highest_priority();
         }
-
-        // 如果删除后没有任何凭据，将 current_id 重置为 0（与初始化行为保持一致）
-        {
-            let entries = self.entries.lock();
-            if entries.is_empty() {
-                let mut current_id = self.current_id.lock();
-                *current_id = 0;
-                tracing::info!("所有凭据已删除，current_id 已重置为 0");
-            }
+        // 删空后 current_id 重置为 0（与初始化 / 单条删除行为一致）
+        if self.entries.lock().is_empty() {
+            *self.current_id.lock() = 0;
+            tracing::info!("所有凭据已删除，current_id 已重置为 0");
         }
 
-        // 持久化更改
-        self.persist_credentials()?;
-
-        // 立即回写统计数据，清除已删除凭据的残留条目
-        self.save_stats();
-
-        tracing::info!("已删除凭据 #{}", id);
-        Ok(())
+        tracing::info!("已批量删除 {} 个凭据", succeeded.len());
+        BatchSetGroupResult { succeeded, failed }
     }
 
     /// 强制刷新指定凭据的 Token（Admin API）
@@ -3265,7 +3339,7 @@ impl MultiTokenManager {
         }
 
         // 持久化
-        if let Err(e) = self.persist_credentials() {
+        if let Err(e) = self.persist_credential(id) {
             tracing::warn!("强制刷新 Token 后持久化失败: {}", e);
         }
 
@@ -3388,7 +3462,7 @@ impl MultiTokenManager {
                 entry.credentials.overage = Some(enabled);
             }
         }
-        if let Err(e) = self.persist_credentials() {
+        if let Err(e) = self.persist_credential(id) {
             tracing::warn!("overage 下发成功但持久化失败: {}", e);
         }
         tracing::info!(
@@ -4035,6 +4109,36 @@ mod tests {
         manager.report_failure(1);
         manager.report_failure(1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    #[test]
+    fn delete_credential_batch_dedups_ids() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                KiroCredentials::default(),
+                KiroCredentials::default(),
+                KiroCredentials::default(),
+            ],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // 删除前置条件：先禁用 #1 #2
+        manager.set_disabled(1, true).unwrap();
+        manager.set_disabled(2, true).unwrap();
+
+        // 重复传入 #1：去重后只处理一次，不应再为它产生「不存在」失败项
+        let res = manager.delete_credential_batch(&[1, 1, 2]);
+        assert_eq!(res.succeeded, vec![1, 2]);
+        assert!(res.failed.is_empty(), "去重后不应有失败项: {:?}", res.failed);
+
+        let snap = manager.snapshot();
+        assert_eq!(snap.entries.len(), 1);
+        assert!(snap.entries.iter().all(|e| e.id != 1 && e.id != 2));
     }
 
     #[test]

@@ -14,6 +14,7 @@ import {
   getCredentialModels,
   addCredential,
   deleteCredential,
+  batchDeleteCredentials,
   getLoadBalancingMode,
   setLoadBalancingMode,
   getGlobalCache,
@@ -190,6 +191,17 @@ export function useDeleteCredential() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => deleteCredential(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 批量删除凭据（一次请求，后端单事务批量删除）
+export function useBatchDeleteCredentials() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (credentialIds: number[]) => batchDeleteCredentials(credentialIds),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
