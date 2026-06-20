@@ -640,25 +640,17 @@ export function CredentialCard({
             </div>
             {/* 超额行固定占位：无超额时也保留高度，保证各卡片元信息行垂直对齐 */}
             <div className="mt-1 flex h-4 items-center gap-1.5 text-[11px] text-warn">
+              {/* 卡面显示超额用量（计数/上限）；费用收进详情。触顶时红字告警 */}
               {balance && hasActualOverage && (
                 <span
-                  className="flex items-center gap-1.5"
-                  title={balance.overageRate > 0 ? `超额计费 @${balance.overageRate}/次` : undefined}
+                  className={cn(
+                    'tnum font-mono',
+                    overageCapExceeded ? 'font-semibold text-bad' : 'font-medium',
+                  )}
+                  title={overageCapExceeded ? '超额用量已达/超过上限' : undefined}
                 >
-                  <span className="tnum font-mono font-medium">
-                    超额 +{balance.overageCharges.toFixed(2)} {balance.currency ?? ''}
-                  </span>
-                  <span className="text-muted-foreground/40">·</span>
-                  <span
-                    className={cn(
-                      'tnum font-mono',
-                      overageCapExceeded ? 'font-semibold text-bad' : 'text-muted-foreground',
-                    )}
-                    title={overageCapExceeded ? '超额用量已达/超过上限' : undefined}
-                  >
-                    {balance.currentOverages.toFixed(2)}
-                    {balance.overageCap > 0 && `/${balance.overageCap.toFixed(0)}`}
-                  </span>
+                  超额 {balance.currentOverages.toFixed(2)}
+                  {balance.overageCap > 0 && `/${balance.overageCap.toFixed(0)}`}
                 </span>
               )}
             </div>
@@ -879,6 +871,14 @@ export function CredentialCard({
                   <>
                     <dt className="text-muted-foreground">剩余额度</dt>
                     <dd className="tnum justify-self-end text-foreground">{balance.remaining.toFixed(2)}</dd>
+                  </>
+                )}
+                {balance && hasActualOverage && (
+                  <>
+                    <dt className="text-muted-foreground">超额费用</dt>
+                    <dd className="tnum justify-self-end text-foreground">
+                      +{balance.overageCharges.toFixed(2)} {balance.currency ?? ''}
+                    </dd>
                   </>
                 )}
 

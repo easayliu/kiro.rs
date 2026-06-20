@@ -273,7 +273,7 @@ impl AdminService {
                 },
             );
         }
-        self.save_balance_cache();
+        self.upsert_balance_cache(id);
 
         Ok(balance)
     }
@@ -368,9 +368,11 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_add_error(e))?;
 
-        // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
-        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
-            tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
+        // 添加后查一次额度：既更新订阅等级（避免 Free 账号首次请求绕过 Opus 过滤），
+        // 又把余额写入 balance_cache 并落库（kiro.db），后续展示/对账免再查上游。
+        // 走 get_balance 而非 get_usage_limits_for：前者内部同样会触发订阅更新，且会持久化。
+        if let Err(e) = self.get_balance(credential_id).await {
+            tracing::warn!("添加凭据后查询额度失败（不影响凭据添加）: {}", e);
         }
 
         Ok(AddCredentialResponse {
@@ -392,7 +394,7 @@ impl AdminService {
             let mut cache = self.balance_cache.lock();
             cache.remove(&id);
         }
-        self.save_balance_cache();
+        self.delete_balance_cache(&[id]);
 
         Ok(())
     }
@@ -607,7 +609,7 @@ impl AdminService {
                     cache.remove(id);
                 }
             }
-            self.save_balance_cache();
+            self.delete_balance_cache(&result.succeeded);
         }
 
         Ok(BatchDeleteCredentialsResponse {
@@ -877,43 +879,59 @@ impl AdminService {
         out
     }
 
-    /// 把当前余额缓存全量落库（事务内 DELETE + INSERT，数据量为凭据数级别）。
-    fn save_balance_cache(&self) {
+    /// 单行 upsert 指定凭据的余额缓存（只写一行）。get_balance / 添加后用此，
+    /// 避免每次查询都全表 DELETE+INSERT（批量导入会放大成 O(N²) 写）。
+    fn upsert_balance_cache(&self, id: u64) {
         let db = match &self.db {
             Some(d) => d,
             None => return,
         };
 
-        let snapshot: Vec<(u64, i64, String)> = {
+        let row: Option<(i64, String)> = {
             let cache = self.balance_cache.lock();
-            cache
-                .iter()
-                .filter_map(|(id, v)| {
-                    serde_json::to_string(&v.data)
-                        .ok()
-                        .map(|data| (*id, v.cached_at as i64, data))
-                })
-                .collect()
+            cache.get(&id).and_then(|v| {
+                serde_json::to_string(&v.data)
+                    .ok()
+                    .map(|data| (v.cached_at as i64, data))
+            })
         };
+        let Some((cached_at, data)) = row else { return };
 
+        let conn = db.lock();
+        if let Err(e) = conn.execute(
+            "INSERT INTO balance_cache (credential_id, cached_at, data) VALUES (?1,?2,?3)
+             ON CONFLICT(credential_id) DO UPDATE SET cached_at=excluded.cached_at, data=excluded.data",
+            rusqlite::params![id as i64, cached_at, data],
+        ) {
+            tracing::warn!("余额缓存单行写入失败 #{}: {}", id, e);
+        }
+    }
+
+    /// 删除指定凭据的余额缓存行（删除凭据后调用），单事务只动这些行。
+    fn delete_balance_cache(&self, ids: &[u64]) {
+        let db = match &self.db {
+            Some(d) => d,
+            None => return,
+        };
+        if ids.is_empty() {
+            return;
+        }
         let mut conn = db.lock();
         let tx = match conn.transaction() {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!("余额缓存写事务失败: {}", e);
+                tracing::warn!("余额缓存删除事务失败: {}", e);
                 return;
             }
         };
-        if tx.execute("DELETE FROM balance_cache", []).is_ok() {
-            for (id, cached_at, data) in &snapshot {
-                let _ = tx.execute(
-                    "INSERT INTO balance_cache (credential_id, cached_at, data) VALUES (?1,?2,?3)",
-                    rusqlite::params![*id as i64, cached_at, data],
-                );
-            }
+        for id in ids {
+            let _ = tx.execute(
+                "DELETE FROM balance_cache WHERE credential_id = ?1",
+                rusqlite::params![*id as i64],
+            );
         }
         if let Err(e) = tx.commit() {
-            tracing::warn!("保存余额缓存失败: {}", e);
+            tracing::warn!("删除余额缓存失败: {}", e);
         }
     }
 

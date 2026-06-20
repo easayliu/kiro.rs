@@ -392,5 +392,53 @@ async fn main() {
     }
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // 不用 with_graceful_shutdown：它会等所有在途请求结束才返回，而 LLM 流式响应
+    // 可能持续数分钟，会把关停（及重启）阻塞很久，甚至被 supervisor SIGKILL 而漏刷。
+    // 改为 select：收到信号即丢弃在途连接、立刻刷盘（亚毫秒）退出，重启不变慢。
+    let server = axum::serve(listener, app).into_future();
+    tokio::select! {
+        res = server => {
+            if let Err(e) = res {
+                tracing::error!("服务器异常退出: {}", e);
+            }
+        }
+        _ = shutdown_signal() => {
+            tracing::info!("收到关停信号，刷盘统计后退出…");
+        }
+    }
+
+    // 信号触发后强制刷盘统计/计费累计，避免丢失距上次 debounce 落盘的数据
+    // （Drop 在信号杀进程时不保证执行：背景任务长期持有 token_manager 的 Arc，
+    //  且 billing 统计是 static 单例，析构都不会跑——故必须显式 flush）。
+    token_manager.flush_stats();
+    anthropic::billing_stats().flush();
+    tracing::info!("统计已刷盘，退出");
+}
+
+/// 等待 Ctrl-C（SIGINT）或 SIGTERM（容器/systemd 停止）。任一到达即触发优雅关停。
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("注册 SIGTERM 处理失败，仅监听 Ctrl-C: {}", e);
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }

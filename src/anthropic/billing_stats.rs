@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -38,8 +38,6 @@ pub struct BillingStats {
     db: Mutex<Option<Connection>>,
     /// 上次落盘时间（用于 debounce）。
     last_save_at: Mutex<Option<Instant>>,
-    /// 是否有未落盘的更新。
-    dirty: AtomicBool,
 }
 
 /// 全局单例。
@@ -146,7 +144,6 @@ impl BillingStats {
 
         *self.db.lock() = Some(conn);
         *self.last_save_at.lock() = Some(Instant::now());
-        self.dirty.store(false, Ordering::Relaxed);
         // 落一行，确保 id=1 存在（迁移或全新启动时）。
         self.save();
     }
@@ -163,10 +160,8 @@ impl BillingStats {
         self.save_debounced();
     }
 
-    /// 标记脏并按 debounce 策略决定是否立即落盘。
+    /// 按 debounce 策略决定是否立即落盘。
     fn save_debounced(&self) {
-        self.dirty.store(true, Ordering::Relaxed);
-
         // 未配置持久化则跳过（仅进程内累计）。
         if self.db.lock().is_none() {
             return;
@@ -208,10 +203,15 @@ impl BillingStats {
         match r {
             Ok(_) => {
                 *self.last_save_at.lock() = Some(Instant::now());
-                self.dirty.store(false, Ordering::Relaxed);
             }
             Err(e) => tracing::warn!("保存计费累计失败: {}", e),
         }
+    }
+
+    /// 强制落盘当前累计值（绕过 debounce）。供进程优雅关停时刷盘,
+    /// 避免丢失距上次落盘最多 `SAVE_DEBOUNCE` 的计费累计。
+    pub fn flush(&self) {
+        self.save();
     }
 
     /// 读取当前累计快照（用于查询接口）。

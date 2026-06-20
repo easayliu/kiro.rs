@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -988,8 +988,9 @@ pub struct MultiTokenManager {
     proxy_groups: RwLock<BTreeMap<String, ProxyGroupConfig>>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
-    /// 统计数据是否有未落盘更新
-    stats_dirty: AtomicBool,
+    /// 有未落盘统计更新的凭据 id 集合（唯一脏标记真相源）：
+    /// flush 时只回写这些行，避免每次刷全表；集合非空即表示有待落盘更新
+    stats_dirty_ids: Mutex<HashSet<u64>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1237,7 +1238,7 @@ impl MultiTokenManager {
             ),
             proxy_groups: RwLock::new(proxy_groups),
             last_stats_save_at: Mutex::new(None),
-            stats_dirty: AtomicBool::new(false),
+            stats_dirty_ids: Mutex::new(HashSet::new()),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -2027,36 +2028,58 @@ impl MultiTokenManager {
             Err(e) => tracing::warn!("加载使用统计失败: {}", e),
         }
         *self.last_stats_save_at.lock() = Some(Instant::now());
-        self.stats_dirty.store(false, Ordering::Relaxed);
+        self.stats_dirty_ids.lock().clear();
     }
 
-    /// 将当前凭据使用统计持久化到 SQLite（全量 upsert，单事务）。
+    /// 落盘统计：只回写 dirty 集合里的凭据行（单事务 upsert），不再每次刷全表。
+    /// 写成功后清空 dirty；写失败则把 id 放回，下次重试。
     fn save_stats(&self) {
         let store = match &self.store {
             Some(s) => s,
             None => return,
         };
 
+        // 取出并清空 dirty 集合（写失败再放回）
+        let dirty: HashSet<u64> = {
+            let mut ids = self.stats_dirty_ids.lock();
+            if ids.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *ids)
+        };
+
         let stats: Vec<(u64, u64, Option<String>)> = {
             let entries = self.entries.lock();
             entries
                 .iter()
+                .filter(|e| dirty.contains(&e.id))
                 .map(|e| (e.id, e.success_count, e.last_used_at.clone()))
                 .collect()
         };
 
         match store.save_credential_stats(&stats) {
             Ok(()) => {
+                // dirty 集合已在上面被 take 清空，无需额外清标志；
+                // 写盘期间并发插回的新 id 会留在集合里，由下次 flush / Drop 处理。
                 *self.last_stats_save_at.lock() = Some(Instant::now());
-                self.stats_dirty.store(false, Ordering::Relaxed);
             }
-            Err(e) => tracing::warn!("保存使用统计失败: {}", e),
+            Err(e) => {
+                tracing::warn!("保存使用统计失败: {}", e);
+                // 放回 dirty，避免丢更新（与本次新增的 id 合并）
+                self.stats_dirty_ids.lock().extend(dirty);
+            }
         }
     }
 
-    /// 标记统计数据已更新，并按 debounce 策略决定是否立即落盘
-    fn save_stats_debounced(&self) {
-        self.stats_dirty.store(true, Ordering::Relaxed);
+    /// 强制把待落盘的统计刷入 SQLite（绕过 debounce）。供进程优雅关停时调用,
+    /// 避免丢失距上次落盘的统计更新（Drop 在信号杀进程时不保证执行）。
+    pub fn flush_stats(&self) {
+        self.save_stats();
+    }
+
+    /// 标记指定凭据统计有更新，并按 debounce 策略决定是否立即落盘
+    fn save_stats_debounced(&self, id: u64) {
+        self.stats_dirty_ids.lock().insert(id);
 
         let should_flush = {
             let last = *self.last_stats_save_at.lock();
@@ -2094,7 +2117,7 @@ impl MultiTokenManager {
                 );
             }
         }
-        self.save_stats_debounced();
+        self.save_stats_debounced(id);
     }
 
     /// 报告凭据被上游 API 限流（429），按 THROTTLE_BACKOFF_SECS 表标记冷却到期时间
@@ -2230,7 +2253,7 @@ impl MultiTokenManager {
 
             entries.iter().any(|e| !e.disabled)
         };
-        self.save_stats_debounced();
+        self.save_stats_debounced(id);
         result
     }
 
@@ -2280,7 +2303,7 @@ impl MultiTokenManager {
                 false
             }
         };
-        self.save_stats_debounced();
+        self.save_stats_debounced(id);
         result
     }
 
@@ -2343,7 +2366,7 @@ impl MultiTokenManager {
                 false
             }
         };
-        self.save_stats_debounced();
+        self.save_stats_debounced(id);
         result
     }
 
@@ -2391,7 +2414,7 @@ impl MultiTokenManager {
                 false
             }
         };
-        self.save_stats_debounced();
+        self.save_stats_debounced(id);
         result
     }
 
@@ -3646,7 +3669,8 @@ impl MultiTokenManager {
 
 impl Drop for MultiTokenManager {
     fn drop(&mut self) {
-        if self.stats_dirty.load(Ordering::Relaxed) {
+        // 集合非空 = 有待落盘更新（唯一脏标记），退出前刷一次
+        if !self.stats_dirty_ids.lock().is_empty() {
             self.save_stats();
         }
     }
