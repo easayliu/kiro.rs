@@ -17,8 +17,6 @@ import {
   CircleDollarSign,
   Boxes,
   X,
-  Clock,
-  KeyRound,
   AlertTriangle,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -348,13 +346,10 @@ export function CredentialCard({
     balance?.nextResetAt != null
       ? Math.max(0, Math.ceil((balance.nextResetAt * 1000 - Date.now()) / 86_400_000))
       : null
-  // Token 健康：剩余有效期（ms）。仅在临期/过期/刷新失败时高亮提示，正常态不占行。
+  // Token 剩余有效期（ms）。过期时间不占卡面第一级，统一收进「详情」。
   const expiryMs = credential.expiresAt
     ? new Date(credential.expiresAt).getTime() - Date.now()
     : null
-  const tokenIssue =
-    (credential.refreshFailureCount ?? 0) > 0 ||
-    (expiryMs != null && expiryMs < 30 * 60 * 1000)
 
   const throttledRemainingMs = credential.throttledUntil
     ? Math.max(0, Date.parse(credential.throttledUntil) - Date.now())
@@ -459,17 +454,14 @@ export function CredentialCard({
       : hasFailures
         ? '异常'
         : null
-  const statusClass = credential.disabled
-    ? 'text-bad'
-    : isThrottled
-      ? 'text-warn'
-      : 'text-warn'
+  // Stripe 式柔和徽章：禁用红、限流/异常琥珀
+  const statusBadgeClass = credential.disabled ? 'bg-bad-soft text-bad' : 'bg-warn-soft text-warn'
 
   return (
     <>
       <div
         className={cn(
-          'group relative flex flex-col overflow-hidden rounded-lg border bg-surface shadow-sm transition-shadow duration-200 hover:shadow-md',
+          'group relative flex flex-col overflow-hidden rounded-xl border bg-surface transition-shadow duration-200 hover:shadow-md',
           selected
             ? 'border-primary ring-2 ring-primary/20'
             : overageCapExceeded
@@ -483,7 +475,7 @@ export function CredentialCard({
         )}
       >
         {/* ─── HEADER: avatar + name/meta + switch ─── */}
-        <div className={cn('flex items-start gap-3 p-4', tier.cardBg)}>
+        <div className="flex items-start gap-3 p-4">
           {/* Avatar — click to select */}
           <button
             onClick={onToggleSelect}
@@ -506,56 +498,57 @@ export function CredentialCard({
             >
               {displayName}
             </h3>
-            <div className="mt-1 flex min-w-0 items-center gap-x-2 overflow-hidden whitespace-nowrap font-mono text-2xs text-muted-foreground">
-              <span className="tnum shrink-0">#{String(credential.id).padStart(3, '0')}</span>
-              {authLabel(credential.authMethod) && (
+            {/* 元信息行：次要 chip 放进可截断区，关键状态钉在末尾永不裁切 */}
+            <div className="mt-1 flex items-center gap-x-2 text-xs text-muted-foreground">
+              <div className="flex min-w-0 flex-1 items-center gap-x-2 overflow-hidden whitespace-nowrap">
+                <span className="tnum shrink-0 font-mono">#{String(credential.id).padStart(3, '0')}</span>
+                {balance?.subscriptionTitle && (
+                  <span
+                    className="shrink-0 font-medium text-foreground/70"
+                    title={balance.subscriptionTitle}
+                  >
+                    {balance.subscriptionTitle.replace(/^KIRO\s+/i, '')}
+                  </span>
+                )}
                 <span
-                  className="inline-flex shrink-0 items-center gap-0.5"
-                  title={`认证方式: ${credential.authMethod}`}
-                >
-                  <KeyRound className="h-2.5 w-2.5 shrink-0" />
-                  {authLabel(credential.authMethod)}
-                </span>
-              )}
-              {balance?.subscriptionTitle && (
-                <span
-                  className={cn('shrink-0 font-medium', tier.labelText)}
-                  title={balance.subscriptionTitle}
-                >
-                  {balance.subscriptionTitle.replace(/^KIRO\s+/i, '')}
-                </span>
-              )}
-              <span
-                className="inline-flex shrink-0 items-center"
-                title={
-                  !overageKnown
-                    ? '超额计费：未知（尚未下发过）'
-                    : overageEnabled
-                      ? `超额计费：已开启${overageFromUpstream ? '（上游确认）' : ''}`
-                      : `超额计费：已关闭${overageFromUpstream ? '（上游确认）' : ''}`
-                }
-              >
-                <CircleDollarSign
-                  className={cn(
-                    'h-3 w-3 shrink-0',
+                  className="inline-flex shrink-0 items-center"
+                  title={
                     !overageKnown
-                      ? 'text-muted-foreground/40'
+                      ? '超额计费：未知（尚未下发过）'
                       : overageEnabled
-                        ? 'text-warn'
-                        : 'text-muted-foreground',
-                  )}
-                />
-              </span>
-              {statusLabel && (
-                <span className={cn('shrink-0 font-medium', statusClass)}>{statusLabel}</span>
-              )}
-              {credential.group && (
-                <span
-                  className="inline-flex min-w-0 items-center gap-0.5 text-foreground"
-                  title={`代理分组: ${credential.group}`}
+                        ? `超额计费：已开启${overageFromUpstream ? '（上游确认）' : ''}`
+                        : `超额计费：已关闭${overageFromUpstream ? '（上游确认）' : ''}`
+                  }
                 >
-                  <Network className="h-2.5 w-2.5 shrink-0" />
-                  <span className="truncate">{credential.group}</span>
+                  <CircleDollarSign
+                    className={cn(
+                      'h-3 w-3 shrink-0',
+                      !overageKnown
+                        ? 'text-muted-foreground/40'
+                        : overageEnabled
+                          ? 'text-warn'
+                          : 'text-muted-foreground',
+                    )}
+                  />
+                </span>
+                {credential.group && (
+                  <span
+                    className="inline-flex min-w-0 items-center gap-0.5 text-foreground"
+                    title={`代理分组: ${credential.group}`}
+                  >
+                    <Network className="h-2.5 w-2.5 shrink-0" />
+                    <span className="truncate">{credential.group}</span>
+                  </span>
+                )}
+              </div>
+              {statusLabel && (
+                <span
+                  className={cn(
+                    'shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium leading-none',
+                    statusBadgeClass,
+                  )}
+                >
+                  {statusLabel}
                 </span>
               )}
             </div>
@@ -568,10 +561,157 @@ export function CredentialCard({
             title={readOnly ? '游客身份不可修改启用状态' : credential.disabled ? '启用凭据' : '禁用凭据'}
             className="shrink-0"
           />
+
+          {/* ─── 操作：右上角溢出菜单（信息看卡面，动作收一处） ─── */}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                className="-mr-1 -mt-0.5 flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                aria-label="更多操作"
+              >
+                <MoreHorizontal className="h-4 w-4" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-44">
+              <DropdownMenuItem onClick={() => onViewBalance(credential.id)}>
+                <Wallet /> 余额
+              </DropdownMenuItem>
+              {!readOnly && (
+                <>
+                  <DropdownMenuItem
+                    onClick={handleForceRefresh}
+                    disabled={forceRefresh.isPending || credential.disabled}
+                    title={credential.disabled ? '已禁用的凭据无法刷新 Token' : '强制刷新 Token'}
+                  >
+                    <RefreshCw className={cn(forceRefresh.isPending && 'animate-spin')} /> 强制刷新 Token
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    onClick={handleReset}
+                    disabled={resetFailure.isPending || !hasFailures}
+                  >
+                    <RotateCcw /> 重置失败计数
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onClick={() => handlePriorityBump(-1)}
+                    disabled={setPriority.isPending || credential.priority === 0}
+                  >
+                    <ChevronUp /> 提高优先级
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onClick={() => handlePriorityBump(1)}
+                    disabled={setPriority.isPending}
+                  >
+                    <ChevronDown /> 降低优先级
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onClick={openRpmDialog}
+                    disabled={setRpmLimit.isPending}
+                  >
+                    <Gauge /> RPM 上限
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onClick={openConcurrencyDialog}
+                    disabled={setConcurrencyLimit.isPending}
+                  >
+                    <Activity /> 并发上限
+                  </DropdownMenuItem>
+                  <DropdownMenuSub>
+                    <DropdownMenuSubTrigger>
+                      <CircleDollarSign /> 超额计费
+                      <span className="ml-auto text-2xs text-muted-foreground">
+                        {!overageKnown ? '未知' : overageEnabled ? '开' : '关'}
+                      </span>
+                    </DropdownMenuSubTrigger>
+                    <DropdownMenuSubContent className="w-40">
+                      <DropdownMenuItem
+                        onClick={() => handleSetOverage(true)}
+                        disabled={setOverage.isPending}
+                      >
+                        {overageKnown && overageEnabled && <Check />}
+                        开启超额
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onClick={() => handleSetOverage(false)}
+                        disabled={setOverage.isPending}
+                      >
+                        {overageKnown && !overageEnabled && <Check />}
+                        关闭超额
+                      </DropdownMenuItem>
+                    </DropdownMenuSubContent>
+                  </DropdownMenuSub>
+                  <DropdownMenuSub>
+                    <DropdownMenuSubTrigger>
+                      <Network /> 代理分组
+                    </DropdownMenuSubTrigger>
+                    <DropdownMenuSubContent className="w-48">
+                      <DropdownMenuItem
+                        onClick={() => handleSetGroup(null)}
+                        disabled={setCredentialGroup.isPending || !credential.group}
+                      >
+                        {!credential.group && <Check />}
+                        无分组
+                      </DropdownMenuItem>
+                      {(proxyGroupsData?.groups || []).length > 0 && <DropdownMenuSeparator />}
+                      {(proxyGroupsData?.groups || []).map(g => (
+                        <DropdownMenuItem
+                          key={g.name}
+                          onClick={() => handleSetGroup(g.name)}
+                          disabled={setCredentialGroup.isPending}
+                        >
+                          {credential.group === g.name && <Check />}
+                          <span className="truncate">{g.name}</span>
+                        </DropdownMenuItem>
+                      ))}
+                      {(proxyGroupsData?.groups || []).length === 0 && (
+                        <div className="px-2 py-1.5 text-2xs text-muted-foreground">
+                          暂无分组，请先在"代理分组"中创建
+                        </div>
+                      )}
+                    </DropdownMenuSubContent>
+                  </DropdownMenuSub>
+                  <DropdownMenuSub onOpenChange={open => { if (open) setModelsRequested(true) }}>
+                    <DropdownMenuSubTrigger>
+                      <Boxes /> 可用模型
+                    </DropdownMenuSubTrigger>
+                    <DropdownMenuSubContent className="max-h-72 w-52 overflow-auto">
+                      {loadingModels ? (
+                        <div className="flex items-center gap-1.5 px-2 py-1.5 text-xs text-muted-foreground">
+                          <Loader2 className="h-3 w-3 animate-spin" /> 加载中
+                        </div>
+                      ) : modelsError ? (
+                        <div className="px-2 py-1.5 text-2xs text-bad">查询失败，请稍后重试</div>
+                      ) : (modelsData?.models || []).length > 0 ? (
+                        modelsData!.models.map(m => (
+                          <div
+                            key={m}
+                            className="truncate px-2 py-1.5 font-mono text-2xs text-foreground"
+                            title={m}
+                          >
+                            {m}
+                          </div>
+                        ))
+                      ) : (
+                        <div className="px-2 py-1.5 text-2xs text-muted-foreground">无可用模型</div>
+                      )}
+                    </DropdownMenuSubContent>
+                  </DropdownMenuSub>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    onClick={() => setShowDeleteDialog(true)}
+                    disabled={!credential.disabled}
+                    className="text-bad focus:text-bad"
+                  >
+                    <Trash2 /> 删除凭据
+                  </DropdownMenuItem>
+                </>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
 
         {/* ─── BODY: usage + meta ─── */}
-        <div className="space-y-2 px-4 pb-4">
+        <div className="space-y-3 px-4 pb-4">
           {/* Usage line: percent + overage tag (left) · used/limit (right) */}
           <div>
             <div className="mb-1.5 flex items-baseline justify-between gap-2">
@@ -584,7 +724,7 @@ export function CredentialCard({
                   <>
                     <span
                       className={cn(
-                        'tnum text-sm font-bold leading-none',
+                        'tnum text-base font-semibold leading-none',
                         isOverageBilling
                           ? overageCapExceeded ? 'text-bad' : 'text-warn'
                           : isOverLimit ? 'text-bad' : 'text-foreground',
@@ -630,10 +770,13 @@ export function CredentialCard({
                 className={cn('absolute inset-y-0 left-0 rounded-full transition-[width] duration-500 ease-out', barColor)}
                 style={{ width: balance ? `${usedPercent}%` : '0%' }}
               />
-              {/* 超额段：在填满的基础额度条上叠加斜纹，宽度 = 超额已用占 overageCap 的比例 */}
+              {/* 超额段：在填满的基础额度条上叠加纯色段，宽度 = 超额已用占 overageCap 的比例 */}
               {isOverageBilling && (
                 <div
-                  className="overage-stripe absolute inset-y-0 left-0 transition-[width] duration-500 ease-out"
+                  className={cn(
+                    'absolute inset-y-0 left-0 transition-[width] duration-500 ease-out',
+                    overageCapExceeded ? 'bg-bad' : 'bg-warn',
+                  )}
                   style={{ width: `${overageFillPercent}%` }}
                 />
               )}
@@ -657,12 +800,12 @@ export function CredentialCard({
           </div>
 
           {/* Meta — 常驻只留「活动」一行 + 异常告警；其余次要数据收进「详情」展开 */}
-          <div className="space-y-1 text-xs">
+          <div className="space-y-1.5 text-xs">
             {/* 活动（常驻）：优先级 · 成功/失败 · 最近使用 */}
             <div className="flex items-center gap-x-2">
             {/* 优先级（可编辑） */}
             {readOnly ? (
-              <span className="inline-flex items-center gap-0.5 tnum font-mono" title="优先级">
+              <span className="inline-flex items-center gap-0.5 tnum" title="优先级">
                 <span className="text-muted-foreground/60">P</span>
                 <span className="font-semibold text-foreground">{credential.priority}</span>
               </span>
@@ -695,7 +838,7 @@ export function CredentialCard({
             ) : (
               <button
                 onClick={() => setEditingPriority(true)}
-                className="group/p inline-flex items-center gap-0.5 tnum font-mono hover:text-primary"
+                className="group/p inline-flex items-center gap-0.5 tnum hover:text-primary"
                 title="点击编辑优先级"
               >
                 <span className="text-muted-foreground/60">P</span>
@@ -706,9 +849,9 @@ export function CredentialCard({
 
             <span className="text-muted-foreground/40">·</span>
 
-            {/* 成功/失败 */}
-            <span className="inline-flex items-center gap-1 tnum font-mono" title="成功 / 失败">
-              <Check className="h-3 w-3 text-ok" />
+            {/* 成功/失败：健康态全中性，只有失败才上色（Stripe：色彩留给问题） */}
+            <span className="inline-flex items-center gap-1 tnum text-muted-foreground" title="成功 / 失败">
+              <Check className="h-3 w-3" />
               <span className="text-foreground">{credential.successCount}</span>
               <X className={cn('h-3 w-3', hasFailures ? 'text-bad' : 'text-muted-foreground/50')} />
               <span className={cn(hasFailures ? 'font-medium text-bad' : 'text-muted-foreground')}>
@@ -719,7 +862,7 @@ export function CredentialCard({
             <span className="text-muted-foreground/40">·</span>
 
             {/* 最近使用 */}
-            <span className="tnum font-mono text-muted-foreground" title="最近使用">
+            <span className="tnum text-muted-foreground" title="最近使用">
               <RelativeTime value={credential.lastUsedAt} />
             </span>
             </div>
@@ -738,45 +881,32 @@ export function CredentialCard({
             {/* 限流告警态（常驻，仅 ≥70%/耗尽时；正常占用收进详情） */}
             {limiterWarn && limiterRow}
 
-            {/* Token 健康：仅在临期/过期/刷新失败时常驻显示（正常态收进详情） */}
-            {tokenIssue && (
-              <div className="flex items-center gap-x-2 font-mono">
-                {expiryMs != null && (
-                  <span
-                    className={cn(
-                      'inline-flex items-center gap-1',
-                      expiryMs <= 0 ? 'text-bad' : 'text-warn',
-                    )}
-                    title="Token 过期时间"
-                  >
-                    <Clock className="h-3 w-3" />
-                    {expiryMs <= 0 ? 'token 已过期' : `token ${formatRemaining(expiryMs)}后过期`}
-                  </span>
-                )}
-                {(credential.refreshFailureCount ?? 0) > 0 && (
-                  <>
-                    <span className="text-muted-foreground/40">·</span>
-                    <span className="text-bad" title="Token 刷新连续失败次数">
-                      刷新失败 {credential.refreshFailureCount}
-                    </span>
-                  </>
-                )}
+            {/* Token 刷新失败：真实故障信号，常驻告警。过期时间不重要，收进「详情」 */}
+            {(credential.refreshFailureCount ?? 0) > 0 && (
+              <div className="font-mono">
+                <span className="text-bad" title="Token 刷新连续失败次数">
+                  刷新失败 {credential.refreshFailureCount}
+                </span>
               </div>
             )}
+          </div>
+        </div>
 
-            {/* 详情切换 */}
+        {/* ─── FOOTER: 详情（Stripe 风：安静的左对齐文字链接，整行可点） ─── */}
+        <div className="pb-3">
             <button
               onClick={() => setShowDetails(v => !v)}
-              className="inline-flex cursor-pointer items-center gap-0.5 font-mono text-muted-foreground transition-colors hover:text-foreground"
+              className="flex w-full cursor-pointer items-center gap-1 px-4 py-1.5 font-mono text-2xs text-muted-foreground/80 transition-colors hover:text-foreground"
               aria-expanded={showDetails}
+              title={showDetails ? '收起详情' : '展开详情'}
             >
-              {showDetails ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
               详情
+              {showDetails ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
             </button>
 
             {/* 详情展开区：键值对齐的 properties list（标签左 / 值右） */}
             {showDetails && (
-              <dl className="grid grid-cols-[auto_1fr] items-center gap-x-4 gap-y-1.5 rounded-md bg-muted/30 px-2.5 py-2 font-mono text-2xs">
+              <dl className="mx-4 mt-1 grid grid-cols-[auto_1fr] items-center gap-x-4 gap-y-1.5 rounded-md bg-muted/20 px-3 py-2.5 text-2xs">
                 {usage && usage.requests > 0 && (
                   <>
                     <dt className="text-muted-foreground">近7天请求</dt>
@@ -843,10 +973,12 @@ export function CredentialCard({
                 )}
 
                 {/* Token 到期（正常态；异常态已在卡面常驻） */}
-                {!tokenIssue && expiryMs != null && (
+                {expiryMs != null && (
                   <>
                     <dt className="text-muted-foreground">Token</dt>
-                    <dd className="justify-self-end text-foreground">{formatRemaining(expiryMs)}后过期</dd>
+                    <dd className={cn('justify-self-end', expiryMs <= 0 ? 'text-bad' : 'text-foreground')}>
+                      {expiryMs <= 0 ? '已过期' : `${formatRemaining(expiryMs)}后过期`}
+                    </dd>
                   </>
                 )}
 
@@ -882,6 +1014,15 @@ export function CredentialCard({
                   </>
                 )}
 
+                {authLabel(credential.authMethod) && (
+                  <>
+                    <dt className="text-muted-foreground">认证方式</dt>
+                    <dd className="justify-self-end text-foreground" title={credential.authMethod || undefined}>
+                      {authLabel(credential.authMethod)}
+                    </dd>
+                  </>
+                )}
+
                 {credential.createdAt != null && (
                   <>
                     <dt className="text-muted-foreground">添加于</dt>
@@ -895,7 +1036,7 @@ export function CredentialCard({
                   <>
                     <dt className="text-muted-foreground">代理出口</dt>
                     <dd
-                      className="max-w-[12rem] justify-self-end truncate text-foreground"
+                      className="max-w-[12rem] justify-self-end truncate font-mono text-foreground"
                       title={proxyDisplay}
                     >
                       {proxyDisplay}
@@ -911,156 +1052,6 @@ export function CredentialCard({
                 )}
               </dl>
             )}
-          </div>
-        </div>
-
-        {/* ─── FOOTER: divided action cells ─── */}
-        <div className={cn('mt-auto grid divide-x divide-border border-t border-border', readOnly ? 'grid-cols-1' : 'grid-cols-3')}>
-          <FooterAction
-            onClick={() => onViewBalance(credential.id)}
-            icon={<Wallet className="h-4 w-4" />}
-            label="余额"
-          />
-          {!readOnly && (
-            <FooterAction
-              onClick={handleForceRefresh}
-              disabled={forceRefresh.isPending || credential.disabled}
-              icon={<RefreshCw className={cn('h-4 w-4', forceRefresh.isPending && 'animate-spin')} />}
-              label="Token"
-              title={credential.disabled ? '已禁用的凭据无法刷新 Token' : '强制刷新 Token'}
-            />
-          )}
-          {!readOnly && <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <button
-                className="group/more flex cursor-pointer items-center justify-center gap-1.5 py-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                aria-label="更多操作"
-              >
-                <MoreHorizontal className="h-4 w-4" />
-                更多
-              </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-44">
-              <DropdownMenuItem
-                onClick={handleReset}
-                disabled={resetFailure.isPending || !hasFailures}
-              >
-                <RotateCcw /> 重置失败计数
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                onClick={() => handlePriorityBump(-1)}
-                disabled={setPriority.isPending || credential.priority === 0}
-              >
-                <ChevronUp /> 提高优先级
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                onClick={() => handlePriorityBump(1)}
-                disabled={setPriority.isPending}
-              >
-                <ChevronDown /> 降低优先级
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                onClick={openRpmDialog}
-                disabled={setRpmLimit.isPending}
-              >
-                <Gauge /> RPM 上限
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                onClick={openConcurrencyDialog}
-                disabled={setConcurrencyLimit.isPending}
-              >
-                <Activity /> 并发上限
-              </DropdownMenuItem>
-              <DropdownMenuSub>
-                <DropdownMenuSubTrigger>
-                  <CircleDollarSign /> 超额计费
-                  <span className="ml-auto text-2xs text-muted-foreground">
-                    {!overageKnown ? '未知' : overageEnabled ? '开' : '关'}
-                  </span>
-                </DropdownMenuSubTrigger>
-                <DropdownMenuSubContent className="w-40">
-                  <DropdownMenuItem
-                    onClick={() => handleSetOverage(true)}
-                    disabled={setOverage.isPending}
-                  >
-                    {overageKnown && overageEnabled && <Check />}
-                    开启超额
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onClick={() => handleSetOverage(false)}
-                    disabled={setOverage.isPending}
-                  >
-                    {overageKnown && !overageEnabled && <Check />}
-                    关闭超额
-                  </DropdownMenuItem>
-                </DropdownMenuSubContent>
-              </DropdownMenuSub>
-              <DropdownMenuSub>
-                <DropdownMenuSubTrigger>
-                  <Network /> 代理分组
-                </DropdownMenuSubTrigger>
-                <DropdownMenuSubContent className="w-48">
-                  <DropdownMenuItem
-                    onClick={() => handleSetGroup(null)}
-                    disabled={setCredentialGroup.isPending || !credential.group}
-                  >
-                    {!credential.group && <Check />}
-                    无分组
-                  </DropdownMenuItem>
-                  {(proxyGroupsData?.groups || []).length > 0 && <DropdownMenuSeparator />}
-                  {(proxyGroupsData?.groups || []).map(g => (
-                    <DropdownMenuItem
-                      key={g.name}
-                      onClick={() => handleSetGroup(g.name)}
-                      disabled={setCredentialGroup.isPending}
-                    >
-                      {credential.group === g.name && <Check />}
-                      <span className="truncate">{g.name}</span>
-                    </DropdownMenuItem>
-                  ))}
-                  {(proxyGroupsData?.groups || []).length === 0 && (
-                    <div className="px-2 py-1.5 text-2xs text-muted-foreground">
-                      暂无分组，请先在"代理分组"中创建
-                    </div>
-                  )}
-                </DropdownMenuSubContent>
-              </DropdownMenuSub>
-              <DropdownMenuSub onOpenChange={open => { if (open) setModelsRequested(true) }}>
-                <DropdownMenuSubTrigger>
-                  <Boxes /> 可用模型
-                </DropdownMenuSubTrigger>
-                <DropdownMenuSubContent className="max-h-72 w-52 overflow-auto">
-                  {loadingModels ? (
-                    <div className="flex items-center gap-1.5 px-2 py-1.5 text-xs text-muted-foreground">
-                      <Loader2 className="h-3 w-3 animate-spin" /> 加载中
-                    </div>
-                  ) : modelsError ? (
-                    <div className="px-2 py-1.5 text-2xs text-bad">查询失败，请稍后重试</div>
-                  ) : (modelsData?.models || []).length > 0 ? (
-                    modelsData!.models.map(m => (
-                      <div
-                        key={m}
-                        className="truncate px-2 py-1.5 font-mono text-2xs text-foreground"
-                        title={m}
-                      >
-                        {m}
-                      </div>
-                    ))
-                  ) : (
-                    <div className="px-2 py-1.5 text-2xs text-muted-foreground">无可用模型</div>
-                  )}
-                </DropdownMenuSubContent>
-              </DropdownMenuSub>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem
-                onClick={() => setShowDeleteDialog(true)}
-                disabled={!credential.disabled}
-                className="text-bad focus:text-bad"
-              >
-                <Trash2 /> 删除凭据
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>}
         </div>
       </div>
 
@@ -1178,28 +1169,6 @@ export function CredentialCard({
 }
 
 // ─── Primitives ───
-
-function FooterAction({
-  onClick, disabled, icon, label, title,
-}: {
-  onClick?: () => void
-  disabled?: boolean
-  icon: React.ReactNode
-  label: string
-  title?: string
-}) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      title={title}
-      className="flex cursor-pointer items-center justify-center gap-1.5 py-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
-    >
-      {icon}
-      {label}
-    </button>
-  )
-}
 
 // ─── Tier resolution ───
 
