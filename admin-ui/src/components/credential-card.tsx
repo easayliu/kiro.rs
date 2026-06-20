@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { toast } from 'sonner'
 import {
   RefreshCw,
@@ -74,6 +74,12 @@ interface CredentialCardProps {
   usage?: StatGroup
   /** 近 N 天每桶平均首字 TTFT 序列（来自 stats timeseries by_credential），用于 sparkline */
   ttftSeries?: number[]
+  /**
+   * 「详情」展开的广播信号：父级一键展开/收起全部时下发。
+   * `version` 每次点击递增，卡片据此同步到 `expanded`；同步后仍可在卡内单独切换。
+   * 不传则卡片完全自管（默认收起）。
+   */
+  expandSignal?: { expanded: boolean; version: number }
 }
 
 // 计算生效的 RPM 上限：凭据级 0 / 正整数覆盖全局；undefined 回退全局；
@@ -136,6 +142,7 @@ export function CredentialCard({
   loadingBalance,
   usage,
   ttftSeries,
+  expandSignal,
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
@@ -148,6 +155,11 @@ export function CredentialCard({
   const [modelsRequested, setModelsRequested] = useState(false)
   // 「详情」展开：默认收起，点击在卡内展开次要数据（近7天用量、添加时间、限流器、余额时效等）
   const [showDetails, setShowDetails] = useState(false)
+  // 父级一键展开/收起全部时同步本卡（按 version 触发，同步后仍可单独切换）
+  useEffect(() => {
+    if (expandSignal) setShowDetails(expandSignal.expanded)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [expandSignal?.version])
 
   const readOnly = useIsReadOnly()
   const setDisabled = useSetDisabled()

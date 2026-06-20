@@ -15,6 +15,8 @@ import {
   ChevronLeft,
   ChevronRight,
   ChevronDown,
+  ChevronsUpDown,
+  ChevronsDownUp,
   X,
   Search,
   MoreHorizontal,
@@ -114,6 +116,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  // 「详情」一键展开/收起全部：广播给所有卡片（version 每次点击递增触发同步）
+  const [detailsAllExpanded, setDetailsAllExpanded] = useState(false)
+  const [expandVersion, setExpandVersion] = useState(0)
+  const toggleAllDetails = () => {
+    setDetailsAllExpanded(v => !v)
+    setExpandVersion(v => v + 1)
+  }
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false)
   const [verifying, setVerifying] = useState(false)
   const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
@@ -1190,7 +1199,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
             {/* Select-all strip (very subtle) */}
             {filteredCreds.length > 0 && (
-              <div className="mb-3 flex items-center justify-between px-1">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-y-2 px-1">
                 <button
                   onClick={toggleSelectAllOnPage}
                   className="inline-flex min-h-[28px] cursor-pointer items-center gap-1.5 rounded-md px-1.5 py-1 font-mono text-2xs text-muted-foreground transition-colors hover:text-foreground"
@@ -1209,7 +1218,22 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   </span>
                   {currentCredentials.length > 0 && currentCredentials.every(c => selectedIds.has(c.id)) ? '取消全选' : '全选本页'}
                 </button>
-                <div className="flex items-center gap-3 font-mono text-2xs text-muted-foreground">
+                <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 font-mono text-2xs text-muted-foreground">
+                  {/* 一键展开/收起全部卡片详情 */}
+                  <button
+                    onClick={toggleAllDetails}
+                    aria-expanded={detailsAllExpanded}
+                    className="inline-flex cursor-pointer items-center gap-1 rounded-md px-1.5 py-1 transition-colors hover:text-foreground"
+                    title={detailsAllExpanded ? '收起全部详情' : '展开全部详情'}
+                  >
+                    {detailsAllExpanded ? (
+                      <ChevronsDownUp className="h-3 w-3" />
+                    ) : (
+                      <ChevronsUpDown className="h-3 w-3" />
+                    )}
+                    {detailsAllExpanded ? '收起详情' : '展开详情'}
+                  </button>
+
                   {/* Sort */}
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
@@ -1325,6 +1349,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                       usage={usageMap.get(credential.id)}
                       ttftSeries={ttftSeriesMap.get(credential.id)}
                       loadingBalance={loadingBalanceIds.has(credential.id)}
+                      expandSignal={{ expanded: detailsAllExpanded, version: expandVersion }}
                     />
                   ))}
                 </div>
