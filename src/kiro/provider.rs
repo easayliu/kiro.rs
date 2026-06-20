@@ -321,10 +321,11 @@ impl KiroProvider {
     /// 发送流式 API 请求
     ///
     /// 支持多凭据故障转移：
+    /// - 400/402 + 配额 reason（MONTHLY_REQUEST_COUNT / OVERAGE_REQUEST_LIMIT_EXCEEDED）:
+    ///   视为额度用尽，禁用凭据并切换（须先于通用 400 判断；overage 用尽上游回 400）
     /// - 400 Bad Request: 直接返回错误，不计入凭据失败
     ///   （例外：INVALID_MODEL_ID 仅 LRU 轮转到下一凭据，不计失败计数）
     /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
-    /// - 402 MONTHLY_REQUEST_COUNT / OVERAGE_REQUEST_LIMIT_EXCEEDED: 视为额度用尽，禁用凭据并切换
     /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
     ///
     /// # Arguments
@@ -518,8 +519,8 @@ impl KiroProvider {
             // 失败响应
             let body = response.text().await.unwrap_or_default();
 
-            // 402 额度用尽
-            if status.as_u16() == 402 && Self::is_quota_exhausted(&body) {
+            // 额度用尽（400/402 + 配额 reason；overage 用尽上游回 400 ServiceQuotaExceededException）
+            if matches!(status.as_u16(), 400 | 402) && Self::is_quota_exhausted(&body) {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
@@ -797,8 +798,11 @@ impl KiroProvider {
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
 
-            // 402 Payment Required 且额度用尽：禁用凭据并故障转移
-            if status.as_u16() == 402 && Self::is_quota_exhausted(&body) {
+            // 额度用尽：禁用凭据并故障转移。
+            // 上游对配额耗尽并不统一：月度多为 402 MONTHLY_REQUEST_COUNT，
+            // 超额(overage)用尽则是 400 ServiceQuotaExceededException + OVERAGE_REQUEST_LIMIT_EXCEEDED。
+            // 故 400/402 都先按 reason 判配额，命中即禁用切换（须先于下方通用 400 分支）。
+            if matches!(status.as_u16(), 400 | 402) && Self::is_quota_exhausted(&body) {
                 tracing::warn!(
                     "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -1041,9 +1045,9 @@ impl KiroProvider {
         Duration::from_millis(backoff.saturating_add(jitter))
     }
 
-    /// 判断 402 响应是否属于"额度用尽"场景，需要禁用凭据并故障转移：
-    /// - `MONTHLY_REQUEST_COUNT`：月度免费额度用尽
-    /// - `OVERAGE_REQUEST_LIMIT_EXCEEDED`：超额配额也用尽
+    /// 判断响应是否属于"额度用尽"场景，需要禁用凭据并故障转移（按 reason 判，与状态码无关）：
+    /// - `MONTHLY_REQUEST_COUNT`：月度免费额度用尽（上游多为 402）
+    /// - `OVERAGE_REQUEST_LIMIT_EXCEEDED`：超额配额也用尽（上游为 400 ServiceQuotaExceededException）
     fn is_quota_exhausted(body: &str) -> bool {
         const REASONS: &[&str] = &["MONTHLY_REQUEST_COUNT", "OVERAGE_REQUEST_LIMIT_EXCEEDED"];
 
@@ -1166,6 +1170,14 @@ mod tests {
     #[test]
     fn test_is_quota_exhausted_overage_reason() {
         let body = r#"{"message":"You have reached the limit for overages.","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#;
+        assert!(KiroProvider::is_quota_exhausted(body));
+    }
+
+    #[test]
+    fn test_is_quota_exhausted_service_quota_exceeded_400_body() {
+        // 实测：overage 用尽时上游回 HTTP 400 + 此 body（含 __type ServiceQuotaExceededException）。
+        // 状态码判断在调用处（400/402 都触发），此处确认 reason 能被识别。
+        let body = r#"{"__type":"com.amazon.coral.service#ServiceQuotaExceededException","message":"You have reached the limit for overages.","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#;
         assert!(KiroProvider::is_quota_exhausted(body));
     }
 
