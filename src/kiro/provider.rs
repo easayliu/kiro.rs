@@ -12,7 +12,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::errors::UpstreamHttpError;
+use crate::kiro::errors::{UpstreamBodyError, UpstreamHttpError};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -284,7 +284,12 @@ impl KiroProvider {
                         BODY_READ_MAX_ATTEMPTS,
                         chain
                     );
-                    last_error = Some(anyhow::Error::new(e));
+                    // 包成带凭据 id 的 typed error，使失败时序统计能归类到实际凭据
+                    // （上游已回 200，body 阶段出错，故区别于 UpstreamHttpError）。
+                    last_error = Some(anyhow::Error::new(UpstreamBodyError {
+                        credential_id,
+                        message: chain,
+                    }));
 
                     // 长生成撞上游响应时长上限：重试注定再次撞墙，直接放弃剩余重试省凭据/省时。
                     if body_elapsed >= LONG_RESPONSE_EOF_NO_RETRY {
@@ -818,6 +823,7 @@ impl KiroProvider {
                         status: status.as_u16(),
                         body,
                         api_type: api_type.to_string(),
+                        credential_id: Some(ctx.id),
                     });
                 }
 
@@ -825,6 +831,7 @@ impl KiroProvider {
                     status: status.as_u16(),
                     body,
                     api_type: api_type.to_string(),
+                    credential_id: Some(ctx.id),
                 }));
                 continue;
             }
@@ -848,6 +855,7 @@ impl KiroProvider {
                         status: status.as_u16(),
                         body,
                         api_type: api_type.to_string(),
+                        credential_id: Some(ctx.id),
                     }));
                     continue;
                 }
@@ -878,6 +886,7 @@ impl KiroProvider {
                     status: status.as_u16(),
                     body,
                     api_type: api_type.to_string(),
+                    credential_id: Some(ctx.id),
                 });
             }
 
@@ -909,6 +918,7 @@ impl KiroProvider {
                         status: status.as_u16(),
                         body,
                         api_type: api_type.to_string(),
+                        credential_id: Some(ctx.id),
                     });
                 }
 
@@ -916,6 +926,7 @@ impl KiroProvider {
                     status: status.as_u16(),
                     body,
                     api_type: api_type.to_string(),
+                    credential_id: Some(ctx.id),
                 }));
                 continue;
             }
@@ -990,6 +1001,7 @@ impl KiroProvider {
                     status: status.as_u16(),
                     body,
                     api_type: api_type.to_string(),
+                    credential_id: Some(ctx.id),
                 }));
                 if will_retry && !skip_backoff {
                     sleep(Self::retry_delay(attempt)).await;
@@ -1003,6 +1015,7 @@ impl KiroProvider {
                     status: status.as_u16(),
                     body,
                     api_type: api_type.to_string(),
+                    credential_id: Some(ctx.id),
                 });
             }
 
@@ -1018,6 +1031,7 @@ impl KiroProvider {
                 status: status.as_u16(),
                 body,
                 api_type: api_type.to_string(),
+                credential_id: Some(ctx.id),
             }));
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;

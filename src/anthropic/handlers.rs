@@ -3,7 +3,7 @@
 use std::convert::Infallible;
 
 use anyhow::Error;
-use crate::kiro::errors::{NoAvailableCredentialsError, UpstreamHttpError};
+use crate::kiro::errors::{NoAvailableCredentialsError, UpstreamBodyError, UpstreamHttpError};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -119,17 +119,23 @@ fn update_binding_after_call(
 /// token/成本/延迟均为 0，只进错误率统计，不污染成功侧聚合。
 fn map_provider_error(err: Error, model: &str) -> Response {
     // 失败请求时序统计：状态码按错误类型归类（凭据全禁 503 / 上游 HTTP 透传 / 兜底 502）。
-    let stat_status: i64 = if err.downcast_ref::<NoAvailableCredentialsError>().is_some() {
-        503
-    } else if let Some(upstream) = err.downcast_ref::<UpstreamHttpError>() {
-        upstream.status as i64
-    } else {
-        502
-    };
+    // credential_id 取上游错误携带的实际凭据（多凭据重试时为最后一次尝试的凭据）；
+    // 无关联凭据的错误（凭据全禁 503 / 请求未发到上游）记 0。
+    let (stat_status, stat_cred): (i64, i64) =
+        if err.downcast_ref::<NoAvailableCredentialsError>().is_some() {
+            (503, 0)
+        } else if let Some(upstream) = err.downcast_ref::<UpstreamHttpError>() {
+            (upstream.status as i64, upstream.credential_id.unwrap_or(0) as i64)
+        } else if let Some(body_err) = err.downcast_ref::<UpstreamBodyError>() {
+            // 上游已回 200 但 body 读取失败：映射 502，归类到实际凭据
+            (502, body_err.credential_id as i64)
+        } else {
+            (502, 0)
+        };
     crate::stats::record(crate::stats::RequestStat {
         ts: 0,
         model: model.to_string(),
-        credential_id: 0,
+        credential_id: stat_cred,
         actual_micro: 0,
         official_micro: 0,
         margin_micro: 0,
