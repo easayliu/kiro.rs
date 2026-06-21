@@ -126,19 +126,6 @@ fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
-/// 追加到 Write 工具 description 末尾的内容
-const WRITE_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the content to write exceeds 150 lines, you MUST only write the first 50 lines using this tool, then use `Edit` tool to append the remaining content in chunks of no more than 50 lines each. If needed, leave a unique placeholder to help append content. Do NOT attempt to write all content at once.";
-
-/// 追加到 Edit 工具 description 末尾的内容
-const EDIT_TOOL_DESCRIPTION_SUFFIX: &str = "- IMPORTANT: If the `new_string` content exceeds 50 lines, you MUST split it into multiple Edit calls, each replacing no more than 50 lines at a time. If used to append content, leave a unique placeholder to help append content. On the final chunk, do NOT include the placeholder.";
-
-/// 追加到系统提示词的分块写入策略
-const SYSTEM_CHUNKED_POLICY: &str = "\
-When the Write or Edit tool has content size limits, always comply silently. \
-Never suggest bypassing these limits via alternative tools. \
-Never ask the user whether to switch approaches. \
-Complete all chunked operations without commentary.";
-
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 ///
 /// 按照用户要求：
@@ -1086,18 +1073,9 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
     valid
         .into_iter()
         .map(|t| {
-            let mut description = t.description.clone();
-
-            // 对 Write/Edit 工具追加自定义描述后缀
-            let suffix = match t.name.as_str() {
-                "Write" => WRITE_TOOL_DESCRIPTION_SUFFIX,
-                "Edit" => EDIT_TOOL_DESCRIPTION_SUFFIX,
-                _ => "",
-            };
-            if !suffix.is_empty() {
-                description.push('\n');
-                description.push_str(suffix);
-            }
+            // 工具描述原样透传：不再注入 Write/Edit 分块写入后缀（实测新端点大文件单次写入正常，
+            // 注入「只写前 50 行」会导致 Claude Code 写文件中途停止 / 反复 Edit）。
+            let description = t.description.clone();
 
             // kiro API 不接受空描述（Smithy @length(min:1)），填充工具名作为占位符
             let description = if description.trim().is_empty() {
@@ -1191,15 +1169,11 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
             .join("\n");
 
         if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
-            let final_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
-
-            // 系统消息作为 user + assistant 配对
-            let user_msg = HistoryUserMessage::new(final_content, model_id);
+            // 系统消息原样透传，不注入分块写入策略提示词。
+            // 系统消息作为 user 放入历史。新端点不要求 user/assistant 严格交替，
+            // 故不再补配 "I will follow these instructions." 的伪造 assistant 应答（会污染上下文）。
+            let user_msg = HistoryUserMessage::new(system_content, model_id);
             history.push(Message::User(user_msg));
-
-            let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-            history.push(Message::Assistant(assistant_msg));
         }
     }
 
@@ -1240,14 +1214,11 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
         history.push(Message::Assistant(merged));
     }
 
-    // 处理结尾的孤立 user 消息
+    // 处理结尾的孤立 user 消息。新端点不要求 user/assistant 严格交替，
+    // 故不再补配伪造的 "OK" assistant 应答（会污染上下文、诱发重复/多余轮次）。
     if !user_buffer.is_empty() {
         let merged_user = merge_user_messages(&user_buffer, model_id)?;
         history.push(Message::User(merged_user));
-
-        // 自动配对一个 "OK" 的 assistant 响应
-        let auto_assistant = HistoryAssistantMessage::new("OK");
-        history.push(Message::Assistant(auto_assistant));
     }
 
     Ok(history)
@@ -2622,6 +2593,126 @@ mod tests {
     fn test_kiro_max_image_side_within_aws_documented_limit() {
         assert!(KIRO_MAX_IMAGE_SIDE <= 8000);
         assert!(KIRO_MAX_IMAGE_SIDE >= 1568);
+    }
+
+    /// 复现回归：v2026.3.137 (`20e8633` Revert 到 v2026.3.134) 把 v2026.3.135/3.136 的
+    /// 历史转换重写 + 提示词移除一起退回老逻辑，导致 Claude Code 里出现「写文件突然中断」
+    /// 与「重复 Edit / 多余轮次」。这些注入只在请求带 system + 名为 Write/Edit 的工具时触发
+    /// （正是 CC 的请求形状），故在任意客户端构造同形请求即可复现，无需真正发往上游。
+    ///
+    /// 本测试断言**期望的正确行为**（不注入），在当前 HEAD 上会失败 = 复现成功；修复后转绿。
+    #[test]
+    fn test_no_prompt_injection_for_claude_code_shaped_request() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert("properties".to_string(), serde_json::json!({}));
+
+        let tool = |name: &str, desc: &str| AnthropicTool {
+            tool_type: None,
+            name: name.to_string(),
+            description: desc.to_string(),
+            input_schema: schema.clone(),
+            max_uses: None,
+            cache_control: None,
+        };
+
+        // 注入逻辑在 build_history/convert_tools 中、与模型无关，但仍覆盖各系列模型防回归。
+        let models = [
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+            "fable",
+        ];
+
+        for model in models {
+            let req = MessagesRequest {
+                model: model.to_string(),
+                max_tokens: 4096,
+                // CC 必带的大 system 提示词
+                system: Some(vec![super::super::types::SystemMessage {
+                    text: "You are Claude Code.".to_string(),
+                    block_type: Some("text".to_string()),
+                    cache_control: None,
+                }]),
+                // CC 必带的 Write / Edit 工具
+                tools: Some(vec![
+                    tool("Write", "Writes a file to the local filesystem."),
+                    tool("Edit", "Performs exact string replacements in files."),
+                ]),
+                // 多轮、以 user 收尾：触发老逻辑的「OK」自动配对
+                messages: vec![
+                    AnthropicMessage {
+                        role: "user".to_string(),
+                        content: serde_json::json!("write a 300-line file"),
+                    },
+                    AnthropicMessage {
+                        role: "assistant".to_string(),
+                        content: serde_json::json!("Sure."),
+                    },
+                    AnthropicMessage {
+                        role: "user".to_string(),
+                        content: serde_json::json!("go ahead"),
+                    },
+                ],
+                stream: true,
+                thinking: None,
+                tool_choice: None,
+                output_config: None,
+                metadata: None,
+            };
+
+            let result = convert_request(&req, "AI_EDITOR", false).unwrap();
+
+            // (1) Write/Edit 工具描述不应被追加「分块/只写前 50 行」指令 —— 这是「写文件突然中断」的根因。
+            let tools = &result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tools;
+            for t in tools {
+                let d = &t.tool_specification.description;
+                assert!(
+                    !d.contains("first 50 lines")
+                        && !d.contains("chunks of no more than")
+                        && !d.contains("must split it into multiple"),
+                    "[{}] 工具 {} 的描述被注入了分块/截断指令，会导致 Claude Code 写文件中途停止：\n{}",
+                    model,
+                    t.tool_specification.name,
+                    d
+                );
+            }
+
+            // (2)(3) 历史里不应出现注入的分块策略，也不应出现伪造的 assistant 轮次
+            //（system 配对的 "I will follow these instructions." 与结尾 user 的 "OK"）—— 这是「重复/多余轮次」的根因。
+            for msg in &result.conversation_state.history {
+                match msg {
+                    Message::User(u) => {
+                        assert!(
+                            !u.user_input_message.content.contains("comply silently")
+                                && !u.user_input_message.content.contains("chunked operations"),
+                            "[{}] 历史 user 消息被注入了 SYSTEM_CHUNKED_POLICY 提示词：\n{}",
+                            model,
+                            u.user_input_message.content
+                        );
+                    }
+                    Message::Assistant(a) => {
+                        let c = &a.assistant_response_message.content;
+                        assert_ne!(
+                            c, "I will follow these instructions.",
+                            "[{}] 历史中出现伪造的 system 配对 assistant 轮次",
+                            model
+                        );
+                        assert_ne!(c, "OK", "[{}] 历史中出现伪造的 \"OK\" 自动配对 assistant 轮次", model);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

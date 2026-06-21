@@ -339,6 +339,8 @@ pub struct HistoryAssistantMessage {
 
 impl HistoryAssistantMessage {
     /// 创建新的历史助手消息
+    // 生产代码不再注入伪造的 assistant 轮次（如旧的 "OK" 配对），仅测试用作构造便捷方法。
+    #[allow(dead_code)]
     pub fn new(content: impl Into<String>) -> Self {
         Self {
             assistant_response_message: AssistantMessage::new(content),
