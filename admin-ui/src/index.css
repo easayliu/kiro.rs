@@ -54,52 +54,54 @@
   }
 
   .dark {
-    /* Standard slate dark (shadcn/ui canonical) */
-    --background: 222.2 84% 4.9%;           /* #020617 slate-950 */
-    --surface: 217.2 32.6% 10%;             /* slate-900-ish card */
-    --surface-2: 217.2 32.6% 13%;
-    --foreground: 210 40% 98%;              /* #F8FAFC */
+    /* 黑白科技风暗色 —— 中性档位取 Tailwind zinc 色阶，对比按 WCAG AA 校准 */
+    --background: 240 10% 3.9%;             /* zinc-950 */
+    --surface: 240 6% 10%;                  /* zinc-900，较背景提亮一档表达层级 */
+    --surface-2: 240 5% 15%;
+    --foreground: 0 0% 98%;                 /* zinc-50，前景/背景 19:1 */
 
-    --card: 217.2 32.6% 10%;
-    --card-foreground: 210 40% 98%;
+    --card: 240 6% 10%;                     /* zinc-900 */
+    --card-foreground: 0 0% 98%;
 
-    --popover: 217.2 32.6% 10%;
-    --popover-foreground: 210 40% 98%;
+    --popover: 240 6% 10%;
+    --popover-foreground: 0 0% 98%;
 
-    /* 黑白科技风 —— 暗色下用近白色作强调，保证对比 */
+    /* 强调色：暗色下用近白，正文/按钮对比 16:1+ */
     --primary: 0 0% 98%;
-    --primary-foreground: 0 0% 9%;
-    --primary-soft: 0 0% 18%;
+    --primary-foreground: 240 6% 10%;
+    --primary-soft: 240 5% 20%;
 
-    --secondary: 217.2 32.6% 17.5%;
-    --secondary-foreground: 210 40% 98%;
+    --secondary: 240 4% 16%;               /* zinc-800 */
+    --secondary-foreground: 0 0% 98%;
 
     --cta: 0 0% 98%;
-    --cta-foreground: 0 0% 9%;
+    --cta-foreground: 240 6% 10%;
 
-    --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
+    --muted: 240 4% 16%;                    /* zinc-800 */
+    --muted-foreground: 240 5% 65%;        /* zinc-400，次要文字对卡片 6.9:1 */
 
-    --accent: 217.2 32.6% 17.5%;
-    --accent-foreground: 210 40% 98%;
+    --accent: 240 4% 16%;
+    --accent-foreground: 0 0% 98%;
 
-    --destructive: 0 72% 51%;
-    --destructive-foreground: 210 40% 98%;
+    /* 危险按钮底：深红 + 白字 9.4:1 */
+    --destructive: 0 63% 31%;              /* red-900 调暗 */
+    --destructive-foreground: 0 0% 98%;
 
-    --ok: 142 70% 45%;
-    --ok-foreground: 222.2 47.4% 11.2%;
-    --ok-soft: 142 40% 16%;
+    /* 语义色取 Tailwind 高亮档，既可作正文(对卡片 ≥6:1)又可作实心徽章(配深字 ≥6:1) */
+    --ok: 160 84% 45%;                      /* emerald-500/600 */
+    --ok-foreground: 240 6% 10%;
+    --ok-soft: 160 40% 13%;
 
-    --warn: 38 92% 55%;
-    --warn-foreground: 222.2 47.4% 11.2%;
-    --warn-soft: 38 45% 18%;
+    --warn: 43 96% 56%;                     /* amber-400 */
+    --warn-foreground: 240 6% 10%;
+    --warn-soft: 40 50% 15%;
 
-    --bad: 0 72% 55%;
-    --bad-foreground: 210 40% 98%;
-    --bad-soft: 0 50% 18%;
+    --bad: 0 91% 71%;                       /* red-400 */
+    --bad-foreground: 240 6% 10%;
+    --bad-soft: 0 50% 16%;
 
-    --border: 217.2 32.6% 17.5%;
-    --input: 217.2 32.6% 17.5%;
+    --border: 240 5% 22%;                   /* zinc-700 档，对背景 1.6:1 清晰可见 */
+    --input: 240 5% 22%;
     --ring: 0 0% 98%;
   }
 }
