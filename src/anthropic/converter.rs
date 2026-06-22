@@ -1004,14 +1004,28 @@ fn shorten_tool_name(name: &str) -> String {
     format!("{}_{}", prefix, hash_suffix)
 }
 
-/// 如果名称超长则缩短，并记录映射（short → original）
+/// 净化 + 缩短工具名，并记录映射（mapped → original）。
+///
+/// 1. 净化非法字符：Bedrock 工具名要求 `^[a-zA-Z0-9_-]+$`，`$`、`.`、空格等其它字符
+///    会被上游以 `Invalid tool use format` / `REQUEST_BODY_INVALID` 拒绝（实测 history
+///    里出现 `$WEB_SEARCH`、`$MUTLI_1.N.1-Read` 这类名字即触发）。统一替换为 `_`。
+/// 2. 净化后若仍超长，再走确定性缩短（缩短结果本身只含 `[a-zA-Z0-9_-]` + hash，合法）。
+/// 3. 若最终名与原始名不同，记录反向映射（mapped → original），使出口能还原客户端原始
+///    工具名。tools 定义与 history toolUse 两端都经本函数，映射一致，不会破坏名称匹配。
 fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> String {
-    if name.len() <= TOOL_NAME_MAX_LEN {
-        return name.to_string();
+    let sanitized: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    let mapped = if sanitized.len() <= TOOL_NAME_MAX_LEN {
+        sanitized
+    } else {
+        shorten_tool_name(&sanitized)
+    };
+    if mapped != name {
+        tool_name_map.insert(mapped.clone(), name.to_string());
     }
-    let short = shorten_tool_name(name);
-    tool_name_map.insert(short.clone(), name.to_string());
-    short
+    mapped
 }
 
 /// 规范化 tool_use_id：净化非法字符 + 缩短超长（确定性，保证 tool_use 和 tool_result 端映射一致）
@@ -1553,6 +1567,51 @@ mod pairing_tests {
         align_history_tool_pairing(&mut history);
         assert_eq!(use_count(&history[0]), 1);
         assert_eq!(result_ids(&history[1]), vec!["toolu_2".to_string()]);
+    }
+
+    #[test]
+    fn test_convert_request_sanitizes_illegal_tool_names() {
+        // 复现线上 400 "Invalid tool use format"：tools 定义与 history toolUse 都带
+        // 非法字符工具名（$WEB_SEARCH / $MUTLI_1.N.1-Read）。修复后两端应统一净化为
+        // 合法名，且 tool_name_map 记录反向映射；序列化结果不得再含 '$' / '.'。
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 64,
+            "stream": true,
+            "tools": [
+                {"name": "$WEB_SEARCH", "description": "search", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "$MUTLI_1.N.1-Read", "description": "read", "input_schema": {"type": "object", "properties": {}}}
+            ],
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu1", "name": "$WEB_SEARCH", "input": {"q": "x"}},
+                    {"type": "tool_use", "id": "tu2", "name": "$MUTLI_1.N.1-Read", "input": {"p": "/a"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu1", "content": "ok1"},
+                    {"type": "tool_result", "tool_use_id": "tu2", "content": "ok2"}
+                ]},
+                {"role": "user", "content": "go"}
+            ]
+        }))
+        .unwrap();
+
+        let result = convert_request(&req, "AI_EDITOR", false).unwrap();
+        let dumped = serde_json::to_string(&result.conversation_state).unwrap();
+
+        // 净化后两端都不应再出现原始非法名 / 非法字符
+        assert!(!dumped.contains("$WEB_SEARCH"), "tools/history 仍残留非法工具名");
+        assert!(!dumped.contains("$MUTLI"), "tools/history 仍残留非法工具名");
+        assert!(dumped.contains("_WEB_SEARCH"));
+        assert!(dumped.contains("_MUTLI_1_N_1-Read"));
+
+        // 反向映射可还原客户端原始名
+        assert_eq!(result.tool_name_map.get("_WEB_SEARCH"), Some(&"$WEB_SEARCH".to_string()));
+        assert_eq!(
+            result.tool_name_map.get("_MUTLI_1_N_1-Read"),
+            Some(&"$MUTLI_1.N.1-Read".to_string())
+        );
     }
 
     #[test]
@@ -2167,6 +2226,40 @@ mod tests {
         let result = map_tool_name(long_name, &mut map);
         assert!(result.len() <= TOOL_NAME_MAX_LEN);
         assert_eq!(map.get(&result), Some(&long_name.to_string()));
+    }
+
+    #[test]
+    fn test_map_tool_name_sanitizes_illegal_chars() {
+        // 复现线上 400：工具名带 $ . 等 Bedrock 不允许的字符，应净化为 _ 并记录反向映射。
+        let mut map = HashMap::new();
+        assert_eq!(map_tool_name("$WEB_SEARCH", &mut map), "_WEB_SEARCH");
+        assert_eq!(map.get("_WEB_SEARCH"), Some(&"$WEB_SEARCH".to_string()));
+
+        assert_eq!(
+            map_tool_name("$MUTLI_1.N.1-Read", &mut map),
+            "_MUTLI_1_N_1-Read"
+        );
+        assert_eq!(
+            map.get("_MUTLI_1_N_1-Read"),
+            Some(&"$MUTLI_1.N.1-Read".to_string())
+        );
+
+        // 净化后结果须满足 ^[a-zA-Z0-9_-]+$
+        for n in ["_WEB_SEARCH", "_MUTLI_1_N_1-Read"] {
+            assert!(
+                n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "净化后仍含非法字符: {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_map_tool_name_clean_name_no_mapping() {
+        // 合法名（仅 [a-zA-Z0-9_-]）原样返回，不产生映射
+        let mut map = HashMap::new();
+        assert_eq!(map_tool_name("Read", &mut map), "Read");
+        assert_eq!(map_tool_name("my-tool_2", &mut map), "my-tool_2");
+        assert!(map.is_empty());
     }
 
     #[test]
