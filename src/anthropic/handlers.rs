@@ -1050,7 +1050,8 @@ async fn handle_non_stream_request(
 
     content.extend(tool_uses);
 
-    // 估算输出 tokens
+    // 估算输出 tokens：tokenizer 计数（output 无上游真值兜底，本地即计费值），
+    // 与流式 count_tokens 口径一致。
     let output_tokens = token::estimate_output_tokens(&content);
 
     // 计费口径的缓存使用量：有 contextUsageEvent 时把本地估算的缓存拆分按上游

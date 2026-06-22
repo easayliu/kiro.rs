@@ -1,18 +1,16 @@
 //! Token 计算模块
 //!
-//! 算法：`tokens = ceil(utf8_byte_len / 4)`。单行实现，零分支、零依赖、
-//! O(1) 时间。
+//! 本地估算口径：内嵌 DeepSeek V3 的 HuggingFace BPE tokenizer（128k 词表），
+//! 对文本做真实子词切分后取 token 数。相比旧的 `ceil(字节/4)` 启发式，对代码、
+//! JSON 等结构化文本明显更准；离线、无 RPM、无需 API key。
 //!
-//! 为什么取字节数而不是字符数：UTF-8 编码下英文 1 字节、中文 3 字节、
-//! 日韩 3 字节、阿拉伯 2 字节 —— 字节数天然反映真实 tokenizer 对不同
-//! 语种的密度差异（中文更密），不需要写 Unicode 分类表或分段放大系数。
+//! 兜底：tokenizer 加载或编码失败时回退到 `ceil(utf8_byte_len / 4)`，保证任何
+//! 情况下都有确定结果、零 panic。`BYTES_PER_TOKEN=4` 取 Claude 家族 BPE 的平均
+//! 压缩比（约 3.5–4 字节/token）。
 //!
-//! 为什么除以 4：社区实测 Claude 家族的 BPE 平均压缩比约 3.5–4 字节/token，
-//! 取 4 更接近真实值；如需保留"偏高以防爆窗口"的裕度方向，可改为 3。
-//!
-//! 这套实现的目标是**稳定可预测**而非精度：同一字符串任何时间/环境/语言
-//! 实现下结果恒定，客户端用单一倍率校正即可对账。需要 100% 精确值请配置
-//! `count_tokens_api_url` 走远程 `/v1/messages/count_tokens`。
+//! 注意：本模块只负责**本地估算/打底**。需要 Claude 精确值时配置
+//! `count_tokens_api_url` 走远程 `/v1/messages/count_tokens`；实际计费仍以上游
+//! `contextUsageEvent` 反推的 input_tokens 为准（见 anthropic::stream）。
 
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
@@ -20,6 +18,31 @@ use crate::anthropic::types::{
 use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
 use std::sync::OnceLock;
+use tokenizers::Tokenizer;
+
+/// 内嵌的 DeepSeek V3 tokenizer 定义（HuggingFace `tokenizer.json`）。
+/// 随二进制一起分发，免去运行时找文件/配 key，部署即生效。
+static TOKENIZER_JSON: &[u8] = include_bytes!("../deepseek_v3_tokenizer/tokenizer.json");
+
+/// 懒加载的 tokenizer 单例。加载失败时为 `None`，调用方回退到字节估算。
+static TOKENIZER: OnceLock<Option<Tokenizer>> = OnceLock::new();
+
+/// 获取进程级 tokenizer 单例引用；首次调用解析内嵌 JSON。
+fn tokenizer() -> Option<&'static Tokenizer> {
+    TOKENIZER
+        .get_or_init(|| match Tokenizer::from_bytes(TOKENIZER_JSON) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::warn!(
+                    "内嵌 tokenizer 加载失败，本地 token 估算回退到 bytes/{}: {}",
+                    BYTES_PER_TOKEN,
+                    e
+                );
+                None
+            }
+        })
+        .as_ref()
+}
 
 /// Count Tokens API 配置
 #[derive(Clone, Default)]
@@ -51,13 +74,20 @@ fn get_config() -> Option<&'static CountTokensConfig> {
     COUNT_TOKENS_CONFIG.get()
 }
 
-/// UTF-8 字节数到 token 的换算基数。取 4 贴近 Claude 家族 BPE 的平均压缩比。
+/// tokenizer 不可用时的兜底换算基数（UTF-8 字节 / 4，贴近 Claude BPE 平均压缩比）。
 const BYTES_PER_TOKEN: u64 = 4;
 
-/// 计算文本的 token 数量（UTF-8 字节 / `BYTES_PER_TOKEN`，向上取整）。空串返回 0。
+/// 计算文本的 token 数量。优先用内嵌 DeepSeek tokenizer 做真实切分；
+/// tokenizer 不可用或编码失败时回退到 `ceil(字节 / BYTES_PER_TOKEN)`。空串返回 0。
 pub fn count_tokens(text: &str) -> u64 {
     if text.is_empty() {
         return 0;
+    }
+    if let Some(tok) = tokenizer() {
+        // add_special_tokens=false：只数内容 token，不计 BOS/EOS。
+        if let Ok(encoding) = tok.encode(text, false) {
+            return encoding.len() as u64;
+        }
     }
     (text.len() as u64).div_ceil(BYTES_PER_TOKEN)
 }
@@ -185,7 +215,10 @@ fn count_all_tokens_local(
     total.max(1)
 }
 
-/// 估算输出 tokens
+/// 估算输出 tokens（非流式路径）。
+///
+/// 对输出内容（正文 + tool 入参）用内嵌 DeepSeek tokenizer 做切分计数。output
+/// **没有**上游 `contextUsageEvent` 真值兜底，本地 DeepSeek 切分数即最终上报/计费值。
 pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     let mut total = 0;
 
@@ -268,27 +301,23 @@ mod tests {
 
     #[test]
     fn count_tokens_english_sanity() {
-        // "Hello, world!" = 13 字节 → ceil(13/4) = 4
+        // 内嵌 DeepSeek tokenizer 对 "Hello, world!" 切出 4 个 token。
         assert_eq!(count_tokens("Hello, world!"), 4);
     }
 
     #[test]
     fn count_tokens_chinese_sanity() {
-        // UTF-8 下中文 3 字节/字，字节数天然反映 tokenizer 对中文更密的事实。
-        // 该文本 107 字节 → ceil(107/4) = 27 tokens。
+        // 中文按真实子词切分（非字节估算）：该文本为 21 个 token。
         let text = "你好世界，这是一个测试。一个很长的测试文本，用来对比不同 tokenizer 的差异。";
-        assert_eq!(count_tokens(text), 27);
+        assert_eq!(count_tokens(text), 21);
     }
 
-    /// 回归防护：纯 ASCII 与纯 CJK 的字节→token 换算关键定点。
+    /// 回归防护：内嵌 tokenizer 对 ASCII / CJK 的关键定点（值由 tokenizer.json 决定）。
     #[test]
-    fn count_tokens_byte_basis() {
-        // 8 字节 ASCII → ceil(8/4) = 2
+    fn count_tokens_tokenizer_fixed_points() {
         assert_eq!(count_tokens("abcdefgh"), 2);
-        // 4 个中文 = 12 字节 → ceil(12/4) = 3
-        assert_eq!(count_tokens("你好世界"), 3);
-        // 向上取整：15 字节 → ceil(15/4) = 4
-        assert_eq!(count_tokens("abcdefghijklmno"), 4);
+        assert_eq!(count_tokens("你好世界"), 2);
+        assert_eq!(count_tokens("abcdefghijklmno"), 6);
     }
 
     /// 回归防护：tokenizer 成功初始化，连续两次调用返回相同结果（单例）。

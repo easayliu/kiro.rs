@@ -630,8 +630,12 @@ pub struct StreamContext {
     /// 从 contextUsageEvent 计算的实际输入 tokens
     #[allow(dead_code)]
     pub context_input_tokens: Option<i32>,
-    /// 输出 tokens 累计
+    /// 输出 tokens 累计。流式过程中只累积文本到 `output_buf`，在
+    /// `generate_final_events` 收口时对整串做一次 tokenizer 计数得权威值。
     pub output_tokens: i32,
+    /// 输出文本累积缓冲（thinking + 正文 + tool 入参 JSON）。流结束时整串
+    /// tokenize 一次，避免逐 chunk 切分在 BPE 边界处系统性偏差。
+    output_buf: String,
     /// Prompt caching 使用细分（由 handler 在 API 调用返回后注入）
     pub cache_usage: CacheUsage,
     /// 命中条目持久化的「上游计费口径」累计 token（W）。计费时把 cache_read
@@ -691,6 +695,7 @@ impl StreamContext {
             input_tokens,
             context_input_tokens: None,
             output_tokens: 0,
+            output_buf: String::new(),
             cache_usage: CacheUsage::default(),
             cache_read_billed: None,
             billing_writeback: None,
@@ -900,7 +905,7 @@ impl StreamContext {
         };
 
         if !reasoning.text.is_empty() {
-            self.output_tokens += estimate_tokens(&reasoning.text);
+            self.output_buf.push_str(&reasoning.text);
             events.push(self.create_thinking_delta_event(thinking_index, &reasoning.text));
         }
         if let Some(signature) = &reasoning.signature {
@@ -938,7 +943,7 @@ impl StreamContext {
             if content.is_empty() {
                 return events;
             }
-            self.output_tokens += estimate_tokens(content);
+            self.output_buf.push_str(content);
             events.extend(self.create_text_delta_events(content));
             return events;
         }
@@ -947,8 +952,8 @@ impl StreamContext {
             return Vec::new();
         }
 
-        // 估算 tokens
-        self.output_tokens += estimate_tokens(content);
+        // 累积正文，收口时统一 tokenize
+        self.output_buf.push_str(content);
 
         // 如果启用了thinking，需要处理thinking块
         if self.thinking_enabled {
@@ -1302,7 +1307,8 @@ impl StreamContext {
 
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)
         if !tool_use.input.is_empty() {
-            self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
+            // tool 入参 JSON 也计入输出（与非流式 estimate_output_tokens 口径一致）
+            self.output_buf.push_str(&tool_use.input);
 
             if let Some(delta_event) = self.state_manager.handle_content_block_delta(
                 block_index,
@@ -1447,6 +1453,11 @@ impl StreamContext {
                 );
             }
         }
+
+        // 输出 token 计数：对整段输出文本（thinking+正文+tool 入参）做一次 tokenizer
+        // 计数（整串切分，避免逐 chunk 在 BPE 边界处的系统性偏差）。output 无上游真值
+        // 兜底，本地 DeepSeek 切分数即最终上报/计费值。保底 1。
+        self.output_tokens = (crate::token::count_tokens(&self.output_buf) as i32).max(1);
 
         let actual = credit_to_usd(self.upstream_credit.unwrap_or(0.0));
         let official = official_price_usd(
@@ -1656,26 +1667,6 @@ impl BufferedStreamContext {
     }
 }
 
-/// 简单的 token 估算
-fn estimate_tokens(text: &str) -> i32 {
-    let chars: Vec<char> = text.chars().collect();
-    let mut chinese_count = 0;
-    let mut other_count = 0;
-
-    for c in &chars {
-        if *c >= '\u{4E00}' && *c <= '\u{9FFF}' {
-            chinese_count += 1;
-        } else {
-            other_count += 1;
-        }
-    }
-
-    // 中文约 1.5 字符/token，英文约 4 字符/token
-    let chinese_tokens = (chinese_count * 2 + 2) / 3;
-    let other_tokens = (other_count + 3) / 4;
-
-    (chinese_tokens + other_tokens).max(1)
-}
 
 #[cfg(test)]
 mod tests {
@@ -1944,13 +1935,6 @@ mod tests {
             }),
             "flushed text should equal the buffered prefix"
         );
-    }
-
-    #[test]
-    fn test_estimate_tokens() {
-        assert!(estimate_tokens("Hello") > 0);
-        assert!(estimate_tokens("你好") > 0);
-        assert!(estimate_tokens("Hello 你好") > 0);
     }
 
     #[test]

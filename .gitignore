@@ -22,3 +22,5 @@
 /kiro.db
 /kiro.db-wal
 /kiro.db-shm
+.DS_Store
+**/.DS_Store
