@@ -874,10 +874,14 @@ impl KiroProvider {
                         "API 400 请求格式错误 - dump 上游请求/响应"
                     );
                 } else {
+                    // 其它 400（如 CONTENT_LENGTH_EXCEEDS_THRESHOLD 输入超窗）：带上模型与
+                    // 实际发往上游的 payload 字节数，便于排查是哪个模型、输入多大触发的。
                     tracing::warn!(
                         cred_id = ctx.id,
                         status = %status,
                         api_type = api_type,
+                        model = model.as_deref().unwrap_or("?"),
+                        request_bytes = outbound_body.len(),
                         "API 400 Bad Request: {}",
                         body
                     );
@@ -1136,9 +1140,19 @@ impl KiroProvider {
         body.contains("TOOL_USE_RESULT_MISMATCH")
     }
 
+    /// 判断 400 响应是否为请求体格式校验失败：
+    /// 形如 `{"message":"Invalid tool use format.","reason":"REQUEST_BODY_INVALID"}`，
+    /// 涵盖 tool_use/tool_result 单块结构非法等情况，同样是我们发出的请求格式问题，
+    /// 需要 dump outbound payload 离线复现。
+    fn is_request_body_invalid(body: &str) -> bool {
+        body.contains("REQUEST_BODY_INVALID")
+    }
+
     /// 判断 400 是否属于"请求格式 bug"（应 dump outbound payload 离线复现）。
     fn is_malformed_request(body: &str) -> bool {
-        Self::is_improperly_formed_request(body) || Self::is_tool_use_result_mismatch(body)
+        Self::is_improperly_formed_request(body)
+            || Self::is_tool_use_result_mismatch(body)
+            || Self::is_request_body_invalid(body)
     }
 }
 
@@ -1235,6 +1249,14 @@ mod tests {
     fn test_is_invalid_model_id_false() {
         let body = r#"{"message":"bad","reason":"VALIDATION_ERROR"}"#;
         assert!(!KiroProvider::is_invalid_model_id(body));
+    }
+
+    #[test]
+    fn test_is_malformed_request_request_body_invalid() {
+        // "Invalid tool use format." / REQUEST_BODY_INVALID 应被识别为请求格式 bug，触发 dump
+        let body = r#"{"__type":"com.amazon.kiro.runtimeservice#ValidationException","message":"Invalid tool use format.","reason":"REQUEST_BODY_INVALID"}"#;
+        assert!(KiroProvider::is_request_body_invalid(body));
+        assert!(KiroProvider::is_malformed_request(body));
     }
 
     fn body_with_user_input(origin: &str, with_env_state: bool) -> String {

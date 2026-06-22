@@ -1799,6 +1799,39 @@ mod tests {
     }
 
     #[test]
+    fn test_effort_passed_through_verbatim() {
+        // effort 原样透传，不做任何兜底/降级：上游对各模型的 effort 枚举不一致
+        //（实测 opus-4.7/4.8 支持 "xhigh"，opus-4.6/sonnet-4.6 仅 [low,medium,high,max]），
+        // 由上游负责校验并回传错误，代理不拦截、不改写，保证客户端看到真实原因。
+        use super::super::types::{OutputConfig, Thinking};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 64,
+            stream: true,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(Thinking {
+                thinking_type: "enabled".to_string(),
+                budget_tokens: 20000,
+            }),
+            output_config: Some(OutputConfig {
+                effort: "xhigh".to_string(),
+            }),
+            metadata: None,
+            messages: vec![super::super::types::Message {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+        };
+
+        let fields = build_additional_model_request_fields(&req).expect("应下发 thinking 字段");
+        // 即便该模型不支持 xhigh，也原样透传，不降级为 max/high
+        assert_eq!(fields["output_config"]["effort"], "xhigh");
+    }
+
+    #[test]
     fn test_map_model_opus_4_7() {
         // 4.7 透传上游 id，不兜底到 4.6
         assert_eq!(
