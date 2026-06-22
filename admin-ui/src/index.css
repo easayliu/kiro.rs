@@ -15,15 +15,15 @@
     --popover: 0 0% 100%;
     --popover-foreground: 210 73% 15%;
 
-    /* Stripe blurple (#635BFF) —— 品牌强调色：主按钮 / 链接 / 选中 / 焦点 */
-    --primary: 243 100% 68%;
+    /* 黑白科技风 —— 强调色：主按钮 / 链接 / 选中 / 焦点 */
+    --primary: 0 0% 9%;
     --primary-foreground: 0 0% 100%;
-    --primary-soft: 243 100% 96%;
+    --primary-soft: 0 0% 95%;
 
     --secondary: 210 40% 96%;
     --secondary-foreground: 210 73% 15%;
 
-    --cta: 243 100% 68%;
+    --cta: 0 0% 9%;
     --cta-foreground: 0 0% 100%;
 
     --muted: 210 40% 96%;
@@ -49,7 +49,7 @@
 
     --border: 213 28% 92%;
     --input: 213 28% 92%;
-    --ring: 243 100% 68%;
+    --ring: 0 0% 9%;
     --radius: 0.5rem;
   }
 
@@ -66,16 +66,16 @@
     --popover: 217.2 32.6% 10%;
     --popover-foreground: 210 40% 98%;
 
-    /* Stripe blurple (#635BFF) —— 暗色下提亮以保证对比 */
-    --primary: 243 100% 76%;
-    --primary-foreground: 222.2 47.4% 11.2%;
-    --primary-soft: 243 40% 24%;
+    /* 黑白科技风 —— 暗色下用近白色作强调，保证对比 */
+    --primary: 0 0% 98%;
+    --primary-foreground: 0 0% 9%;
+    --primary-soft: 0 0% 18%;
 
     --secondary: 217.2 32.6% 17.5%;
     --secondary-foreground: 210 40% 98%;
 
-    --cta: 243 100% 76%;
-    --cta-foreground: 222.2 47.4% 11.2%;
+    --cta: 0 0% 98%;
+    --cta-foreground: 0 0% 9%;
 
     --muted: 217.2 32.6% 17.5%;
     --muted-foreground: 215 20.2% 65.1%;
@@ -100,7 +100,7 @@
 
     --border: 217.2 32.6% 17.5%;
     --input: 217.2 32.6% 17.5%;
-    --ring: 243 100% 76%;
+    --ring: 0 0% 98%;
   }
 }
 

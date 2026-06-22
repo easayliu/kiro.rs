@@ -2083,7 +2083,7 @@ function NavSection({ label, collapsed, children }: { label?: string; collapsed?
   )
 }
 
-// 侧栏导航项：active 用 blurple 浅底高亮 + 品牌色文字图标（Stripe 圆角整行高亮）；
+// 侧栏导航项：active 用强调色浅底高亮 + 强调色文字图标（圆角整行高亮）；
 // tone='bad' 给退出登录的危险 hover；collapsed 时仅图标居中，文字转为 tooltip。
 function NavItem({ icon, label, active, onClick, tone = 'default', collapsed }: {
   icon: ReactNode
