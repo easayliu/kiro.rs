@@ -1066,9 +1066,12 @@ async fn handle_non_stream_request(
     };
     let billing = match context_input_tokens {
         Some(context_total) => {
+            // 计费前扣掉 Kiro 服务端注入的固定提示词基线（与流式路径同口径）。
+            let content_total =
+                super::converter::strip_injected_prompt(context_total, estimated_input_tokens);
             let billed = estimated_usage.billed_split(
                 estimated_input_tokens,
-                context_total,
+                content_total,
                 cache_context.cache_read_billed,
             );
             // 计费完成后把缩放后的 billed 累计回写缓存，供下次命中实现读写守恒。
@@ -1082,6 +1085,32 @@ async fn handle_non_stream_request(
         None => estimated_usage,
     };
     let billed_input_tokens = billing.uncached_input_tokens.max(1);
+
+    // [token-diag] 临时诊断：量化「上游反推总量」与「本地仅客户端内容估算」的差值。
+    // diff = 上游(含 Kiro 服务端注入 + Claude/DeepSeek 分词偏差) − 本地(纯客户端内容)。
+    // 与流式路径同一口径；验证完毕后整段删除。
+    if let Some(upstream_total) = context_input_tokens {
+        let window = get_context_window_size(model);
+        let diff = upstream_total - estimated_input_tokens;
+        let diff_pct = if estimated_input_tokens > 0 {
+            (diff as f64) / (estimated_input_tokens as f64) * 100.0
+        } else {
+            0.0
+        };
+        tracing::debug!(
+            target: "token-diag",
+            model = %model,
+            window = window,
+            local_estimate = estimated_input_tokens,
+            upstream_total = upstream_total,
+            diff = diff,
+            diff_pct = format!("{:.1}%", diff_pct),
+            billed_uncached = billing.uncached_input_tokens,
+            billed_cache_read = billing.cache_read_input_tokens,
+            billed_cache_creation = billing.cache_creation_input_tokens,
+            "[token-diag] 上游反推 vs 本地估算（非流式）"
+        );
+    }
 
     let actual = credit_to_usd(upstream_credit.unwrap_or(0.0));
     let official = official_price_usd(

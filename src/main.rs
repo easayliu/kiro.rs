@@ -208,6 +208,9 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    // 计费扣除 Kiro 服务端注入的固定提示词基线（终端用户只按真实内容计费）。
+    anthropic::set_injected_prompt_tokens(config.kiro_injected_prompt_tokens);
+
     // 解析缓存分桶策略：cache_scope 优先，否则回落到 global_cache 布尔
     let cache_scope = match config.cache_scope.as_deref() {
         Some(s) => anthropic::CacheScope::parse(s),

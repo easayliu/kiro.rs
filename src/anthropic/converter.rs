@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use base64::Engine;
 use parking_lot::RwLock;
@@ -190,6 +191,42 @@ pub fn set_dynamic_model_windows(windows: HashMap<String, i32>) {
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文，Opus 4.7/4.8 同样支持 1M。
 pub fn get_context_window_size(model: &str) -> i32 {
     window_size_for(model, &dynamic_model_windows().read())
+}
+
+/// Kiro 服务端为 agentic 端点（`agentTaskType=vibe`）强制注入的固定系统提示词 token 数。
+///
+/// 该提示词**不在**我们发出的请求体里，而是上游在 `GenerateAssistantResponse` 端点服务端
+/// 拼入后喂给模型的，因此会计入 `contextUsage` 反推出的 input_tokens。实测（kiro-ide 模式）：
+/// 一句话请求 input=6393，其中 ~6384 即该注入；agentMode 改任何值无效，agentTaskType 只接受
+/// "vibe"（换值直接上游 400），即注入无法在请求侧关闭。每请求全价计费、无缓存折扣。
+///
+/// 计费上报时从上游反推总量里扣除该基线，使终端用户只按**真实内容**计费（见
+/// [`strip_injected_prompt`]）。由 main 启动时用配置值经 [`set_injected_prompt_tokens`] 设入；
+/// 0 表示不扣除（保持原始上游口径）。Kiro 更新提示词或切换 client_mode 时需重新实测调整配置。
+static INJECTED_PROMPT_TOKENS: AtomicI32 = AtomicI32::new(0);
+
+/// 设置 Kiro 注入提示词的扣除基线（启动时由配置注入）。负值按 0 处理。
+pub fn set_injected_prompt_tokens(n: i32) {
+    INJECTED_PROMPT_TOKENS.store(n.max(0), Ordering::Relaxed);
+}
+
+/// 当前生效的注入扣除基线。
+pub fn injected_prompt_tokens() -> i32 {
+    INJECTED_PROMPT_TOKENS.load(Ordering::Relaxed)
+}
+
+/// 从上游反推总量里扣掉 Kiro 注入基线，得到计费用的「内容总量」。
+///
+/// - `context_total`：上游 `contextUsage` 反推的 input_tokens（含注入）。
+/// - `local_estimate`：本地对**客户端内容**的 token 估算，作为下限——基线偏大时
+///   floor 到它，避免反向少计内容；并保底 1。
+/// 基线为 0（未配置）时原样返回，保持原行为。
+pub fn strip_injected_prompt(context_total: i32, local_estimate: i32) -> i32 {
+    let baseline = injected_prompt_tokens();
+    if baseline <= 0 {
+        return context_total;
+    }
+    (context_total - baseline).max(local_estimate).max(1)
 }
 
 /// 1 credit 折算的 USD（上游 Kiro 计价单价）。如折扣/套餐变化在此调整。
@@ -1834,6 +1871,23 @@ mod pairing_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_injected_prompt_subtracts_baseline_with_floor() {
+        // 串行设置全局基线后验证；该测试独占基线，避免与其它用例并发互扰故单独成测。
+        set_injected_prompt_tokens(6384);
+
+        // 正常：从上游总量里扣掉基线，得到 Claude 口径的内容量。
+        assert_eq!(strip_injected_prompt(7101, 223), 717);
+        // 基线偏大导致差值低于本地估算时 floor 到本地估算（不反向少计）。
+        assert_eq!(strip_injected_prompt(6393, 10), 10);
+        // 极端：差值与本地估算都很小，仍至少保 1。
+        assert_eq!(strip_injected_prompt(6384, 0), 1);
+
+        // 基线为 0 时原样返回（关闭扣除，保持原始上游口径）。
+        set_injected_prompt_tokens(0);
+        assert_eq!(strip_injected_prompt(7101, 223), 7101);
+    }
 
     #[test]
     fn test_map_model_sonnet() {

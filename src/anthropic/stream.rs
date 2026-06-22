@@ -1344,9 +1344,11 @@ impl StreamContext {
     /// 算出的本地拆分。
     fn billing_cache_usage(&self) -> CacheUsage {
         match self.context_input_tokens {
+            // 计费前先扣掉 Kiro 服务端注入的固定提示词基线（见 converter::strip_injected_prompt），
+            // 使终端用户只按真实内容计费；注入恒落在 uncached，扣除即从 uncached 移除。
             Some(context_total) => self.cache_usage.billed_split(
                 self.input_tokens,
-                context_total,
+                super::converter::strip_injected_prompt(context_total, self.input_tokens),
                 self.cache_read_billed,
             ),
             None => self.cache_usage,
@@ -1442,6 +1444,34 @@ impl StreamContext {
         // 计费口径：有 contextUsageEvent 时钉住 cache_read 到历史 billed 值（守恒）、
         // 剩余按本地比例劈给 creation/uncached（保总量精确）；否则用本地估算拆分。
         let billing = self.billing_cache_usage();
+
+        // [token-diag] 临时诊断：量化「上游反推总量」与「本地仅客户端内容估算」的差值。
+        // diff = 上游(含 Kiro 服务端注入 + Claude/DeepSeek 分词偏差) − 本地(纯客户端内容)。
+        // 跑不同体量的真实请求收集这组数，用来判断膨胀是固定基线注入还是随内容浮动的分词偏差。
+        // 验证完毕后整段删除。
+        if let Some(upstream_total) = self.context_input_tokens {
+            let window = get_context_window_size(&self.model);
+            let local_est = self.input_tokens;
+            let diff = upstream_total - local_est;
+            let diff_pct = if local_est > 0 {
+                (diff as f64) / (local_est as f64) * 100.0
+            } else {
+                0.0
+            };
+            tracing::debug!(
+                target: "token-diag",
+                model = %self.model,
+                window = window,
+                local_estimate = local_est,
+                upstream_total = upstream_total,
+                diff = diff,
+                diff_pct = format!("{:.1}%", diff_pct),
+                billed_uncached = billing.uncached_input_tokens,
+                billed_cache_read = billing.cache_read_input_tokens,
+                billed_cache_creation = billing.cache_creation_input_tokens,
+                "[token-diag] 上游反推 vs 本地估算"
+            );
+        }
 
         // 计费完成后回写 billed 累计到缓存条目（仅有上游真实总量时），供下次命中守恒。
         if self.context_input_tokens.is_some() {

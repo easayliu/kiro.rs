@@ -125,6 +125,14 @@ pub struct Config {
     #[serde(default = "default_count_tokens_auth_type")]
     pub count_tokens_auth_type: String,
 
+    /// Kiro 服务端注入提示词的计费扣除基线（token 数，默认 6384）。
+    ///
+    /// 上游 agentic 端点会在服务端强制注入固定系统提示词（实测 kiro-ide ≈ 6384 token），
+    /// 计入 contextUsage 反推的 input。计费时从上游总量里扣掉该值，使终端用户只按真实内容
+    /// 计费。设为 0 关闭扣除（保持原始上游口径）。Kiro 改提示词 / 切 clientMode 时需重新实测。
+    #[serde(default = "default_kiro_injected_prompt_tokens")]
+    pub kiro_injected_prompt_tokens: i32,
+
     /// HTTP 代理地址（可选）
     /// 支持格式: http://host:port, https://host:port, socks5://host:port
     #[serde(default)]
@@ -247,6 +255,11 @@ fn default_count_tokens_auth_type() -> String {
     "x-api-key".to_string()
 }
 
+/// Kiro 服务端注入提示词的默认扣除基线（实测 kiro-ide ≈ 6384 token）。
+fn default_kiro_injected_prompt_tokens() -> i32 {
+    6384
+}
+
 fn default_tls_backend() -> TlsBackend {
     TlsBackend::Rustls
 }
@@ -285,6 +298,7 @@ impl Default for Config {
             count_tokens_api_url: None,
             count_tokens_api_key: None,
             count_tokens_auth_type: default_count_tokens_auth_type(),
+            kiro_injected_prompt_tokens: default_kiro_injected_prompt_tokens(),
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
