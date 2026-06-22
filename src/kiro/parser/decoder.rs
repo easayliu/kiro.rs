@@ -342,4 +342,52 @@ mod tests {
         let result = decoder.decode();
         assert!(matches!(result, Ok(None)));
     }
+
+    /// 构造一个 header_length=0 的最小合法 event-stream 帧（prelude + payload + msg_crc，CRC 均正确）
+    fn build_frame(payload: &[u8]) -> Vec<u8> {
+        use super::super::crc::crc32;
+        let header_length: u32 = 0;
+        let total_length = (super::super::frame::PRELUDE_SIZE + payload.len() + 4) as u32;
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&total_length.to_be_bytes());
+        msg.extend_from_slice(&header_length.to_be_bytes());
+        let prelude_crc = crc32(&msg[..8]);
+        msg.extend_from_slice(&prelude_crc.to_be_bytes());
+        msg.extend_from_slice(payload); // header_length=0，直接接 payload
+        let message_crc = crc32(&msg); // 对前面全部字节算 CRC
+        msg.extend_from_slice(&message_crc.to_be_bytes());
+        assert_eq!(msg.len(), total_length as usize);
+        msg
+    }
+
+    /// 正常收尾：完整帧喂完后缓冲区应被消费干净（pending==0）→ 不触发截断报错分支
+    #[test]
+    fn test_pending_bytes_zero_after_complete_frame() {
+        let frame = build_frame(br#"{"text":" The"}"#);
+        let mut decoder = EventStreamDecoder::new();
+        decoder.feed(&frame).unwrap();
+        let decoded: Vec<_> = decoder.decode_iter().filter_map(Result::ok).collect();
+        assert_eq!(decoded.len(), 1, "完整帧应被解出");
+        assert_eq!(
+            decoder.pending_bytes(),
+            0,
+            "完整帧消费后缓冲区应为空——handlers.rs 据此判定正常收尾"
+        );
+    }
+
+    /// 流被切在帧中间：上游 EOF 时缓冲区残留半帧（pending>0）→ handlers.rs 发 error 让客户端重试
+    #[test]
+    fn test_pending_bytes_positive_when_truncated_mid_frame() {
+        let frame = build_frame(br#"{"text":" a long assistant reply that gets cut"}"#);
+        let cut = frame.len() - 10; // 在帧中间切断（保留完整 prelude，但少 10 字节）
+        let mut decoder = EventStreamDecoder::new();
+        decoder.feed(&frame[..cut]).unwrap();
+        let decoded: Vec<_> = decoder.decode_iter().filter_map(Result::ok).collect();
+        assert_eq!(decoded.len(), 0, "半截帧不应被解出");
+        assert!(
+            decoder.pending_bytes() > 0,
+            "切在帧中间时缓冲区必有残留——这是 handlers.rs 判定真截断、发 error 事件的铁证"
+        );
+        assert_eq!(decoder.pending_bytes(), cut, "残留字节数应等于已喂入的半截长度");
+    }
 }

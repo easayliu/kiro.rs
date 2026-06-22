@@ -392,11 +392,9 @@ export function CredentialCard({
     ? credential.proxyUrl.replace(/\/\/[^@/]*@/, '//')
     : null
 
-  // 限流是否处于告警态（≥70% 或耗尽）。告警态常驻卡面；非告警态（正常占用）收进详情。
+  // 有任一限额生效即在卡面常驻 RPM · 并发行；颜色由各自 colorClass 表达告警程度。
   const limiterActive = rpmActive || concurrencyActive
-  const limiterWarn =
-    (rpmActive && rpmUsageRatio >= 0.7) || (concurrencyActive && concurrencyUsageRatio >= 0.7)
-  // 限流器展示行：RPM · 并发（卡面告警态与详情非告警态复用同一份标记，避免重复）。
+  // 限流器展示行：RPM · 并发。
   const limiterRow = (
     <div className="flex items-center gap-x-2">
       {rpmActive && (
@@ -873,8 +871,8 @@ export function CredentialCard({
               </div>
             )}
 
-            {/* 限流告警态（常驻，仅 ≥70%/耗尽时；正常占用收进详情） */}
-            {limiterWarn && limiterRow}
+            {/* RPM · 并发：常驻卡面（有限额即显示）。正常态柔和、≥70% 琥珀、耗尽红 —— Stripe：色彩留给问题 */}
+            {limiterActive && limiterRow}
 
             {/* Token 刷新失败：真实故障信号，常驻告警。过期时间不重要，收进「详情」 */}
             {(credential.refreshFailureCount ?? 0) > 0 && (
@@ -943,29 +941,7 @@ export function CredentialCard({
                   </>
                 )}
 
-                {/* 限流器（非告警态；告警态已在卡面常驻） */}
-                {limiterActive && !limiterWarn && rpmActive && (
-                  <>
-                    <dt className="text-muted-foreground">RPM</dt>
-                    <dd
-                      className={cn('tnum justify-self-end', rpmColorClass)}
-                      title={`RPM ${rpmCurrent}/${effectiveRpm} · 60s 窗口${typeof credential.rpmLimit !== 'number' ? '（默认）' : ''}`}
-                    >
-                      {rpmCurrent}/{effectiveRpm}
-                    </dd>
-                  </>
-                )}
-                {limiterActive && !limiterWarn && concurrencyActive && (
-                  <>
-                    <dt className="text-muted-foreground">并发在途</dt>
-                    <dd
-                      className={cn('tnum justify-self-end', concurrencyColorClass)}
-                      title={`并发 ${concurrencyCurrent}/${effectiveConcurrency} 在途${typeof credential.concurrencyLimit !== 'number' ? '（默认）' : ''}`}
-                    >
-                      {concurrencyCurrent}/{effectiveConcurrency}
-                    </dd>
-                  </>
-                )}
+                {/* RPM / 并发已常驻卡面（见上方限流器行），详情区不再重复 */}
 
                 {/* Token 到期（正常态；异常态已在卡面常驻） */}
                 {expiryMs != null && (

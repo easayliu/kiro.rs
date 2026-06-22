@@ -108,6 +108,12 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub disabled: bool,
 
+    /// 凭据禁用原因（持久化的英文枚举名，如 "TooManyFailures"/"QuotaExceeded"）。
+    /// 由 DB `disabled_reason` 列填充，供重启后还原真实原因（前端按英文映射中文展示）。
+    /// `disabled=false` 时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
+
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -622,6 +628,7 @@ mod tests {
             group: None,
             client_mode: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             rpm_limit: None,
             concurrency_limit: None,
@@ -745,6 +752,7 @@ mod tests {
             group: None,
             client_mode: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             rpm_limit: None,
             concurrency_limit: None,
@@ -781,6 +789,7 @@ mod tests {
             group: None,
             client_mode: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             rpm_limit: None,
             concurrency_limit: None,
@@ -900,6 +909,7 @@ mod tests {
             group: None,
             client_mode: None,
             disabled: false,
+            disabled_reason: None,
             kiro_api_key: None,
             rpm_limit: None,
             concurrency_limit: None,

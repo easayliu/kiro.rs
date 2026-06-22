@@ -825,6 +825,35 @@ enum DisabledReason {
     FreeSubscription,
 }
 
+impl DisabledReason {
+    /// 持久化 / API 输出用的英文枚举名（入库即此值，前端据此映射中文）。
+    fn as_db_str(self) -> &'static str {
+        match self {
+            DisabledReason::Manual => "Manual",
+            DisabledReason::TooManyFailures => "TooManyFailures",
+            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+            DisabledReason::QuotaExceeded => "QuotaExceeded",
+            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+            DisabledReason::InvalidConfig => "InvalidConfig",
+            DisabledReason::FreeSubscription => "FreeSubscription",
+        }
+    }
+
+    /// 从持久化字符串还原（未知值返回 None，由调用方兜底）。
+    fn from_db_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "Manual" => DisabledReason::Manual,
+            "TooManyFailures" => DisabledReason::TooManyFailures,
+            "TooManyRefreshFailures" => DisabledReason::TooManyRefreshFailures,
+            "QuotaExceeded" => DisabledReason::QuotaExceeded,
+            "InvalidRefreshToken" => DisabledReason::InvalidRefreshToken,
+            "InvalidConfig" => DisabledReason::InvalidConfig,
+            "FreeSubscription" => DisabledReason::FreeSubscription,
+            _ => return None,
+        })
+    }
+}
+
 /// 统计数据持久化条目
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
@@ -1154,8 +1183,12 @@ impl MultiTokenManager {
                     failure_count: 0,
                     refresh_failure_count: 0,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
+                    // 还原持久化的禁用原因；旧库无 disabled_reason 的禁用行兜底为 Manual。
                     disabled_reason: if cred.disabled {
-                        Some(DisabledReason::Manual)
+                        cred.disabled_reason
+                            .as_deref()
+                            .and_then(DisabledReason::from_db_str)
+                            .or(Some(DisabledReason::Manual))
                     } else {
                         None
                     },
@@ -1655,14 +1688,20 @@ impl MultiTokenManager {
                             tracing::warn!(
                                 "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
                             );
+                            let mut healed_ids = Vec::new();
                             for e in entries.iter_mut() {
                                 if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
                                     e.disabled = false;
                                     e.disabled_reason = None;
                                     e.failure_count = 0;
+                                    healed_ids.push(e.id);
                                 }
                             }
                             drop(entries);
+                            // 自愈把这些重新启用，落库以与内存一致（否则 DB 仍是 disabled=true）。
+                            if let Err(err) = self.persist_credentials_subset(&healed_ids) {
+                                tracing::warn!("自愈重新启用后持久化失败: {}", err);
+                            }
                             best = self.select_next_credential(model);
                         }
                     }
@@ -1899,6 +1938,7 @@ impl MultiTokenManager {
                     let mut cred = e.credentials.clone();
                     cred.canonicalize_auth_method();
                     cred.disabled = e.disabled;
+                    cred.disabled_reason = e.disabled_reason.map(|r| r.as_db_str().to_string());
                     cred
                 })
                 .collect()
@@ -1927,6 +1967,7 @@ impl MultiTokenManager {
                     let mut cred = e.credentials.clone();
                     cred.canonicalize_auth_method();
                     cred.disabled = e.disabled;
+                    cred.disabled_reason = e.disabled_reason.map(|r| r.as_db_str().to_string());
                     cred
                 }
                 None => return Ok(false),
@@ -1936,6 +1977,14 @@ impl MultiTokenManager {
         store.upsert(&cred)?;
         tracing::debug!("已 upsert 凭据 #{} 到 SQLite", id);
         Ok(true)
+    }
+
+    /// 自动禁用后把该凭据（含 disabled / disabled_reason）落库；失败仅告警不致命。
+    /// 内部会自取 `entries` 锁，故必须在释放 `entries` 锁之后调用。
+    fn persist_auto_disabled(&self, id: u64) {
+        if let Err(e) = self.persist_credential(id) {
+            tracing::warn!("自动禁用凭据 #{} 持久化失败（重启后可能复活）: {}", id, e);
+        }
     }
 
     /// 把内存中**指定 id 集合**的凭据 upsert 到 SQLite（单事务，只写这些行、不删行）。
@@ -1962,6 +2011,7 @@ impl MultiTokenManager {
                     let mut cred = e.credentials.clone();
                     cred.canonicalize_auth_method();
                     cred.disabled = e.disabled;
+                    cred.disabled_reason = e.disabled_reason.map(|r| r.as_db_str().to_string());
                     cred
                 })
                 .collect()
@@ -2205,6 +2255,7 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
+        let mut newly_disabled = false;
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -2232,6 +2283,7 @@ impl MultiTokenManager {
             if failure_count >= MAX_FAILURES_PER_CREDENTIAL {
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::TooManyFailures);
+                newly_disabled = true;
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
 
                 // 切换到优先级最高的可用凭据
@@ -2254,6 +2306,10 @@ impl MultiTokenManager {
             entries.iter().any(|e| !e.disabled)
         };
         self.save_stats_debounced(id);
+        // 自动禁用必须落库，否则重启后 load_all 读回旧的 disabled=false 又被启用。
+        if newly_disabled {
+            self.persist_auto_disabled(id);
+        }
         result
     }
 
@@ -2304,6 +2360,8 @@ impl MultiTokenManager {
             }
         };
         self.save_stats_debounced(id);
+        // 走到这里必然刚刚禁用（已禁用 / 不存在的分支都已提前 return），落库。
+        self.persist_auto_disabled(id);
         result
     }
 
@@ -2367,6 +2425,8 @@ impl MultiTokenManager {
             }
         };
         self.save_stats_debounced(id);
+        // 走到这里必然刚刚禁用（未达阈值 / 已禁用 / 不存在都已提前 return），落库。
+        self.persist_auto_disabled(id);
         result
     }
 
@@ -2415,6 +2475,8 @@ impl MultiTokenManager {
             }
         };
         self.save_stats_debounced(id);
+        // 走到这里必然刚刚禁用（已禁用 / 不存在的分支都已提前 return），落库。
+        self.persist_auto_disabled(id);
         result
     }
 
@@ -2503,15 +2565,7 @@ impl MultiTokenManager {
                     proxy_url: e.credentials.proxy_url.clone(),
                     group: e.credentials.group.clone(),
                     refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| match r {
-                        DisabledReason::Manual => "Manual",
-                        DisabledReason::TooManyFailures => "TooManyFailures",
-                        DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                        DisabledReason::QuotaExceeded => "QuotaExceeded",
-                        DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                        DisabledReason::InvalidConfig => "InvalidConfig",
-                        DisabledReason::FreeSubscription => "FreeSubscription",
-                    }.to_string()),
+                    disabled_reason: e.disabled_reason.map(|r| r.as_db_str().to_string()),
                     throttled_until: e
                         .throttled_until
                         .filter(|t| *t > now)
@@ -4113,6 +4167,51 @@ mod tests {
         assert!(manager.report_failure(2));
         assert!(!manager.report_failure(2)); // 所有凭据都禁用了
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_auto_disable_persists_reason_and_survives_reload() {
+        use crate::kiro::credential_store::CredentialStore;
+        // 内存库（单连接），模拟真实持久化路径
+        let store = Arc::new(CredentialStore::open(std::path::Path::new(":memory:")).unwrap());
+        store.upsert(&KiroCredentials {
+            id: Some(1),
+            refresh_token: Some("rt-1".into()),
+            auth_method: Some("social".into()),
+            ..Default::default()
+        }).unwrap();
+
+        let creds = store.load_all().unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            creds,
+            None,
+            Some(std::path::PathBuf::from("credentials.json")),
+            Some(store.clone()),
+        ).unwrap();
+
+        // 连续失败到阈值 → 自动禁用，且必须落库
+        manager.report_failure(1);
+        manager.report_failure(1);
+        manager.report_failure(1);
+        assert_eq!(manager.available_count(), 0);
+
+        // 直接读库：disabled=true 且原因为 TooManyFailures（即使没重启也已持久化）
+        let reloaded = store.load_all().unwrap();
+        assert!(reloaded[0].disabled);
+        assert_eq!(reloaded[0].disabled_reason.as_deref(), Some("TooManyFailures"));
+
+        // 模拟重启：用库里的数据重建 manager，禁用与原因都应还原
+        let manager2 = MultiTokenManager::new(
+            Config::default(),
+            reloaded,
+            None,
+            Some(std::path::PathBuf::from("credentials.json")),
+            Some(store.clone()),
+        ).unwrap();
+        assert_eq!(manager2.available_count(), 0, "重启后自动禁用的凭据不应复活");
+        let snap = manager2.snapshot();
+        assert_eq!(snap.entries[0].disabled_reason.as_deref(), Some("TooManyFailures"));
     }
 
     #[test]

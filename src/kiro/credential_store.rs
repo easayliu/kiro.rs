@@ -73,6 +73,7 @@ impl CredentialStore {
                 subscription_title TEXT,
                 priority           INTEGER NOT NULL DEFAULT 0,
                 disabled           INTEGER NOT NULL DEFAULT 0 CHECK (disabled IN (0,1)),
+                disabled_reason    TEXT,
                 rpm_limit          INTEGER CHECK (rpm_limit IS NULL OR rpm_limit >= 0),
                 concurrency_limit  INTEGER CHECK (concurrency_limit IS NULL OR concurrency_limit >= 0),
                 overage            INTEGER CHECK (overage IN (0,1)),
@@ -101,6 +102,11 @@ impl CredentialStore {
             ) STRICT;",
         )
         .context("初始化凭据库 schema 失败")?;
+
+        // 兼容旧库：`disabled_reason` 列后加，老库 CREATE TABLE IF NOT EXISTS 不会补列，
+        // 在此 ALTER 补上（列已存在时 SQLite 报 "duplicate column"，忽略即可，幂等）。
+        let _ = conn.execute("ALTER TABLE credentials ADD COLUMN disabled_reason TEXT", []);
+
         Ok(())
     }
 
@@ -330,7 +336,8 @@ impl CredentialStore {
 const COLS: &str = "id, access_token, refresh_token, profile_arn, expires_at, auth_method,
     kiro_api_key, client_id, client_secret, region, auth_region, api_region, machine_id,
     client_mode, proxy_url, proxy_username, proxy_password, group_name, email,
-    subscription_title, priority, disabled, rpm_limit, concurrency_limit, overage, created_at";
+    subscription_title, priority, disabled, rpm_limit, concurrency_limit, overage, created_at,
+    disabled_reason";
 
 /// 把一行映射回 `KiroCredentials`（列序同 [`COLS`]）。
 fn row_to_cred(row: &Row) -> rusqlite::Result<KiroCredentials> {
@@ -341,6 +348,7 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<KiroCredentials> {
     let conc: Option<i64> = row.get(23)?;
     let overage_i: Option<i64> = row.get(24)?;
     let created_at: Option<i64> = row.get(25)?;
+    let disabled_reason: Option<String> = row.get(26)?;
 
     Ok(KiroCredentials {
         id: row.get::<_, i64>(0).map(|v| v as u64).ok(),
@@ -365,6 +373,7 @@ fn row_to_cred(row: &Row) -> rusqlite::Result<KiroCredentials> {
         subscription_title: row.get(19)?,
         priority: row.get::<_, i64>(20)? as u32,
         disabled: disabled_i != 0,
+        disabled_reason,
         rpm_limit: rpm.map(|v| v as u32),
         concurrency_limit: conc.map(|v| v as u32),
         overage: overage_i.map(|v| v != 0),
@@ -380,8 +389,9 @@ fn upsert_with(conn: &Connection, cred: &KiroCredentials) -> anyhow::Result<()> 
             (id, access_token, refresh_token, profile_arn, expires_at, auth_method,
              kiro_api_key, client_id, client_secret, region, auth_region, api_region,
              machine_id, client_mode, proxy_url, proxy_username, proxy_password, group_name,
-             email, subscription_title, priority, disabled, rpm_limit, concurrency_limit, overage)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)
+             email, subscription_title, priority, disabled, rpm_limit, concurrency_limit, overage,
+             disabled_reason)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)
          ON CONFLICT(id) DO UPDATE SET
             access_token=excluded.access_token, refresh_token=excluded.refresh_token,
             profile_arn=excluded.profile_arn, expires_at=excluded.expires_at,
@@ -394,7 +404,8 @@ fn upsert_with(conn: &Connection, cred: &KiroCredentials) -> anyhow::Result<()> 
             group_name=excluded.group_name, email=excluded.email,
             subscription_title=excluded.subscription_title, priority=excluded.priority,
             disabled=excluded.disabled, rpm_limit=excluded.rpm_limit,
-            concurrency_limit=excluded.concurrency_limit, overage=excluded.overage",
+            concurrency_limit=excluded.concurrency_limit, overage=excluded.overage,
+            disabled_reason=excluded.disabled_reason",
         params![
             id,
             cred.access_token,
@@ -421,6 +432,7 @@ fn upsert_with(conn: &Connection, cred: &KiroCredentials) -> anyhow::Result<()> 
             cred.rpm_limit.map(|v| v as i64),
             cred.concurrency_limit.map(|v| v as i64),
             cred.overage.map(|b| b as i64),
+            cred.disabled_reason,
         ],
     )
     .with_context(|| format!("写入凭据 #{} 失败", id))?;
@@ -501,6 +513,28 @@ mod tests {
         assert_eq!(g.client_mode, Some(ClientMode::KiroCli));
         // 过期时间瞬时值往返一致
         assert_eq!(expires_unix(g), expires_unix(&c));
+    }
+
+    #[test]
+    fn disabled_reason_roundtrips() {
+        let s = store();
+        let mut c = oauth(1, "rt-1");
+        c.disabled = true;
+        c.disabled_reason = Some("QuotaExceeded".into());
+        s.upsert(&c).unwrap();
+
+        let all = s.load_all().unwrap();
+        assert!(all[0].disabled);
+        assert_eq!(all[0].disabled_reason.as_deref(), Some("QuotaExceeded"));
+
+        // 启用时清空原因，确认覆盖写回 NULL
+        let mut c2 = oauth(1, "rt-1");
+        c2.disabled = false;
+        c2.disabled_reason = None;
+        s.upsert(&c2).unwrap();
+        let all = s.load_all().unwrap();
+        assert!(!all[0].disabled);
+        assert_eq!(all[0].disabled_reason, None);
     }
 
     #[test]
