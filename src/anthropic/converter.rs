@@ -667,11 +667,47 @@ fn get_document_format(media_type: &str) -> Option<String> {
     Some(fmt.to_string())
 }
 
-/// 规整文档名：去掉扩展名与路径，Kiro `documents[].name` 不含扩展名。
+/// 文档名最大长度（Kiro/Bedrock `documents[].name` 限 1-200）。
+const DOCUMENT_NAME_MAX_LEN: usize = 200;
+
+/// 规整文档名：去掉扩展名与路径，并满足 Kiro `documents[].name` 校验。
+///
+/// 上游校验（`INVALID_DOCUMENT_NAME`）：名称需 1-200 字符，只能包含
+/// 字母数字、空白、连字符、下划线、圆括号或方括号，且不能有连续空白。
+///
+/// 1. 去掉路径与扩展名（`documents[].name` 不含扩展名）。
+/// 2. 把不在允许集（`[a-zA-Z0-9 \t\-_()\[\]]`）内的字符替换为 `_`——
+///    例如残留的 `.`、`:`、`,` 以及 CJK/标点都会被上游拒绝。
+/// 3. 连续空白折叠为单个空格，并去除首尾空白（满足"无连续空白"）。
+/// 4. 截断到 200 字符（按字符边界）。
 fn sanitize_document_name(title: &str) -> String {
     let base = title.rsplit(['/', '\\']).next().unwrap_or(title);
     let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
-    stem.trim().to_string()
+
+    let mut out = String::with_capacity(stem.len());
+    let mut prev_ws = false;
+    for c in stem.chars() {
+        if c.is_whitespace() {
+            // 折叠连续空白；统一用普通空格，避免首部空白
+            if !prev_ws && !out.is_empty() {
+                out.push(' ');
+            }
+            prev_ws = true;
+            continue;
+        }
+        prev_ws = false;
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '(' | ')' | '[' | ']') {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+        if out.chars().count() >= DOCUMENT_NAME_MAX_LEN {
+            break;
+        }
+    }
+    // 去掉折叠后可能留在尾部的空格
+    out.truncate(out.trim_end().len());
+    out
 }
 
 /// 从 media_type 获取图片格式
@@ -2251,6 +2287,39 @@ mod tests {
                 "净化后仍含非法字符: {n}"
             );
         }
+    }
+
+    #[test]
+    fn test_sanitize_document_name() {
+        // 去路径 + 去扩展名
+        assert_eq!(sanitize_document_name("/tmp/report.pdf"), "report");
+        assert_eq!(sanitize_document_name("C:\\docs\\notes.txt"), "notes");
+        // 残留的点（多扩展名）属非法字符，应替换为 _
+        assert_eq!(sanitize_document_name("my.file.pdf"), "my_file");
+        // 冒号/逗号/斜杠等标点净化为 _
+        assert_eq!(sanitize_document_name("a:b,c.pdf"), "a_b_c");
+        // 连续空白折叠为单个空格，首尾去空白
+        assert_eq!(sanitize_document_name("  foo   bar  .pdf"), "foo bar");
+        // 允许集中的字符保留
+        assert_eq!(
+            sanitize_document_name("plan (v2) [draft].md"),
+            "plan (v2) [draft]"
+        );
+
+        // CJK/标点被替换后，结果仅含允许字符集，且无连续空白
+        let n = sanitize_document_name("项目 报告：第一章.docx");
+        assert!(
+            n.chars()
+                .all(|c| c.is_ascii_alphanumeric()
+                    || c == ' '
+                    || matches!(c, '-' | '_' | '(' | ')' | '[' | ']')),
+            "净化后仍含非法字符: {n}"
+        );
+        assert!(!n.contains("  "), "净化后仍有连续空白: {n}");
+
+        // 超长截断到 200 字符
+        let long = "a".repeat(300);
+        assert_eq!(sanitize_document_name(&long).chars().count(), 200);
     }
 
     #[test]
