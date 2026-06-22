@@ -4,52 +4,55 @@
 
 @layer base {
   :root {
-    --background: 210 50% 98%;
-    --surface: 0 0% 100%;
-    --surface-2: 210 40% 96%;
-    --foreground: 210 73% 15%;
+    /* 黑白科技风亮色 —— 中性档位取 Tailwind zinc 色阶，白卡浮于浅灰页底，对比按 WCAG AA 校准 */
+    --background: 240 5% 96.5%;            /* 极浅 zinc 页底，与白卡拉开层级 */
+    --surface: 0 0% 100%;                  /* 白卡 */
+    --surface-2: 240 5% 95%;
+    --foreground: 240 10% 4%;              /* zinc-950 近黑，正文对白卡 19:1 */
 
     --card: 0 0% 100%;
-    --card-foreground: 210 73% 15%;
+    --card-foreground: 240 10% 4%;
 
     --popover: 0 0% 100%;
-    --popover-foreground: 210 73% 15%;
+    --popover-foreground: 240 10% 4%;
 
-    /* 黑白科技风 —— 强调色：主按钮 / 链接 / 选中 / 焦点 */
-    --primary: 0 0% 9%;
+    /* 强调色：主按钮 / 链接 / 选中 / 焦点 —— 近黑 */
+    --primary: 240 6% 10%;
     --primary-foreground: 0 0% 100%;
-    --primary-soft: 0 0% 95%;
+    --primary-soft: 240 5% 96%;
 
-    --secondary: 210 40% 96%;
-    --secondary-foreground: 210 73% 15%;
+    --secondary: 240 5% 96%;               /* zinc-100 */
+    --secondary-foreground: 240 6% 10%;
 
-    --cta: 0 0% 9%;
+    --cta: 240 6% 10%;
     --cta-foreground: 0 0% 100%;
 
-    --muted: 210 40% 96%;
-    --muted-foreground: 219 13% 47%;
+    --muted: 240 5% 96%;                   /* zinc-100 */
+    --muted-foreground: 240 4% 40%;        /* 次要文字对白卡 6:1 */
 
-    --accent: 210 40% 96%;
-    --accent-foreground: 210 73% 15%;
+    --accent: 240 5% 96%;
+    --accent-foreground: 240 6% 10%;
 
-    --destructive: 0 72% 51%;
-    --destructive-foreground: 210 40% 98%;
+    /* 危险按钮底：深红 + 白字 5.8:1 */
+    --destructive: 0 72% 45%;
+    --destructive-foreground: 0 0% 100%;
 
-    --ok: 160 60% 35%;
+    /* 语义色取深档，既可作正文(对白卡 ≥5:1)又可作实心徽章(配白字 ≥5:1) */
+    --ok: 160 84% 27%;                     /* emerald-700 */
     --ok-foreground: 0 0% 100%;
-    --ok-soft: 160 50% 94%;
+    --ok-soft: 160 45% 95%;
 
-    --warn: 28 85% 45%;
+    --warn: 30 90% 33%;                    /* amber-700 */
     --warn-foreground: 0 0% 100%;
-    --warn-soft: 28 90% 94%;
+    --warn-soft: 38 85% 94%;
 
-    --bad: 0 72% 51%;
-    --bad-foreground: 210 40% 98%;
-    --bad-soft: 0 90% 96%;
+    --bad: 0 72% 45%;                      /* red-700 */
+    --bad-foreground: 0 0% 100%;
+    --bad-soft: 0 75% 96%;
 
-    --border: 213 28% 92%;
-    --input: 213 28% 92%;
-    --ring: 0 0% 9%;
+    --border: 240 6% 90%;                  /* zinc-200 */
+    --input: 240 6% 90%;
+    --ring: 240 6% 10%;
     --radius: 0.5rem;
   }
 
