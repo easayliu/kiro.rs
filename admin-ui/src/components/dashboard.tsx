@@ -434,7 +434,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
     queryClient.invalidateQueries({ queryKey: ['credentials'] })
   }
 
-  const handleRefresh = () => { refetch(); toast.success('已刷新凭据列表') }
 
   const handleLogout = () => {
     storage.removeApiKey(); queryClient.clear(); onLogout()
@@ -549,8 +548,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   const handleQueryCurrentPageInfo = async () => {
     if (currentCredentials.length === 0) { toast.error('当前页没有可查询的凭据'); return }
-    const ids = currentCredentials.filter(c => !c.disabled).map(c => c.id)
-    if (ids.length === 0) { toast.error('当前页没有可查询的启用凭据'); return }
+    // 禁用的凭据也支持查询额度：后端 get_usage_limits_for 不区分启用状态
+    const ids = currentCredentials.map(c => c.id)
     setQueryingInfo(true)
     setQueryInfoProgress({ current: 0, total: ids.length })
     let successCount = 0, failCount = 0
@@ -942,7 +941,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
         darkMode={darkMode}
         collapsed={sidebarCollapsed}
         onToggleTheme={toggleDarkMode}
-        onRefresh={handleRefresh}
         onLogout={handleLogout}
         onToggleCollapse={toggleSidebar}
       />
@@ -982,7 +980,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
             <MobileIconBtn onClick={toggleDarkMode} label={darkMode ? '浅色模式' : '深色模式'}>
               {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
             </MobileIconBtn>
-            <MobileIconBtn onClick={handleRefresh} label="刷新"><RefreshCw className="h-4 w-4" /></MobileIconBtn>
             <MobileIconBtn onClick={handleLogout} label="退出登录"><LogOut className="h-4 w-4" /></MobileIconBtn>
           </div>
         </div>
@@ -1985,7 +1982,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 // 顶部账户头（logo + 名称 + Guest 徽章）→ 分组导航（主导航 / 系统）→ 底部账户操作。
 function Sidebar({
   view, onChange, readOnly, darkMode, collapsed,
-  onToggleTheme, onRefresh, onLogout, onToggleCollapse,
+  onToggleTheme, onLogout, onToggleCollapse,
 }: {
   view: 'credentials' | 'stats'
   onChange: (v: 'credentials' | 'stats') => void
@@ -1993,7 +1990,6 @@ function Sidebar({
   darkMode: boolean
   collapsed: boolean
   onToggleTheme: () => void
-  onRefresh: () => void
   onLogout: () => void
   onToggleCollapse: () => void
 }) {
@@ -2054,7 +2050,6 @@ function Sidebar({
             label={darkMode ? '浅色模式' : '深色模式'}
             onClick={onToggleTheme}
           />
-          <NavItem collapsed={collapsed} icon={<RefreshCw />} label="刷新数据" onClick={onRefresh} />
         </NavSection>
       </nav>
 
