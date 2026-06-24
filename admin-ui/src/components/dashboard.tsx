@@ -289,6 +289,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const disabledCredentialCount = allCreds.filter(c => c.disabled).length
   const faultyCredentialCount = allCreds.filter(c => !c.disabled && !isThrottledNow(c) && (c.failureCount > 0 || c.refreshFailureCount > 0)).length
   const activeCredential = data?.currentId ? allCreds.find(c => c.id === data.currentId) : undefined
+  // 实时吞吐汇总：所有凭据当前 RPM（60s 窗口）/ 并发（在途）之和
+  const totalRpmCurrent = allCreds.reduce((sum, c) => sum + (c.rpmCurrent ?? 0), 0)
+  const totalConcurrencyCurrent = allCreds.reduce((sum, c) => sum + (c.concurrencyCurrent ?? 0), 0)
   // 余额来自服务端列表（credential.balance）—— kiro.db 为单一真相源
   const balanceOf = (c: CredentialStatusItem) => c.balance
   const activeBalance = activeCredential?.balance
@@ -1036,6 +1039,21 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   )}
                   <span className="shrink-0 text-border">·</span>
                   <span className="shrink-0"><RelativeTime value={activeCredential?.lastUsedAt} /></span>
+                </p>
+              )}
+
+              {/* 实时吞吐：当前总 RPM · 总并发（卡面每卡分项，这里给全局合计）。
+                  纯文字 label·值，与「当前」「策略」同一行基线对齐；宽屏 ml-auto 推入右侧状态簇 */}
+              {totalCount > 0 && (
+                <p
+                  className="flex shrink-0 items-center gap-1.5 font-mono text-xs text-muted-foreground sm:ml-auto"
+                  title="所有凭据当前 RPM（60s 窗口）/ 并发（在途请求）之和"
+                >
+                  <span className="shrink-0">RPM</span>
+                  <span className="tnum text-foreground">{totalRpmCurrent}</span>
+                  <span className="shrink-0 text-border">·</span>
+                  <span className="shrink-0">并发</span>
+                  <span className="tnum text-foreground">{totalConcurrencyCurrent}</span>
                 </p>
               )}
 
