@@ -33,8 +33,8 @@
     --accent: 240 5% 96%;
     --accent-foreground: 240 6% 10%;
 
-    /* 危险按钮底：深红 + 白字 5.8:1 */
-    --destructive: 0 72% 45%;
+    /* 危险按钮底：Stripe 緋红 + 白字 ≥5.5:1，与 --bad 同色相 */
+    --destructive: 347 77% 42%;
     --destructive-foreground: 0 0% 100%;
 
     /* 语义色取深档，既可作正文(对白卡 ≥5:1)又可作实心徽章(配白字 ≥5:1) */
@@ -46,9 +46,17 @@
     --warn-foreground: 0 0% 100%;
     --warn-soft: 38 85% 94%;
 
-    --bad: 0 72% 45%;                      /* red-700 */
+    --bad: 347 78% 42%;                    /* Stripe 緋红 #DF1B41 家族，对白卡 ≥5:1 */
     --bad-foreground: 0 0% 100%;
-    --bad-soft: 0 75% 96%;
+    --bad-soft: 347 80% 97%;
+
+    /* 图表分类色板：互相可区分的非语义色相（语义系列直接引用 --ok/--bad），集中托管便于主题化 */
+    --chart-ink: 0 0% 32%;                 /* 实际成本/输入 token，neutral-600 */
+    --chart-slate: 215 20% 65%;            /* 官方价，slate-400 */
+    --chart-blue: 217 91% 60%;             /* 请求量 */
+    --chart-cyan: 189 94% 43%;             /* 缓存读 */
+    --chart-amber: 38 92% 50%;             /* 缓存写 / 首字延迟 */
+    --chart-violet: 258 90% 66%;           /* 总耗时 */
 
     --border: 240 6% 90%;                  /* zinc-200 */
     --input: 240 6% 90%;
@@ -86,8 +94,8 @@
     --accent: 240 4% 16%;
     --accent-foreground: 0 0% 98%;
 
-    /* 危险按钮底：深红 + 白字 9.4:1 */
-    --destructive: 0 63% 31%;              /* red-900 调暗 */
+    /* 危险按钮底：Stripe 緋红深档 + 近白字 ≥7:1，与 --bad 同色相 */
+    --destructive: 347 60% 33%;
     --destructive-foreground: 0 0% 98%;
 
     /* 语义色取 Tailwind 高亮档，既可作正文(对卡片 ≥6:1)又可作实心徽章(配深字 ≥6:1) */
@@ -99,9 +107,17 @@
     --warn-foreground: 240 6% 10%;
     --warn-soft: 40 50% 15%;
 
-    --bad: 0 91% 71%;                       /* red-400 */
+    --bad: 349 90% 72%;                     /* Stripe 緋红 crimson-400，对卡片 ≥6:1 */
     --bad-foreground: 240 6% 10%;
-    --bad-soft: 0 50% 16%;
+    --bad-soft: 347 45% 16%;
+
+    /* 图表分类色板（暗色提亮，保证在 zinc-900 卡上清晰） */
+    --chart-ink: 0 0% 75%;
+    --chart-slate: 215 20% 65%;
+    --chart-blue: 217 91% 66%;
+    --chart-cyan: 189 90% 55%;
+    --chart-amber: 38 92% 55%;
+    --chart-violet: 258 90% 73%;
 
     --border: 240 5% 22%;                   /* zinc-700 档，对背景 1.6:1 清晰可见 */
     --input: 240 5% 22%;

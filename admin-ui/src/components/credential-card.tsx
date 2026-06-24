@@ -383,10 +383,12 @@ export function CredentialCard({
         : 'text-foreground'
 
   // 近7天错误率（来自 stats by_credential）：失败 / (成功 + 失败)。
-  // 有失败时卡面红字常驻（健康告警），无失败时收进详情。
+  // Stripe「色彩留给问题」：只有错误率越过阈值才在卡面红字告警，偶发失败收进详情。
+  const ERR_RATE_ALERT = 10 // %
   const usageTotal = usage ? usage.requests + usage.failures : 0
   const errRate = usageTotal > 0 ? (usage!.failures / usageTotal) * 100 : 0
   const hasErrors = !!usage && usage.failures > 0
+  const errRateAlert = errRate >= ERR_RATE_ALERT
   // 代理出口（凭据级 proxyUrl，脱去 user:pass 仅留 scheme+host，避免泄露口令）
   const proxyDisplay = credential.proxyUrl
     ? credential.proxyUrl.replace(/\/\/[^@/]*@/, '//')
@@ -435,7 +437,7 @@ export function CredentialCard({
     Manual: '手动禁用',
     TooManyFailures: '连续失败',
     TooManyRefreshFailures: '刷新失败',
-    QuotaExceeded: '额度已用完',
+    QuotaExceeded: '额度已用尽',
     InvalidRefreshToken: 'Token 失效',
     InvalidConfig: '配置无效',
     FreeSubscription: 'Free 订阅（自动禁用）',
@@ -693,7 +695,7 @@ export function CredentialCard({
                   <DropdownMenuItem
                     onClick={() => setShowDeleteDialog(true)}
                     disabled={!credential.disabled}
-                    className="text-bad focus:text-bad"
+                    className="text-bad focus:bg-bad-soft focus:text-bad [&_svg]:text-bad"
                   >
                     <Trash2 /> 删除凭据
                   </DropdownMenuItem>
@@ -728,24 +730,27 @@ export function CredentialCard({
                     {isOverageBilling ? (
                       <span
                         className={cn(
-                          'shrink-0 rounded-full px-1.5 py-0.5 text-2xs font-medium leading-none',
+                          'inline-flex shrink-0 items-center gap-1 rounded-full px-1.5 py-0.5 text-2xs font-medium leading-none',
                           overageCapExceeded ? 'bg-bad-soft text-bad' : 'bg-warn-soft text-warn',
                         )}
                         title={
                           overageCapExceeded
-                            ? '超额用量已达上限（overageCap），请尽快处理'
-                            : '用量已越过额度，正在按超额计费'
+                            ? '超额用量已达封顶上限，请及时处理'
+                            : '用量已超出额度，转入超额计费'
                         }
                       >
+                        {/* Stripe 式状态点：同色实心圆，先于文字被扫到 */}
+                        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-current" />
                         {overageCapExceeded ? '超额已封顶' : '超额计费中'}
                       </span>
                     ) : isOverLimit ? (
                       // 基础额度耗尽且未开超额：Stripe 式柔和徽章，色彩只用来标识问题
                       <span
-                        className="shrink-0 rounded-full bg-bad-soft px-1.5 py-0.5 text-2xs font-medium leading-none text-bad"
-                        title="基础额度已用完，未开启超额计费"
+                        className="inline-flex shrink-0 items-center gap-1 rounded-full bg-bad-soft px-1.5 py-0.5 text-2xs font-medium leading-none text-bad"
+                        title="基础额度已用尽，未开通超额计费"
                       >
-                        额度已用完
+                        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-current" />
+                        额度已用尽
                       </span>
                     ) : null}
                   </>
@@ -791,7 +796,7 @@ export function CredentialCard({
                     'tnum font-mono',
                     overageCapExceeded ? 'font-semibold text-bad' : 'font-medium',
                   )}
-                  title={overageCapExceeded ? '超额用量已达/超过上限' : undefined}
+                  title={overageCapExceeded ? '超额用量已达或超过封顶上限' : undefined}
                 >
                   超额 {balance.currentOverages.toFixed(2)}
                   {balance.overageCap > 0 && `/${balance.overageCap.toFixed(0)}`}
@@ -868,8 +873,8 @@ export function CredentialCard({
             </span>
             </div>
 
-            {/* 近7天错误率：有失败才红字常驻（健康告警）；无失败收进详情 */}
-            {hasErrors && (
+            {/* 近7天错误率：仅当 ≥10% 才红字常驻（真异常）；低于阈值收进详情，避免偶发失败误报 */}
+            {errRateAlert && (
               <div
                 className="flex items-center gap-1 font-mono text-bad"
                 title={`近7天 ${usageTotal} 次请求中 ${usage!.failures} 次失败（上游 API 错误）`}
@@ -927,7 +932,7 @@ export function CredentialCard({
                           <Line
                             type="monotone"
                             dataKey="v"
-                            stroke="#f59e0b"
+                            stroke="hsl(var(--chart-amber))"
                             strokeWidth={1.5}
                             dot={false}
                             isAnimationActive={false}
@@ -940,10 +945,13 @@ export function CredentialCard({
                     <dd className="tnum justify-self-end text-foreground" title="近7天平均总耗时">
                       {fmtMs(usage.avg_elapsed_ms)}
                     </dd>
-                    {!hasErrors && (
+                    {/* 错误率：≥10% 已在卡面红字告警，详情不重复；低于阈值（含偶发失败）在此中性展示 */}
+                    {!errRateAlert && (
                       <>
                         <dt className="text-muted-foreground">错误率</dt>
-                        <dd className="tnum justify-self-end text-foreground">{errRate.toFixed(1)}%</dd>
+                        <dd className="tnum justify-self-end text-foreground">
+                          {errRate.toFixed(1)}%{hasErrors && ` · ${usage!.failures} 次失败`}
+                        </dd>
                       </>
                     )}
                   </>

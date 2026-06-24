@@ -282,7 +282,7 @@ export function ProxyGroupsDialog({ open, onOpenChange }: ProxyGroupsDialogProps
 
                 <div className="space-y-2">
                   <label className="text-xs font-medium text-muted-foreground">
-                    分组名称 <span className="text-red-500">*</span>
+                    分组名称 <span className="text-bad">*</span>
                   </label>
                   <Input
                     placeholder="例如 us-pool"
@@ -299,7 +299,7 @@ export function ProxyGroupsDialog({ open, onOpenChange }: ProxyGroupsDialogProps
 
                 <div className="space-y-2">
                   <label className="text-xs font-medium text-muted-foreground">
-                    代理 URL <span className="text-red-500">*</span>
+                    代理 URL <span className="text-bad">*</span>
                   </label>
                   <Input
                     placeholder='例如 socks5://host:1080 或 "direct"'

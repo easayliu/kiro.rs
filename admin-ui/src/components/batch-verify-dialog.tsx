@@ -77,11 +77,11 @@ export function BatchVerifyDialog({
                   key={result.id}
                   className={`text-sm p-2 rounded ${
                     result.status === 'success'
-                      ? 'bg-green-50 text-green-700 dark:bg-green-950 dark:text-green-300'
+                      ? 'bg-ok-soft text-ok'
                       : result.status === 'failed'
-                      ? 'bg-red-50 text-red-700 dark:bg-red-950 dark:text-red-300'
+                      ? 'bg-bad-soft text-bad'
                       : result.status === 'verifying'
-                      ? 'bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300'
+                      ? 'bg-muted text-muted-foreground'
                       : 'bg-gray-50 text-gray-700 dark:bg-gray-950 dark:text-gray-300'
                   }`}
                 >
