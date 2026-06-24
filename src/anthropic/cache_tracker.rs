@@ -36,8 +36,13 @@ const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
 const ONE_HOUR_CACHE_TTL: Duration = Duration::from_secs(3600);
 const MAX_BREAKPOINTS: usize = 4;
 const MAX_ENTRIES: usize = 100_000;
-/// Anthropic 官方：命中查找从 breakpoint 往前最多扫 20 个 block（含自身）。
+/// Anthropic 官方：命中查找从每个 breakpoint 往前最多扫 20 个 block（含自身）。
+/// 这是真实上游行为——长会话里若稳定前缀未每轮重新 pin，跨 >20 block 会静默
+/// miss 并整段重建。模拟器必须保持一致，否则会虚报 cache_read、把计费做错。
 const PREFIX_LOOKBACK_LIMIT: usize = 20;
+/// 全表清扫的最小间隔：每请求只清当前 bucket（O(单桶)），全表清扫（回收已
+/// 废弃、不再被触碰的 bucket）按此间隔节流，避免每请求 O(全表) 持锁扫描。
+const PRUNE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CacheResult {
@@ -176,6 +181,8 @@ pub struct CacheTracker {
     /// 跳过判定是**逐请求独立随机**的：与会话身份无关，聚合命中率按 `(1 - rate)`
     /// 下降，同一 device/session 不会被固定 hash 永久锁死在"全冷"区间。
     cache_skip_rate: Mutex<Option<f32>>,
+    /// 上次全表清扫的时刻，配合 [`PRUNE_SWEEP_INTERVAL`] 节流全表清扫。
+    last_full_prune: Mutex<Instant>,
 }
 
 impl CacheTracker {
@@ -189,6 +196,7 @@ impl CacheTracker {
             max_supported_ttl,
             scope: AtomicU8::new(scope.as_u8()),
             cache_skip_rate: Mutex::new(cache_skip_rate.map(clamp_skip_rate)),
+            last_full_prune: Mutex::new(Instant::now()),
         }
     }
 
@@ -221,6 +229,22 @@ impl CacheTracker {
 
     pub fn set_cache_skip_rate(&self, rate: Option<f32>) {
         *self.cache_skip_rate.lock() = rate.map(clamp_skip_rate);
+    }
+
+    /// 测试用：立即执行一次全表清扫（绕过 [`PRUNE_SWEEP_INTERVAL`] 节流），
+    /// 验证废弃 bucket 的回收。
+    #[cfg(test)]
+    fn force_full_prune_now(&self) {
+        let now = Instant::now();
+        let mut all = self.entries.lock();
+        prune_expired(&mut all, now);
+        *self.last_full_prune.lock() = now;
+    }
+
+    /// 测试用：当前全表 bucket 数量。
+    #[cfg(test)]
+    fn bucket_count(&self) -> usize {
+        self.entries.lock().len()
     }
 
     /// 按配置的跳过率决定本次请求是否跳过 cache 查找。
@@ -404,7 +428,22 @@ impl CacheTracker {
 
         let now = Instant::now();
         let mut all_entries = self.entries.lock();
-        prune_expired(&mut all_entries, now);
+
+        // 每请求只清当前 bucket（O(单桶)）：保持触碰到的桶干净、LRU 计数准确。
+        // 查找/写入本就跳过过期条目，正确性不依赖于此，仅为内存与计数。
+        if let Some(bucket) = all_entries.get_mut(&effective_id) {
+            bucket.retain(|_, entry| entry.expires_at > now);
+        }
+        // 全表清扫按间隔节流，回收已废弃（不再被触碰）的 bucket，避免每请求
+        // O(全表) 持锁扫描。两次清扫之间过期条目最多多留 PRUNE_SWEEP_INTERVAL，
+        // 由单桶 LRU 上限兜底，且查找始终跳过过期条目。
+        {
+            let mut last = self.last_full_prune.lock();
+            if now.saturating_duration_since(*last) >= PRUNE_SWEEP_INTERVAL {
+                prune_expired(&mut all_entries, now);
+                *last = now;
+            }
+        }
 
         let mut matched_tokens = 0;
         let mut matched_block_index: Option<usize> = None;
@@ -429,6 +468,8 @@ impl CacheTracker {
 
             // 对齐 Anthropic：每个 cache_control breakpoint 各自回扫最多
             // 20 个 block（含自身），取跨所有 breakpoint 中最长的匹配 prefix。
+            // 这刻意复刻上游的 20-block 窗口——不能扫全段，否则会命中上游
+            // 不会命中的前缀，虚报 cache_read。
             // 先只读扫描锁定最佳 (idx, fingerprint)，再单独 get_mut 更新，
             // 避免在循环中同时持有可变借用。
             let mut best: Option<(usize, [u8; 32], i32)> = None;
@@ -976,43 +1017,40 @@ fn mix_fingerprint(content: &[u8; 32], extras: &[u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// 对齐 Anthropic 官方 prompt caching 最小可缓存 tokens。
-/// 参考: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+/// 对齐 Anthropic 官方 prompt caching 最小可缓存 tokens（Claude API 口径）。
+/// 参考: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+/// （Bedrock 上 Fable 5 / Mythos 5 为 1024，本代理走 Anthropic 口径不处理。）
 fn minimum_cacheable_tokens_for_model(model: &str) -> i32 {
-    let m = model.to_lowercase();
+    // 归一化分隔符，统一用 '-' 匹配（兼容 opus-4.8 / opus_4_8 等写法）。
+    let m = model.to_lowercase().replace(['.', '_'], "-");
 
-    if m.contains("mythos")
-        || m.contains("opus-4-5")
-        || m.contains("opus-4.5")
-        || m.contains("opus-4-6")
-        || m.contains("opus-4.6")
-        || m.contains("opus-4-7")
-        || m.contains("opus-4.7")
-        || m.contains("opus-4-8")
-        || m.contains("opus-4.8")
-        || m.contains("haiku-4-5")
-        || m.contains("haiku-4.5")
-        || m.contains("haiku_4_5")
-        || m.contains("haiku_4.5")
-    {
-        return 4096;
+    // 512：Fable 5 / Mythos 5
+    if m.contains("fable-5") || m.contains("mythos-5") {
+        return 512;
     }
-
-    if m.contains("sonnet-4-6")
-        || m.contains("sonnet-4.6")
-        || m.contains("sonnet_4_6")
-        || m.contains("haiku-3-5")
-        || m.contains("haiku-3.5")
-        || m.contains("haiku_3_5")
-        || m.contains("haiku_3.5")
-    {
+    // 2048：Mythos Preview / Opus 4.7 / Haiku 3.5
+    if m.contains("mythos") || m.contains("opus-4-7") || m.contains("haiku-3-5") {
         return 2048;
     }
-
-    if m.contains("opus") || m.contains("sonnet") {
+    // 4096：Opus 4.6 / Opus 4.5 / Haiku 4.5
+    if m.contains("opus-4-6") || m.contains("opus-4-5") || m.contains("haiku-4-5") {
+        return 4096;
+    }
+    // 1024：Opus 4.8 / Sonnet 4.6 / Sonnet 4.5 / Opus 4.1 / Opus 4 / Sonnet 4
+    if m.contains("opus-4-8")
+        || m.contains("sonnet-4-6")
+        || m.contains("sonnet-4-5")
+        || m.contains("opus-4-1")
+        || m.contains("opus-4")
+        || m.contains("sonnet-4")
+    {
         return 1024;
     }
 
+    // 兜底：未列出的 opus/sonnet 取 1024，老 haiku（3 等）取 2048。
+    if m.contains("opus") || m.contains("sonnet") {
+        return 1024;
+    }
     if m.contains("haiku") {
         return 2048;
     }
@@ -1202,6 +1240,315 @@ mod tests {
             r2.cache_creation_input_tokens > 0,
             "第二轮仍会给新 breakpoint 建缓存"
         );
+    }
+
+    /// 复现「设置 1h，12 分钟后又进入缓存写」的排查：
+    /// 12min < 1h 且 max_supported_ttl=1h，条目不会被 prune 删除，所以
+    /// 同 bucket + 同前缀的返回请求必然 cache_read 命中（不会变 creation）。
+    /// 由于 12min 未过期，与「立即重放」对 prune/lookup 路径完全等价，
+    /// 无需伪造 Instant 时间。
+    #[test]
+    fn returning_1h_request_hits_not_rewrite() {
+        // 与生产一致：max_supported_ttl=1h，否则 "1h" 会被 line 315 clamp 成 5m。
+        let tracker = CacheTracker::new(ONE_HOUR_CACHE_TTL, CacheScope::Global, None);
+        let credential_id = 7;
+        let md = make_metadata("dev-A", "acct-A", "sess-1");
+        let system = large_text("SYSTEM ", LARGE_SYSTEM_CHARS);
+
+        let turn1 = user_message(vec![json!({
+            "type": "text", "text": "u1", "cache_control": ephemeral_1h(),
+        })]);
+        let req1 = build_request_with_metadata(&system, vec![turn1.clone()], md.clone());
+        let (r1, _) = tracker.compute_and_update(credential_id, &tracker.build_profile(&req1, 10_000));
+        assert!(r1.cache_creation_input_tokens > 0 && r1.cache_creation_1h_input_tokens > 0,
+            "turn1 应建立 1h 缓存: {r1:?}");
+
+        // 12 分钟后的请求：同 device/account/session、同前缀、1h breakpoint。
+        let turn2 = user_message(vec![json!({
+            "type": "text", "text": "u2", "cache_control": ephemeral_1h(),
+        })]);
+        let req2 = build_request_with_metadata(
+            &system, vec![turn1, assistant_text("a1"), turn2], md.clone());
+        let (r2, _) = tracker.compute_and_update(credential_id, &tracker.build_profile(&req2, 12_000));
+        assert!(r2.cache_read_input_tokens > 0,
+            "同 bucket+同前缀的 1h 返回请求应命中 cache_read，而不是整段重写: {r2:?}");
+
+        // 每个 cacheable breakpoint = 1 条；同前缀复用、不同前缀新增。
+        // 同 device/account/session 只有 1 个 bucket，本轮两段对话共 2 条。
+        let entries = tracker.entries.lock();
+        assert_eq!(entries.len(), 1, "同 device/account/session 应只有 1 个 bucket");
+        let total: usize = entries.values().map(|b| b.len()).sum();
+        assert_eq!(total, 2, "两段对话应写 2 条 1h 条目");
+    }
+
+    /// 复现 cache_read=0 整段重写的真实成因之一：session_id 变了 →
+    /// effective_bucket_key 落到不同 bucket → 找不到旧 1h 条目 → 全 creation。
+    #[test]
+    fn changed_session_id_causes_full_rewrite() {
+        let tracker = CacheTracker::new(ONE_HOUR_CACHE_TTL, CacheScope::Global, None);
+        let credential_id = 7;
+        let system = large_text("SYSTEM ", LARGE_SYSTEM_CHARS);
+
+        let turn1 = user_message(vec![json!({
+            "type": "text", "text": "u1", "cache_control": ephemeral_1h(),
+        })]);
+        let req1 = build_request_with_metadata(
+            &system, vec![turn1.clone()], make_metadata("dev-A", "acct-A", "sess-1"));
+        let (r1, _) = tracker.compute_and_update(credential_id, &tracker.build_profile(&req1, 10_000));
+        assert!(r1.cache_creation_input_tokens > 0);
+
+        // 同设备同账号，但 session_id 不同 → identity_key 变 → bucket 变。
+        let turn2 = user_message(vec![json!({
+            "type": "text", "text": "u2", "cache_control": ephemeral_1h(),
+        })]);
+        let req2 = build_request_with_metadata(
+            &system, vec![turn1, assistant_text("a1"), turn2],
+            make_metadata("dev-A", "acct-A", "sess-2"));
+        let (r2, _) = tracker.compute_and_update(credential_id, &tracker.build_profile(&req2, 12_000));
+        assert_eq!(r2.cache_read_input_tokens, 0,
+            "session_id 变化后落到新 bucket，旧 1h 缓存读不到，整段重写: {r2:?}");
+    }
+
+    /// 大上下文(600k 级)排查 A：前缀内容变了（典型是上下文压缩/总结/截断
+    /// 改写了靠前的 block）→ 级联指纹全变 → 旧 1h 缓存读不到 → 整段重写。
+    /// 体量只放大重写成本，不改变机理，所以用小样本即可证明。
+    #[test]
+    fn large_context_prefix_change_causes_full_rewrite() {
+        let tracker = CacheTracker::new(ONE_HOUR_CACHE_TTL, CacheScope::Global, None);
+        let cid = 9;
+        let md = make_metadata("dev-A", "acct-A", "sess-1");
+
+        // turn1：system 打 1h，建立 1h 缓存。
+        let sys_v1 = large_text("SYSTEM-V1 ", LARGE_SYSTEM_CHARS);
+        let req1 = MessagesRequest {
+            model: "claude-sonnet-4-6".into(), max_tokens: 1024, stream: false,
+            system: Some(vec![SystemMessage {
+                text: sys_v1.clone(), block_type: Some("text".into()),
+                cache_control: Some(ephemeral_1h()),
+            }]),
+            messages: vec![user_message(vec![json!({"type":"text","text":"u1"})])],
+            tools: None, tool_choice: None, thinking: None, output_config: None,
+            metadata: md.clone(),
+        };
+        let (r1, _) = tracker.compute_and_update(cid, &tracker.build_profile(&req1, 10_000));
+        assert!(r1.cache_creation_1h_input_tokens > 0, "turn1 应建立 1h: {r1:?}");
+
+        // turn2：12 分钟后，session 不变，但 system 被压缩改写了 1 个字。
+        let sys_v2 = large_text("SYSTEM-V2 ", LARGE_SYSTEM_CHARS);
+        let req2 = MessagesRequest {
+            model: "claude-sonnet-4-6".into(), max_tokens: 1024, stream: false,
+            system: Some(vec![SystemMessage {
+                text: sys_v2, block_type: Some("text".into()),
+                cache_control: Some(ephemeral_1h()),
+            }]),
+            messages: vec![user_message(vec![json!({"type":"text","text":"u2"})])],
+            tools: None, tool_choice: None, thinking: None, output_config: None,
+            metadata: md,
+        };
+        let (r2, _) = tracker.compute_and_update(cid, &tracker.build_profile(&req2, 10_000));
+        assert_eq!(r2.cache_read_input_tokens, 0,
+            "前缀(system)被改写后指纹变化，旧 1h 读不到，整段重写: {r2:?}");
+    }
+
+    /// 大上下文排查 B：长会话里稳定前缀未每轮重新 pin、breakpoint 滑到距
+    /// system > 20 block 处时，回扫窗口(20)够不到 block 0 → 整段重写。
+    /// 这是**真实 Anthropic 行为**(20-block lookback)，模拟器刻意保持一致；
+    /// 客户端的正解是每轮在稳定前缀重新打 cache_control(或每 ~15 block 加点)。
+    #[test]
+    fn large_context_lookback_window_loses_unpinned_breakpoint() {
+        let tracker = CacheTracker::new(ONE_HOUR_CACHE_TTL, CacheScope::Global, None);
+        let cid = 11;
+        let system = large_text("SYSTEM ", LARGE_SYSTEM_CHARS);
+
+        // turn1：system 打 1h（block 0）。
+        let req1 = MessagesRequest {
+            model: "claude-sonnet-4-6".into(), max_tokens: 1024, stream: false,
+            system: Some(vec![SystemMessage {
+                text: system.clone(), block_type: Some("text".into()),
+                cache_control: Some(ephemeral_1h()),
+            }]),
+            messages: vec![user_message(vec![json!({"type":"text","text":"u1"})])],
+            tools: None, tool_choice: None, thinking: None, output_config: None,
+            metadata: None,
+        };
+        let (r1, _) = tracker.compute_and_update(cid, &tracker.build_profile(&req1, 10_000));
+        assert!(r1.cache_creation_1h_input_tokens > 0);
+
+        // turn2：system 不再 pin；末尾塞 25 个 block，只在最后一个打 1h。
+        let mut tail: Vec<serde_json::Value> = (0..25)
+            .map(|i| json!({"type":"text","text": format!("pad {i}")}))
+            .collect();
+        tail.push(json!({"type":"text","text":"final","cache_control": ephemeral_1h()}));
+        let req2 = MessagesRequest {
+            model: "claude-sonnet-4-6".into(), max_tokens: 1024, stream: false,
+            system: Some(vec![SystemMessage {
+                text: system, block_type: Some("text".into()),
+                cache_control: None, // ← 关键：稳定前缀不再 pin
+            }]),
+            messages: vec![user_message(tail)],
+            tools: None, tool_choice: None, thinking: None, output_config: None,
+            metadata: None,
+        };
+        let (r2, _) = tracker.compute_and_update(cid, &tracker.build_profile(&req2, 15_000));
+        assert_eq!(r2.cache_read_input_tokens, 0,
+            "system 距末尾 breakpoint > 20 block 且未重新 pin，回扫够不到 → 整段重写\
+             (与真实 Anthropic 一致): {r2:?}");
+    }
+
+    /// 排查 C：缓存条目上限(MAX_ENTRIES=10万,per-bucket LRU)能否导致 1h 被删。
+    /// 关键结论：LRU 按 last_used_at 删最久未用;**正在命中的 1h 条目每次命中都会
+    /// 刷新 last_used_at(line 467),即使把 bucket 灌爆也不会被淘汰**。
+    #[test]
+    fn lru_eviction_keeps_actively_used_1h_entry() {
+        let tracker = CacheTracker::new(ONE_HOUR_CACHE_TTL, CacheScope::Global, None);
+        let cid = 13;
+        let system = large_text("SYSTEM ", LARGE_SYSTEM_CHARS);
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".into(), max_tokens: 1024, stream: false,
+            system: Some(vec![SystemMessage {
+                text: system, block_type: Some("text".into()),
+                cache_control: Some(ephemeral_1h()),
+            }]),
+            messages: vec![user_message(vec![json!({"type":"text","text":"u1"})])],
+            tools: None, tool_choice: None, thinking: None, output_config: None,
+            metadata: None,
+        };
+        let profile = tracker.build_profile(&req, 10_000);
+        let (r1, _) = tracker.compute_and_update(cid, &profile);
+        assert!(r1.cache_creation_1h_input_tokens > 0);
+
+        // 把同一个 bucket 灌爆到 > 10 万条假条目，last_used_at 全部早于后续命中。
+        let eid = tracker.effective_bucket_key(cid, &profile);
+        let old = Instant::now();
+        {
+            let mut all = tracker.entries.lock();
+            let bucket = all.get_mut(&eid).expect("bucket 应存在");
+            for i in 0u64..(MAX_ENTRIES as u64 + 50) {
+                let mut key = [0u8; 32];
+                key[..8].copy_from_slice(&i.to_be_bytes());
+                key[8] = 0xAB; // 避开与真实指纹碰撞
+                bucket.insert(key, CacheEntry {
+                    token_count: 1, billed_cumulative: None,
+                    ttl: ONE_HOUR_CACHE_TTL,
+                    expires_at: old + ONE_HOUR_CACHE_TTL,
+                    last_used_at: old,
+                });
+            }
+        }
+
+        // 再来一次同前缀请求：命中会刷新真实条目的 last_used_at 为最新,
+        // 写入路径触发 LRU 淘汰最旧的(那批假条目) → 真实 1h 条目存活。
+        let (r2, _) = tracker.compute_and_update(cid, &profile);
+        assert!(r2.cache_read_input_tokens > 0,
+            "活跃命中的 1h 条目不应被 LRU 淘汰: {r2:?}");
+    }
+
+    /// 方案 B-1：每请求只清「当前 bucket」的过期条目，保留有效条目。
+    #[test]
+    fn per_bucket_prune_cleans_touched_bucket_only() {
+        let tracker = CacheTracker::new(ONE_HOUR_CACHE_TTL, CacheScope::Global, None);
+        let cid = 21;
+        let system = large_text("SYSTEM ", LARGE_SYSTEM_CHARS);
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-6".into(), max_tokens: 1024, stream: false,
+            system: Some(vec![SystemMessage {
+                text: system, block_type: Some("text".into()),
+                cache_control: Some(ephemeral_1h()),
+            }]),
+            messages: vec![user_message(vec![json!({"type":"text","text":"u1"})])],
+            tools: None, tool_choice: None, thinking: None, output_config: None,
+            metadata: None,
+        };
+        let profile = tracker.build_profile(&req, 10_000);
+        let eid = tracker.effective_bucket_key(cid, &profile);
+        // 先写入真实 1h 条目。
+        let (r1, _) = tracker.compute_and_update(cid, &profile);
+        assert!(r1.cache_creation_1h_input_tokens > 0);
+
+        // 往同一 bucket 塞一条「已过期」假条目 + 另一个 bucket 也塞过期条目。
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        let dummy = |exp| CacheEntry {
+            token_count: 1, billed_cumulative: None,
+            ttl: ONE_HOUR_CACHE_TTL, expires_at: exp, last_used_at: past,
+        };
+        {
+            let mut all = tracker.entries.lock();
+            all.get_mut(&eid).unwrap().insert([0xEE; 32], dummy(past));
+            all.entry(0xDEAD).or_default().insert([0xAB; 32], dummy(past));
+        }
+
+        // 再次请求同一 bucket：只清当前 bucket → 过期假条目没了、真实条目命中；
+        // 另一个未被触碰的 bucket(0xDEAD) 的过期条目这一步仍在（留给全表清扫）。
+        let (r2, _) = tracker.compute_and_update(cid, &profile);
+        assert!(r2.cache_read_input_tokens > 0, "真实 1h 条目应命中: {r2:?}");
+        let all = tracker.entries.lock();
+        assert!(!all.get(&eid).unwrap().contains_key(&[0xEE; 32]),
+            "当前 bucket 的过期条目应被清除");
+        assert!(all.get(&0xDEAD).is_some_and(|b| b.contains_key(&[0xAB; 32])),
+            "未触碰的 bucket 不应被每请求清理影响");
+    }
+
+    /// 方案 B-2：节流的全表清扫回收「已废弃、不再被触碰」的 bucket。
+    #[test]
+    fn full_sweep_reaps_abandoned_buckets() {
+        let tracker = CacheTracker::new(ONE_HOUR_CACHE_TTL, CacheScope::Global, None);
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        let now_exp = Instant::now() + ONE_HOUR_CACHE_TTL;
+        {
+            let mut all = tracker.entries.lock();
+            // 废弃 bucket：全过期。
+            all.entry(0xABA0).or_default().insert([0x01; 32], CacheEntry {
+                token_count: 1, billed_cumulative: None, ttl: ONE_HOUR_CACHE_TTL,
+                expires_at: past, last_used_at: past,
+            });
+            // 活跃 bucket：未过期，应保留。
+            all.entry(0xA11E).or_default().insert([0x02; 32], CacheEntry {
+                token_count: 1, billed_cumulative: None, ttl: ONE_HOUR_CACHE_TTL,
+                expires_at: now_exp, last_used_at: past,
+            });
+        }
+        assert_eq!(tracker.bucket_count(), 2);
+
+        tracker.force_full_prune_now();
+
+        let all = tracker.entries.lock();
+        assert!(!all.contains_key(&0xABA0), "全过期的废弃 bucket 应被全表清扫回收");
+        assert!(all.contains_key(&0xA11E), "仍有有效条目的 bucket 应保留");
+    }
+
+    /// 最小可缓存 tokens 对齐官方文档（Claude API 口径）。
+    #[test]
+    fn minimum_cacheable_tokens_matches_official_docs() {
+        let cases = [
+            ("claude-fable-5", 512),
+            ("claude-mythos-5", 512),
+            ("claude-mythos-preview", 2048),
+            ("claude-opus-4-7", 2048),
+            ("claude-haiku-3-5", 2048),
+            ("claude-opus-4-6", 4096),
+            ("claude-opus-4-5", 4096),
+            ("claude-haiku-4-5", 4096),
+            ("claude-opus-4-8", 1024),
+            ("claude-sonnet-4-6", 1024),
+            ("claude-sonnet-4-5", 1024),
+            ("claude-opus-4-1", 1024),
+            ("claude-opus-4-0", 1024),
+            ("claude-sonnet-4-0", 1024),
+            // 分隔符兼容
+            ("claude-opus-4.8", 1024),
+            ("claude-opus-4.7", 2048),
+        ];
+        for (model, expect) in cases {
+            assert_eq!(
+                minimum_cacheable_tokens_for_model(model),
+                expect,
+                "model={model}"
+            );
+        }
     }
 
     /// 第一轮无任何 breakpoint：不写表，也不报 creation。
