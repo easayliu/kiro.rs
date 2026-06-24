@@ -327,7 +327,7 @@ export function CredentialCard({
   // 已实际产生超额用量，或（开了超额且越过额度）= 正在超额计费（amber 警示，而非"耗尽"红色）。
   const hasActualOverage = !!balance && balance.currentOverages > 0
   const isOverageBilling = hasActualOverage || (overageEnabled && isOverLimit)
-  // 超额本身也已触顶（currentOverages 越过 overageCap）→ 从 amber 升级为 red 警示
+  // 超额本身也已封顶（currentOverages 越过 overageCap）→ 从 amber 升级为 red 警示
   const overageCapExceeded =
     !!balance && balance.overageCap > 0 && balance.currentOverages >= balance.overageCap
   // 超额段进度：currentOverages 占 overageCap 的比例（0–100）；cap 未知时填满表示"正在超额"
@@ -435,7 +435,7 @@ export function CredentialCard({
     Manual: '手动禁用',
     TooManyFailures: '连续失败',
     TooManyRefreshFailures: '刷新失败',
-    QuotaExceeded: '额度用尽',
+    QuotaExceeded: '额度已用完',
     InvalidRefreshToken: 'Token 失效',
     InvalidConfig: '配置无效',
     FreeSubscription: 'Free 订阅（自动禁用）',
@@ -725,7 +725,7 @@ export function CredentialCard({
                     >
                       {(isOverageBilling ? rawUsagePercent : balance.usagePercentage).toFixed(1)}%
                     </span>
-                    {isOverageBilling && (
+                    {isOverageBilling ? (
                       <span
                         className={cn(
                           'shrink-0 rounded-full px-1.5 py-0.5 text-2xs font-medium leading-none',
@@ -737,9 +737,17 @@ export function CredentialCard({
                             : '用量已越过额度，正在按超额计费'
                         }
                       >
-                        {overageCapExceeded ? '超额已触顶' : '超额计费中'}
+                        {overageCapExceeded ? '超额已封顶' : '超额计费中'}
                       </span>
-                    )}
+                    ) : isOverLimit ? (
+                      // 基础额度耗尽且未开超额：Stripe 式柔和徽章，色彩只用来标识问题
+                      <span
+                        className="shrink-0 rounded-full bg-bad-soft px-1.5 py-0.5 text-2xs font-medium leading-none text-bad"
+                        title="基础额度已用完，未开启超额计费"
+                      >
+                        额度已用完
+                      </span>
+                    ) : null}
                   </>
                 ) : (
                   <span className="text-xs text-muted-foreground">—</span>
@@ -776,7 +784,7 @@ export function CredentialCard({
             </div>
             {/* 超额行固定占位：无超额时也保留高度，保证各卡片元信息行垂直对齐 */}
             <div className="mt-1 flex h-4 items-center gap-1.5 text-[11px] text-warn">
-              {/* 卡面显示超额用量（计数/上限）；费用收进详情。触顶时红字告警 */}
+              {/* 卡面显示超额用量（计数/上限）；费用收进详情。封顶时红字告警 */}
               {balance && hasActualOverage && (
                 <span
                   className={cn(
