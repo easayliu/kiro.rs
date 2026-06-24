@@ -759,16 +759,17 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, stats)))
                         }
                         None => {
-                            // 流结束（上游 EOF）。区分"正常结束"与"静默截断"：
-                            // 静默截断走的也是 None 分支（尤其 HTTP/1.1 close-delimited body 被提前关闭时），
-                            // 不会报错，需靠应用层判据识别：
-                            //   判据1 pending_bytes>0 → 切在半个帧中间；
-                            //   判据2 没见过 meteringEvent → 收尾事件缺失，几乎可断定被提前截断。
+                            // 流结束（上游 EOF）。按「传输层如何终止」分类，避免把"干净收尾但
+                            // 漏发 metering"误判成截断（上游无显式完成事件，metering 缺失只是弱信号）：
+                            //   pending_bytes>0           → 切在半个帧中间 = 真截断（传输层铁证）；
+                            //   pending==0 && !metering    → 已收到协议结束符、解码器无残留 = 传输完整，
+                            //                                仅上游漏发 meteringEvent，内容应完整（非截断）；
+                            //   pending==0 && metering     → 正常完成。
                             let pending = decoder.pending_bytes();
-                            let suspected_truncation = pending > 0 || !stats.saw_metering;
-                            if suspected_truncation {
+                            if pending > 0 {
                                 tracing::warn!(
                                     model = %ctx.model,
+                                    termination = "half_frame_truncated",
                                     elapsed_secs = stats.start.elapsed().as_secs_f64(),
                                     bytes = stats.bytes,
                                     frames = stats.frames,
@@ -776,13 +777,27 @@ fn create_sse_stream(
                                     saw_metering = stats.saw_metering,
                                     saw_context_usage = stats.saw_context_usage,
                                     output_tokens = ctx.output_tokens,
-                                    "疑似静默截断：流以 EOF 正常结束但缺少收尾信号（残留半帧或未收到 meteringEvent），客户端会看到半截回复"
+                                    "输出被截断：流在事件帧中间中断（解码器残留半帧），客户端会拿到半截回复，已发 error 事件触发重试"
+                                );
+                            } else if !stats.saw_metering {
+                                tracing::warn!(
+                                    model = %ctx.model,
+                                    termination = "clean_eof_no_metering",
+                                    elapsed_secs = stats.start.elapsed().as_secs_f64(),
+                                    bytes = stats.bytes,
+                                    frames = stats.frames,
+                                    pending_bytes = pending,
+                                    saw_metering = stats.saw_metering,
+                                    saw_context_usage = stats.saw_context_usage,
+                                    output_tokens = ctx.output_tokens,
+                                    "流已规整结束（收到协议结束符、无残留半帧）但上游漏发 meteringEvent：传输完整、内容应完整，仅计费元数据缺失（非截断）"
                                 );
                             } else {
                                 // 计费汇总由 generate_final_events 的「请求完成（流式）」承担；
                                 // 此处仅记 transport 层 EOF/耗时，降级 debug 避免每请求双 info 行。
                                 tracing::debug!(
                                     model = %ctx.model,
+                                    termination = "clean_eof",
                                     elapsed_secs = stats.start.elapsed().as_secs_f64(),
                                     output_tokens = ctx.output_tokens,
                                     "上游流正常结束（EOF）"
@@ -1573,12 +1588,14 @@ fn create_buffered_sse_stream(
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, stats)));
                             }
                             None => {
-                                // 流结束（上游 EOF）。同样区分正常结束与静默截断（判据同直传路径）。
+                                // 流结束（上游 EOF）。按传输层终止方式分类（判据同直传路径）：
+                                //   pending>0 = 真截断；pending==0 && !metering = 传输完整仅漏发
+                                //   metering（非截断）；pending==0 && metering = 正常完成。
                                 let pending = decoder.pending_bytes();
-                                let suspected_truncation = pending > 0 || !stats.saw_metering;
-                                if suspected_truncation {
+                                if pending > 0 {
                                     tracing::warn!(
                                         model = %ctx.model(),
+                                        termination = "half_frame_truncated",
                                         elapsed_secs = stats.start.elapsed().as_secs_f64(),
                                         bytes = stats.bytes,
                                         frames = stats.frames,
@@ -1586,13 +1603,27 @@ fn create_buffered_sse_stream(
                                         saw_metering = stats.saw_metering,
                                         saw_context_usage = stats.saw_context_usage,
                                         output_tokens = ctx.output_tokens(),
-                                        "疑似静默截断（缓冲模式）：流以 EOF 正常结束但缺少收尾信号（残留半帧或未收到 meteringEvent）"
+                                        "输出被截断（缓冲模式）：流在事件帧中间中断（解码器残留半帧），已发 error 事件触发重试"
+                                    );
+                                } else if !stats.saw_metering {
+                                    tracing::warn!(
+                                        model = %ctx.model(),
+                                        termination = "clean_eof_no_metering",
+                                        elapsed_secs = stats.start.elapsed().as_secs_f64(),
+                                        bytes = stats.bytes,
+                                        frames = stats.frames,
+                                        pending_bytes = pending,
+                                        saw_metering = stats.saw_metering,
+                                        saw_context_usage = stats.saw_context_usage,
+                                        output_tokens = ctx.output_tokens(),
+                                        "流已规整结束（收到协议结束符、无残留半帧）但上游漏发 meteringEvent：传输完整、内容应完整，仅计费元数据缺失（非截断）"
                                     );
                                 } else {
                                     // 计费汇总由 inner 的「请求完成（流式）」承担；此处仅记
                                     // transport 层 EOF/耗时，降级 debug 避免每请求双 info 行。
                                     tracing::debug!(
                                         model = %ctx.model(),
+                                        termination = "clean_eof",
                                         elapsed_secs = stats.start.elapsed().as_secs_f64(),
                                         output_tokens = ctx.output_tokens(),
                                         "上游流正常结束（EOF，缓冲模式）"
