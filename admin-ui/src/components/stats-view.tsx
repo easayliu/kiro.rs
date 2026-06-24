@@ -312,7 +312,7 @@ export function StatsView() {
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Area name="官方价" type="monotone" dataKey="official_usd" stroke="hsl(var(--chart-slate))" fill="url(#gOff)" strokeWidth={1.5} />
                 <Area name="实际成本" type="monotone" dataKey="actual_usd" stroke="hsl(var(--chart-ink))" fill="url(#gAct)" strokeWidth={1.5} />
-                <Line name="毛利" type="monotone" dataKey="margin_usd" stroke="hsl(var(--ok))" strokeWidth={1.8} dot={false} />
+                <Line name="毛利" type="monotone" dataKey="margin_usd" stroke="hsl(var(--chart-positive))" strokeWidth={1.8} dot={false} />
               </ComposedChart>
             </ResponsiveContainer>
           </ChartCard>
@@ -327,8 +327,8 @@ export function StatsView() {
                 <Tooltip contentStyle={tooltipStyle} />
                 <Legend wrapperStyle={{ fontSize: 12 }} />
                 <Bar yAxisId="l" name="请求" dataKey="requests" fill="hsl(var(--chart-blue))" radius={[3, 3, 0, 0]} maxBarSize={28} />
-                <Bar yAxisId="l" name="失败" dataKey="failures" fill="hsl(var(--bad))" radius={[3, 3, 0, 0]} maxBarSize={28} />
-                <Line yAxisId="r" name="错误率%" type="monotone" dataKey="errRate" stroke="hsl(var(--bad))" strokeWidth={1.8} dot={false} />
+                <Bar yAxisId="l" name="失败" dataKey="failures" fill="hsl(var(--chart-negative))" radius={[3, 3, 0, 0]} maxBarSize={28} />
+                <Line yAxisId="r" name="错误率%" type="monotone" dataKey="errRate" stroke="hsl(var(--chart-negative))" strokeWidth={1.8} dot={false} />
               </ComposedChart>
             </ResponsiveContainer>
           </ChartCard>
@@ -344,7 +344,7 @@ export function StatsView() {
                 <Area name="输入" type="monotone" dataKey="input_tokens" stackId="t" stroke="hsl(var(--chart-ink))" fill="hsl(var(--chart-ink))" fillOpacity={0.5} />
                 <Area name="缓存读" type="monotone" dataKey="cache_read" stackId="t" stroke="hsl(var(--chart-cyan))" fill="hsl(var(--chart-cyan))" fillOpacity={0.5} />
                 <Area name="缓存写" type="monotone" dataKey="cache_creation" stackId="t" stroke="hsl(var(--chart-amber))" fill="hsl(var(--chart-amber))" fillOpacity={0.5} />
-                <Area name="输出" type="monotone" dataKey="output_tokens" stackId="t" stroke="hsl(var(--ok))" fill="hsl(var(--ok))" fillOpacity={0.5} />
+                <Area name="输出" type="monotone" dataKey="output_tokens" stackId="t" stroke="hsl(var(--chart-positive))" fill="hsl(var(--chart-positive))" fillOpacity={0.5} />
               </AreaChart>
             </ResponsiveContainer>
           </ChartCard>

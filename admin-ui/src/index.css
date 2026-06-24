@@ -50,7 +50,10 @@
     --bad-foreground: 0 0% 100%;
     --bad-soft: 347 80% 97%;
 
-    /* 图表分类色板：互相可区分的非语义色相（语义系列直接引用 --ok/--bad），集中托管便于主题化 */
+    /* 图表自有色板：自成一体便于主题化。状态色色相沿用品牌（正=emerald/负=緋红），
+       但明度按 data-viz 调亮——UI 语义 token 偏暗是为卡面文字对比，画线/填充会发闷 */
+    --chart-positive: 160 84% 39%;         /* 毛利 / 输出，emerald-500，比 --ok 亮 */
+    --chart-negative: 347 82% 50%;         /* 失败 / 错误率，crimson-500，比 --bad 亮 */
     --chart-ink: 0 0% 32%;                 /* 实际成本/输入 token，neutral-600 */
     --chart-slate: 215 20% 65%;            /* 官方价，slate-400 */
     --chart-blue: 217 91% 60%;             /* 请求量 */
@@ -111,7 +114,9 @@
     --bad-foreground: 240 6% 10%;
     --bad-soft: 347 45% 16%;
 
-    /* 图表分类色板（暗色提亮，保证在 zinc-900 卡上清晰） */
+    /* 图表自有色板（暗色提亮，保证在 zinc-900 卡上清晰） */
+    --chart-positive: 160 70% 50%;
+    --chart-negative: 349 90% 70%;
     --chart-ink: 0 0% 75%;
     --chart-slate: 215 20% 65%;
     --chart-blue: 217 91% 66%;
