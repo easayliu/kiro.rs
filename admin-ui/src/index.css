@@ -50,17 +50,6 @@
     --bad-foreground: 0 0% 100%;
     --bad-soft: 347 80% 97%;
 
-    /* 图表自有色板：自成一体便于主题化。状态色色相沿用品牌（正=emerald/负=緋红），
-       但明度按 data-viz 调亮——UI 语义 token 偏暗是为卡面文字对比，画线/填充会发闷 */
-    --chart-positive: 160 84% 39%;         /* 毛利 / 输出，emerald-500，比 --ok 亮 */
-    --chart-negative: 347 82% 50%;         /* 失败 / 错误率，crimson-500，比 --bad 亮 */
-    --chart-ink: 0 0% 32%;                 /* 实际成本/输入 token，neutral-600 */
-    --chart-slate: 215 20% 65%;            /* 官方价，slate-400 */
-    --chart-blue: 217 91% 60%;             /* 请求量 */
-    --chart-cyan: 189 94% 43%;             /* 缓存读 */
-    --chart-amber: 38 92% 50%;             /* 缓存写 / 首字延迟 */
-    --chart-violet: 258 90% 66%;           /* 总耗时 */
-
     --border: 240 6% 90%;                  /* zinc-200 */
     --input: 240 6% 90%;
     --ring: 240 6% 10%;
@@ -113,16 +102,6 @@
     --bad: 349 90% 72%;                     /* Stripe 緋红 crimson-400，对卡片 ≥6:1 */
     --bad-foreground: 240 6% 10%;
     --bad-soft: 347 45% 16%;
-
-    /* 图表自有色板（暗色提亮，保证在 zinc-900 卡上清晰） */
-    --chart-positive: 160 70% 50%;
-    --chart-negative: 349 90% 70%;
-    --chart-ink: 0 0% 75%;
-    --chart-slate: 215 20% 65%;
-    --chart-blue: 217 91% 66%;
-    --chart-cyan: 189 90% 55%;
-    --chart-amber: 38 92% 55%;
-    --chart-violet: 258 90% 73%;
 
     --border: 240 5% 22%;                   /* zinc-700 档，对背景 1.6:1 清晰可见 */
     --input: 240 5% 22%;

@@ -932,7 +932,7 @@ export function CredentialCard({
                           <Line
                             type="monotone"
                             dataKey="v"
-                            stroke="hsl(var(--chart-amber))"
+                            stroke="#f59e0b"
                             strokeWidth={1.5}
                             dot={false}
                             isAnimationActive={false}
