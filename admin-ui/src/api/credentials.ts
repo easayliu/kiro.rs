@@ -184,6 +184,18 @@ export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promi
   return data
 }
 
+// 获取上游中继地址（null = 未启用中继，全走公网直连）
+export async function getRelayHost(): Promise<{ relayHost: string | null }> {
+  const { data } = await api.get<{ relayHost: string | null }>('/config/relay-host')
+  return data
+}
+
+// 设置上游中继地址（传 null/空串关闭中继，立即生效并持久化）
+export async function setRelayHost(relayHost: string | null): Promise<{ relayHost: string | null }> {
+  const { data } = await api.put<{ relayHost: string | null }>('/config/relay-host', { relayHost })
+  return data
+}
+
 // 获取全局缓存模式
 export async function getGlobalCache(): Promise<{ enabled: boolean }> {
   const { data } = await api.get<{ enabled: boolean }>('/config/global-cache')

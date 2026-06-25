@@ -232,7 +232,9 @@ pub struct Config {
     /// 上游中继地址（NLB DNS 名或 IP，可选 `:port`，默认 443）。设置后，对 API host
     /// （`apiHostTemplate` 解析出的域名，如 `q.{region}.amazonaws.com`）的连接会被定向到此地址，
     /// 但 SNI/Host 保持原域名 —— 适用于经 NLB→PrivateLink 中继优化到 AWS 的入口路由。
-    /// 中继连接失败时自动降级到公网直连（见 provider 调用循环）。仅作用于非 runtime 端点。
+    /// 中继连接失败时本次请求后续轮次自动跳过中继（按凭据代理设置走直连/代理，非强制公网直连，
+    /// 见 provider 调用循环）。runtime / q 两端点均适用（实测同一 NLB 同时前置二者）。
+    /// 运行时可热改：Admin API `PUT /config/relay-host` 即时生效并持久化。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_host: Option<String>,
 

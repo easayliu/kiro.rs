@@ -304,6 +304,24 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+// ============ 上游中继地址 ============
+
+/// 上游中继地址响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayHostResponse {
+    /// 当前中继地址 `host[:port]`；未启用时为 null
+    pub relay_host: Option<String>,
+}
+
+/// 设置上游中继地址请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRelayHostRequest {
+    /// 目标中继地址 `host[:port]`；传 null 或空串表示关闭中继（全走公网直连）
+    pub relay_host: Option<String>,
+}
+
 // ============ 全局缓存配置 ============
 
 /// 全局缓存模式响应

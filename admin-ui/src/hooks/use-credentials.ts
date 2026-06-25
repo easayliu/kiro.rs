@@ -17,6 +17,8 @@ import {
   batchDeleteCredentials,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getRelayHost,
+  setRelayHost,
   getGlobalCache,
   setGlobalCache,
   getCacheScope,
@@ -225,6 +227,25 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+// 获取上游中继地址
+export function useRelayHost() {
+  return useQuery({
+    queryKey: ['relayHost'],
+    queryFn: getRelayHost,
+  })
+}
+
+// 设置上游中继地址
+export function useSetRelayHost() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (relayHost: string | null) => setRelayHost(relayHost),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['relayHost'] })
     },
   })
 }

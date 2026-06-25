@@ -50,6 +50,8 @@ import {
   useResetFailure,
   useLoadBalancingMode,
   useSetLoadBalancingMode,
+  useRelayHost,
+  useSetRelayHost,
   useCacheScope,
   useSetCacheScope,
   useCacheSkipRate,
@@ -147,6 +149,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchRpmValue, setBatchRpmValue] = useState('')
   const [defaultRpmDialogOpen, setDefaultRpmDialogOpen] = useState(false)
   const [defaultRpmValue, setDefaultRpmValue] = useState('')
+  const [relayHostDialogOpen, setRelayHostDialogOpen] = useState(false)
+  const [relayHostValue, setRelayHostValue] = useState('')
   const [batchConcurrencyDialogOpen, setBatchConcurrencyDialogOpen] = useState(false)
   const [batchConcurrencyValue, setBatchConcurrencyValue] = useState('')
   const [defaultConcurrencyDialogOpen, setDefaultConcurrencyDialogOpen] = useState(false)
@@ -243,6 +247,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const batchSetOverageMutation = useBatchSetOverage()
   const { data: defaultRpmData } = useDefaultRpmLimit()
   const setDefaultRpmMutation = useSetDefaultRpmLimit()
+  const { data: relayHostData } = useRelayHost()
+  const setRelayHostMutation = useSetRelayHost()
   const { data: defaultConcurrencyData } = useDefaultConcurrencyLimit()
   const setDefaultConcurrencyMutation = useSetDefaultConcurrencyLimit()
   // 近 7 天每凭据用量（请求/成本/TTFT），按 id 映射给卡片
@@ -780,6 +786,27 @@ export function Dashboard({ onLogout }: DashboardProps) {
               : `全局默认 RPM 已设为 ${payload} 次/分钟`,
         )
         setDefaultRpmDialogOpen(false)
+      },
+      onError: err => toast.error('保存失败: ' + (err as Error).message),
+    })
+  }
+
+  const openRelayHostDialog = () => {
+    setRelayHostValue(relayHostData?.relayHost ?? '')
+    setRelayHostDialogOpen(true)
+  }
+
+  const handleRelayHostSubmit = () => {
+    const trimmed = relayHostValue.trim()
+    const payload: string | null = trimmed === '' ? null : trimmed
+    setRelayHostMutation.mutate(payload, {
+      onSuccess: () => {
+        toast.success(
+          payload === null
+            ? '已关闭中继，全走公网直连'
+            : `中继地址已设为 ${payload}`,
+        )
+        setRelayHostDialogOpen(false)
       },
       onError: err => toast.error('保存失败: ' + (err as Error).message),
     })
@@ -1687,6 +1714,17 @@ export function Dashboard({ onLogout }: DashboardProps) {
               disabled={setDefaultConcurrencyMutation.isPending}
               onClick={() => { setPoliciesOpen(false); openDefaultConcurrencyDialog() }}
             />
+            <PolicyRow
+              label="上游中继地址"
+              sub={
+                relayHostData?.relayHost == null
+                  ? '未启用（全走公网直连）'
+                  : '上游连接经此地址中继，连不通自动降级直连'
+              }
+              value={relayHostData?.relayHost == null ? '关闭' : '已启用'}
+              disabled={setRelayHostMutation.isPending}
+              onClick={() => { setPoliciesOpen(false); openRelayHostDialog() }}
+            />
           </div>
         </DialogContent>
       </Dialog>
@@ -1900,6 +1938,47 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Button>
             <Button onClick={handleDefaultRpmSubmit} disabled={setDefaultRpmMutation.isPending}>
               {setDefaultRpmMutation.isPending ? '保存中…' : '保存'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={relayHostDialogOpen} onOpenChange={setRelayHostDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>上游中继地址</DialogTitle>
+            <DialogDescription>
+              上游 API 连接经此地址（NLB DNS 名或 IP，可选 :port，默认 443）中继，SNI/Host 仍保持原域名。立即生效并持久化到 config.json，连不通时自动降级公网直连。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 py-2">
+            <Input
+              type="text"
+              placeholder="留空表示关闭（全走公网直连）"
+              value={relayHostValue}
+              onChange={e => setRelayHostValue(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') handleRelayHostSubmit() }}
+              autoFocus
+              className="font-mono"
+            />
+            <p className="text-2xs text-muted-foreground">
+              · 留空：关闭中继，所有上游连接走公网直连
+              <br />
+              · 形如 <span className="font-mono">kiro-xxx.elb.us-east-1.amazonaws.com</span> 或带端口 <span className="font-mono">host:443</span>
+              <br />
+              · 中继域名每次连接现场解析，IP 变更自动跟上，无需重启
+            </p>
+          </div>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setRelayHostDialogOpen(false)}
+              disabled={setRelayHostMutation.isPending}
+            >
+              取消
+            </Button>
+            <Button onClick={handleRelayHostSubmit} disabled={setRelayHostMutation.isPending}>
+              {setRelayHostMutation.isPending ? '保存中…' : '保存'}
             </Button>
           </DialogFooter>
         </DialogContent>

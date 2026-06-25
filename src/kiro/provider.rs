@@ -56,10 +56,12 @@ pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
     /// 全局代理配置（用于凭据无自定义代理时的回退）
     global_proxy: Option<ProxyConfig>,
-    /// Client 缓存：key = (effective proxy config, 是否走中继), value = reqwest::Client
+    /// Client 缓存：key = (effective proxy config, 中继地址 or None), value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client；
     /// 中继与直连各缓存一份（中继 Client 带 DNS 解析覆盖）。
-    client_cache: Mutex<HashMap<(Option<ProxyConfig>, bool), Client>>,
+    /// key 带实际中继地址：relay_host 热改后地址一变即 key 不命中，自动用新地址重建 Client
+    /// （旧 Client 自然弃用），无需显式清缓存。
+    client_cache: Mutex<HashMap<(Option<ProxyConfig>, Option<String>), Client>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
 }
@@ -82,7 +84,7 @@ impl KiroProvider {
         let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
             .expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
-        cache.insert((proxy.clone(), false), initial_client);
+        cache.insert((proxy.clone(), None), initial_client);
 
         Self {
             token_manager,
@@ -98,7 +100,7 @@ impl KiroProvider {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref(), &groups);
         // 仅当确实配了中继地址时才构建中继 Client（否则退化为直连缓存槽，避免空跑）。
         let relay = if use_relay { self.relay_authority() } else { None };
-        let key = (effective.clone(), relay.is_some());
+        let key = (effective.clone(), relay.clone());
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&key) {
             return Ok(client.clone());
@@ -109,7 +111,7 @@ impl KiroProvider {
         // 注：下方 "直连/代理" 指 HTTP 代理维度；中继是独立维度，开启时上游连接经此 NLB 转发。
         let relay_note = relay
             .as_ref()
-            .map(|a| format!("；上游经中继 {}（每次连接现解析其 IP，连不通自动降级直连）", a))
+            .map(|a| format!("；上游经中继 {}（每次连接现解析其 IP，连不通自动跳过中继按代理设置重试）", a))
             .unwrap_or_default();
         match &effective {
             Some(p) => tracing::info!(
@@ -142,13 +144,17 @@ impl KiroProvider {
         Ok(client)
     }
 
-    /// 中继地址 `host:port`（来自 `config.relay_host`，默认端口 443）。未配置 / 为空时返回 `None`。
+    /// 中继地址 `host:port`（来自运行时可变的 `relay_host`，默认端口 443）。未配置 / 为空时返回 `None`。
     ///
+    /// 现读 `token_manager.get_relay_host()`（Admin API 可热改），不读冻结的 config。
     /// 只返回地址字符串、不在此解析 DNS —— 实际解析由 `RelayResolver` 在每次连接时现场完成，
     /// 故中继域名（如 NLB DNS）的 IP 变更会被自动跟上，无需重启或清缓存。
     fn relay_authority(&self) -> Option<String> {
-        let config = self.token_manager.config();
-        let relay = config.relay_host.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+        let relay = self.token_manager.get_relay_host()?;
+        let relay = relay.trim();
+        if relay.is_empty() {
+            return None;
+        }
         Some(if relay.contains(':') {
             relay.to_string()
         } else {
@@ -731,13 +737,10 @@ impl KiroProvider {
             };
 
             // 中继：配置了 relay_host 且未降级即走中继（runtime/q 两端点的 NLB 证书均有效，
-            // 实测 NLB 同时前置 q 与 runtime 域名）；连接失败时本次请求后续轮次自动降级直连。
-            let relay_use = !relay_degraded
-                && config
-                    .relay_host
-                    .as_deref()
-                    .map(str::trim)
-                    .is_some_and(|s| !s.is_empty());
+            // 实测 NLB 同时前置 q 与 runtime 域名）；连接失败时本次请求后续轮次自动跳过中继
+            // （按凭据代理设置走直连/代理，非强制公网直连）。
+            // 现读运行时可变的 relay_host（Admin API 可热改），不读冻结的 config。
+            let relay_use = !relay_degraded && self.relay_authority().is_some();
 
             let mut request = self
                 .client_for(&ctx.credentials, relay_use)?
@@ -776,12 +779,13 @@ impl KiroProvider {
             {
                 Ok(resp) => resp,
                 Err(e) => {
-                    // 走中继时连接失败 → 立即降级公网直连重试（不计退避、不切凭据），
-                    // 实现"中继不通就降级到公开地址"。后续轮次 relay_use 自动为 false。
+                    // 走中继时连接失败 → 立即降级"跳过中继"重试（不计退避、不切凭据）。
+                    // 注意：跳过中继≠强制公网直连——HTTP 代理是独立维度，若配了代理，
+                    // 后续轮次仍经该代理，只是不再经中继 NLB。后续轮次 relay_use 自动为 false。
                     if relay_use && !relay_degraded {
                         relay_degraded = true;
                         tracing::warn!(
-                            "中继连接失败（尝试 {}/{}），降级公网直连重试: {}",
+                            "中继连接失败（尝试 {}/{}），本次请求后续轮次跳过中继重试（仍按凭据代理设置走直连/代理）: {}",
                             attempt + 1,
                             max_retries,
                             e
@@ -820,7 +824,7 @@ impl KiroProvider {
                     .unwrap_or_else(|| "直连".to_string())
             };
             tracing::debug!(
-                "[TTFT] 凭据 #{} {} model={} attempt={}/{} status={} acquire={}ms send={}ms host={} proxy={}",
+                "[TTFT] 凭据 #{} {} model={} attempt={}/{} status={} acquire={}ms send={}ms host={} proxy={} relay={}",
                 ctx.id,
                 api_type,
                 model.as_deref().unwrap_or("-"),
@@ -831,6 +835,9 @@ impl KiroProvider {
                 send_ms,
                 self.base_domain_for(&ctx.credentials),
                 proxy_host,
+                // 中继维度（独立于 proxy）：本轮是否经中继 NLB 转发。
+                // relay_degraded 后或未配中继时为 off，避免与 proxy=直连 混淆。
+                if relay_use { "on" } else { "off" },
             );
 
             // 成功响应

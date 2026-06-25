@@ -17,7 +17,7 @@ use super::{
         SetCredentialGroupRequest, SetDefaultConcurrencyLimitRequest, SetDefaultRpmLimitRequest,
         SetDisabledRequest,
         SetGlobalCacheRequest, SetLoadBalancingModeRequest, SetOverageRequest, SetPriorityRequest,
-        SetRpmLimitRequest, SuccessResponse, UpsertProxyGroupRequest,
+        SetRelayHostRequest, SetRpmLimitRequest, SuccessResponse, UpsertProxyGroupRequest,
     },
 };
 
@@ -312,6 +312,24 @@ pub async fn set_load_balancing_mode(
     Json(payload): Json<SetLoadBalancingModeRequest>,
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/relay-host
+/// 获取上游中继地址
+pub async fn get_relay_host(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_relay_host())
+}
+
+/// PUT /api/admin/config/relay-host
+/// 设置上游中继地址（传 null/空串关闭中继）
+pub async fn set_relay_host(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetRelayHostRequest>,
+) -> impl IntoResponse {
+    match state.service.set_relay_host(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

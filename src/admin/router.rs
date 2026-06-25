@@ -24,7 +24,7 @@ use super::{
         set_credential_disabled, set_credential_group,
         set_credential_overage, set_credential_priority, set_credential_rpm_limit,
         set_default_concurrency_limit, set_default_rpm_limit, set_global_cache,
-        set_load_balancing_mode, upsert_proxy_group,
+        set_load_balancing_mode, get_relay_host, set_relay_host, upsert_proxy_group,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -45,6 +45,8 @@ use super::{
 /// - `GET /credentials/:id/models` - 查询凭据上游可用模型列表
 /// - `GET /config/load-balancing` - 获取负载均衡模式
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
+/// - `GET /config/relay-host` - 获取上游中继地址
+/// - `PUT /config/relay-host` - 设置上游中继地址（null/空串关闭）
 /// - `GET /config/global-cache` - 获取全局缓存模式
 /// - `PUT /config/global-cache` - 设置全局缓存模式
 /// - `GET /config/proxy-groups` - 列出所有代理分组
@@ -102,6 +104,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
+        )
+        .route(
+            "/config/relay-host",
+            get(get_relay_host).put(set_relay_host),
         )
         .route(
             "/config/global-cache",

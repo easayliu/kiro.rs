@@ -1015,6 +1015,11 @@ pub struct MultiTokenManager {
     concurrency_feature_enabled: AtomicBool,
     /// 代理分组（运行时可修改，与 config.json 中 proxyGroups 同步）
     proxy_groups: RwLock<BTreeMap<String, ProxyGroupConfig>>,
+    /// 上游中继地址（运行时可变；初始化自 config.relay_host，Admin API 修改后实时生效并持久化）
+    ///
+    /// `None`/空 = 不走中继（全走公网直连）；`Some("host[:port]")` = 经此地址中继。
+    /// 改动通过 client 缓存 key 带地址实现自愈：地址一变，下次请求 key 不命中即重建 client。
+    relay_host: Mutex<Option<String>>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 有未落盘统计更新的凭据 id 集合（唯一脏标记真相源）：
@@ -1244,6 +1249,7 @@ impl MultiTokenManager {
 
         let load_balancing_mode = config.load_balancing_mode.clone();
         let proxy_groups = config.proxy_groups.clone();
+        let relay_host = config.relay_host.clone();
         let default_rpm_limit = config.default_rpm_limit;
         let any_cred_rpm = entries
             .iter()
@@ -1270,6 +1276,7 @@ impl MultiTokenManager {
                 any_cred_concurrency || any_default_concurrency,
             ),
             proxy_groups: RwLock::new(proxy_groups),
+            relay_host: Mutex::new(relay_host),
             last_stats_save_at: Mutex::new(None),
             stats_dirty_ids: Mutex::new(HashSet::new()),
         };
@@ -3628,6 +3635,59 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 获取当前上游中继地址（Admin API）。`None`/空 = 不走中继。
+    pub fn get_relay_host(&self) -> Option<String> {
+        self.relay_host.lock().clone()
+    }
+
+    /// 设置上游中继地址（Admin API）；持久化到 config.json。
+    ///
+    /// 传 `None` 或空白串 = 关闭中继（统一归一化为 `None`）；
+    /// 传 `Some("host[:port]")` = 启用。改动即时生效：provider 每次请求现读此值，
+    /// client 缓存 key 带实际地址，地址一变下次请求自动重建 client（旧 client 自然弃用）。
+    ///
+    /// 锁全程持有以串行化并发写：读 previous → 写 value → persist → 失败回滚。
+    pub fn set_relay_host(&self, value: Option<String>) -> anyhow::Result<()> {
+        // 归一化：trim 后空串视为关闭。
+        let normalized = value
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let mut guard = self.relay_host.lock();
+        let previous = guard.clone();
+        *guard = normalized.clone();
+
+        if let Err(e) = self.persist_relay_host(normalized.as_deref()) {
+            *guard = previous;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn persist_relay_host(&self, value: Option<&str>) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!(
+                    "配置文件路径未知，上游中继地址仅在当前进程生效: {:?}",
+                    value
+                );
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.relay_host = value.map(str::to_string);
+        config
+            .save()
+            .with_context(|| format!("持久化上游中继地址失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
     /// 获取全局默认并发上限（Admin API）
     pub fn get_default_concurrency_limit(&self) -> Option<u32> {
         *self.default_concurrency_limit.lock()
@@ -4333,6 +4393,42 @@ mod tests {
         let persisted = Config::load(&config_path).unwrap();
         assert_eq!(persisted.load_balancing_mode, "balanced");
         assert_eq!(manager.get_load_balancing_mode(), "balanced");
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn test_set_relay_host_persists_and_normalizes() {
+        let config_path = std::env::temp_dir()
+            .join(format!("kiro-relay-host-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&config_path, r#"{"relayHost":"old.example.com:443"}"#).unwrap();
+
+        let config = Config::load(&config_path).unwrap();
+        // 初始化自 config.relay_host
+        assert_eq!(config.relay_host.as_deref(), Some("old.example.com:443"));
+        let manager = MultiTokenManager::new(
+            config,
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(manager.get_relay_host().as_deref(), Some("old.example.com:443"));
+
+        // 设置新地址：即时生效 + 落盘
+        manager
+            .set_relay_host(Some("new.example.com".to_string()))
+            .unwrap();
+        assert_eq!(manager.get_relay_host().as_deref(), Some("new.example.com"));
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.relay_host.as_deref(), Some("new.example.com"));
+
+        // 空白串归一化为 None（关闭中继）+ 落盘清空
+        manager.set_relay_host(Some("   ".to_string())).unwrap();
+        assert_eq!(manager.get_relay_host(), None);
+        let persisted = Config::load(&config_path).unwrap();
+        assert_eq!(persisted.relay_host, None);
 
         std::fs::remove_file(&config_path).unwrap();
     }

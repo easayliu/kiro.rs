@@ -23,10 +23,10 @@ use super::types::{
     CacheSkipRateResponse, CredentialStatusItem,
     CredentialsStatusResponse, DefaultConcurrencyLimitResponse, DefaultRpmLimitResponse,
     GlobalCacheResponse, ModelsResponse, OutputMultiplierResponse, SetOutputMultiplierRequest,
-    LoadBalancingModeResponse, ProxyGroupsResponse, SetCacheSkipRateRequest,
+    LoadBalancingModeResponse, ProxyGroupsResponse, RelayHostResponse, SetCacheSkipRateRequest,
     SetCredentialGroupRequest, SetDefaultConcurrencyLimitRequest, SetDefaultRpmLimitRequest,
     SetGlobalCacheRequest,
-    SetLoadBalancingModeRequest, UpsertProxyGroupRequest,
+    SetLoadBalancingModeRequest, SetRelayHostRequest, UpsertProxyGroupRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -424,6 +424,27 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    /// 获取上游中继地址
+    pub fn get_relay_host(&self) -> RelayHostResponse {
+        RelayHostResponse {
+            relay_host: self.token_manager.get_relay_host(),
+        }
+    }
+
+    /// 设置上游中继地址；传 null/空串关闭中继。即时生效并持久化到 config.json。
+    pub fn set_relay_host(
+        &self,
+        req: SetRelayHostRequest,
+    ) -> Result<RelayHostResponse, AdminServiceError> {
+        self.token_manager
+            .set_relay_host(req.relay_host)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(RelayHostResponse {
+            relay_host: self.token_manager.get_relay_host(),
+        })
     }
 
     /// 获取全局缓存模式
