@@ -6,7 +6,6 @@
 
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -97,12 +96,8 @@ impl KiroProvider {
     fn client_for(&self, credentials: &KiroCredentials, use_relay: bool) -> anyhow::Result<Client> {
         let groups = self.token_manager.proxy_groups_snapshot();
         let effective = credentials.effective_proxy(self.global_proxy.as_ref(), &groups);
-        // 仅当确实拿到中继地址时才构建中继 Client（否则退化为直连缓存槽，避免空跑）。
-        let relay = if use_relay {
-            self.relay_resolve_for(credentials)
-        } else {
-            None
-        };
+        // 仅当确实配了中继地址时才构建中继 Client（否则退化为直连缓存槽，避免空跑）。
+        let relay = if use_relay { self.relay_authority() } else { None };
         let key = (effective.clone(), relay.is_some());
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&key) {
@@ -111,9 +106,10 @@ impl KiroProvider {
 
         // cache miss：首次为该(代理, 中继)组合构建 client，记一条 INFO 日志
         let source = resolve_proxy_source(credentials, &groups, self.global_proxy.is_some());
+        // 注：下方 "直连/代理" 指 HTTP 代理维度；中继是独立维度，开启时上游连接经此 NLB 转发。
         let relay_note = relay
             .as_ref()
-            .map(|(h, a)| format!("，中继 {} → {:?}", h, a))
+            .map(|a| format!("；上游经中继 {}（每次连接现解析其 IP，连不通自动降级直连）", a))
             .unwrap_or_default();
         match &effective {
             Some(p) => tracing::info!(
@@ -134,11 +130,11 @@ impl KiroProvider {
         }
 
         let client = match &relay {
-            Some((host, addrs)) => build_client_with_resolve(
+            Some(authority) => build_client_with_resolve(
                 effective.as_ref(),
                 720,
                 self.tls_backend,
-                Some((host.as_str(), addrs)),
+                Some(authority.as_str()),
             )?,
             None => build_client(effective.as_ref(), 720, self.tls_backend)?,
         };
@@ -146,35 +142,18 @@ impl KiroProvider {
         Ok(client)
     }
 
-    /// 解析中继地址：把 API host 的连接定向到 `config.relay_host`。
+    /// 中继地址 `host:port`（来自 `config.relay_host`，默认端口 443）。未配置 / 为空时返回 `None`。
     ///
-    /// 返回 `Some((api_host, addrs))` 表示该走中继；relay_host 未配置 / 为空 / 解析失败时返回
-    /// `None`（退化为直连）。relay_host 可为 IP 或 DNS 名，可带 `:port`，默认 443。
-    /// 注：解析结果随 Client 缓存固定，relay_host 若为 DNS 名且其 IP 变动，需重启或清缓存。
-    fn relay_resolve_for(&self, credentials: &KiroCredentials) -> Option<(String, Vec<SocketAddr>)> {
+    /// 只返回地址字符串、不在此解析 DNS —— 实际解析由 `RelayResolver` 在每次连接时现场完成，
+    /// 故中继域名（如 NLB DNS）的 IP 变更会被自动跟上，无需重启或清缓存。
+    fn relay_authority(&self) -> Option<String> {
         let config = self.token_manager.config();
         let relay = config.relay_host.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
-        let host = self.base_domain_for(credentials);
-        let target = if relay.contains(':') {
+        Some(if relay.contains(':') {
             relay.to_string()
         } else {
             format!("{relay}:443")
-        };
-        match target.to_socket_addrs() {
-            Ok(iter) => {
-                let addrs: Vec<SocketAddr> = iter.collect();
-                if addrs.is_empty() {
-                    tracing::warn!("中继地址 {} 解析为空，降级直连", target);
-                    None
-                } else {
-                    Some((host, addrs))
-                }
-            }
-            Err(e) => {
-                tracing::warn!("中继地址 {} 解析失败（{}），降级直连", target, e);
-                None
-            }
-        }
+        })
     }
 
     /// 获取凭据级 API 基础 URL
@@ -751,9 +730,9 @@ impl KiroProvider {
                 "application/json"
             };
 
-            // 中继：配置了 relay_host 且未降级、且为非 runtime 端点时走中继；连接失败会降级。
+            // 中继：配置了 relay_host 且未降级即走中继（runtime/q 两端点的 NLB 证书均有效，
+            // 实测 NLB 同时前置 q 与 runtime 域名）；连接失败时本次请求后续轮次自动降级直连。
             let relay_use = !relay_degraded
-                && !is_runtime
                 && config
                     .relay_host
                     .as_deref()

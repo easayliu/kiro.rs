@@ -2,11 +2,37 @@
 //!
 //! 提供统一的 HTTP Client 构建功能，支持代理配置
 
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{Client, Proxy};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::model::config::TlsBackend;
+
+/// 中继 DNS resolver：把上游 host 的解析重定向到中继域名（NLB 等），且**每次连接现场解析**
+/// 中继域名 —— 这样中继/NLB 的 IP 变更后下次连接自动跟上，避免固定 IP 失效。
+/// SNI / Host 仍是上游 host（reqwest 用请求 URL 的 host 做 SNI），故后端需对该 host 持有有效证书。
+#[derive(Debug)]
+struct RelayResolver {
+    /// 中继地址 `host:port`（如 `kiro-xxx.elb.us-east-1.amazonaws.com:443`）
+    authority: String,
+}
+
+impl Resolve for RelayResolver {
+    fn resolve(&self, _name: Name) -> Resolving {
+        let authority = self.authority.clone();
+        Box::pin(async move {
+            match tokio::net::lookup_host(authority.as_str()).await {
+                Ok(iter) => {
+                    let addrs: Addrs = Box::new(iter.collect::<Vec<SocketAddr>>().into_iter());
+                    Ok(addrs)
+                }
+                Err(e) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+            }
+        })
+    }
+}
 
 /// 代理配置
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -100,15 +126,16 @@ pub fn build_client(
     build_client_with_resolve(proxy, timeout_secs, tls_backend, None)
 }
 
-/// 构建 HTTP Client，可选 DNS 解析覆盖。
+/// 构建 HTTP Client，可选中继。
 ///
-/// `resolve = Some((host, addrs))` 时，对 `host` 的连接强制走 `addrs`，但 TLS SNI / HTTP Host
-/// 仍是 `host` —— 用于"经中继（如 NLB L4 透传）连上游、但证书/Host 仍校验原服务域名"的场景。
+/// `relay = Some("host:port")` 时安装 [`RelayResolver`]：上游 host 的连接被定向到中继地址，
+/// 中继域名每次连接现场解析（IP 变更自动跟上），但 TLS SNI / HTTP Host 仍是上游 host
+/// —— 用于"经中继（如 NLB→PrivateLink）连上游、证书/Host 仍校验原服务域名"的场景。
 pub fn build_client_with_resolve(
     proxy: Option<&ProxyConfig>,
     timeout_secs: u64,
     tls_backend: TlsBackend,
-    resolve: Option<(&str, &[SocketAddr])>,
+    relay: Option<&str>,
 ) -> anyhow::Result<Client> {
     // 固定 HTTP/1.1：
     // 1. 与真实 Kiro IDE（aws-sdk-js / node）一致——抓包显示其用 HTTP/1.1 + Connection: close；
@@ -128,11 +155,12 @@ pub fn build_client_with_resolve(
         builder = builder.use_rustls_tls();
     }
 
-    // 中继：把 host 的连接定向到 addrs（SNI/Host 不变），失败时由调用方降级到直连。
-    if let Some((host, addrs)) = resolve {
-        if !addrs.is_empty() {
-            builder = builder.resolve_to_addrs(host, addrs);
-        }
+    // 中继：用自定义 resolver 把上游 host 解析到中继域名的当前 IP（SNI/Host 不变）。
+    // 连接失败时由调用方降级到直连。
+    if let Some(authority) = relay {
+        builder = builder.dns_resolver(Arc::new(RelayResolver {
+            authority: authority.to_string(),
+        }));
     }
 
     if let Some(proxy_config) = proxy {
