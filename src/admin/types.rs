@@ -353,6 +353,22 @@ pub struct SetCacheSkipRateRequest {
     pub rate: Option<f32>,
 }
 
+/// 输出 token 上报倍率响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputMultiplierResponse {
+    /// 当前倍率（>0），未启用时为 null
+    pub multiplier: Option<f32>,
+}
+
+/// 设置输出 token 上报倍率请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetOutputMultiplierRequest {
+    /// 目标倍率（>0）；传 null 表示关闭（1.0×）
+    pub multiplier: Option<f32>,
+}
+
 // ============ 代理分组管理 ============
 
 /// 单个代理分组（带 name，列表展示用）

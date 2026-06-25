@@ -15,10 +15,12 @@ use super::{
         get_all_credentials, get_billing_stats,
         get_cache_scope, get_cache_skip_rate, get_credential_balance, get_credential_models,
         get_default_concurrency_limit, get_default_rpm_limit,
-        get_global_cache, get_load_balancing_mode, get_me, get_stats_summary, get_stats_timeseries,
+        get_global_cache, get_load_balancing_mode, get_me, get_output_multiplier,
+        get_stats_summary, get_stats_timeseries,
         list_proxy_groups,
         reset_failure_count,
         set_cache_scope, set_cache_skip_rate, set_credential_concurrency_limit,
+        set_output_multiplier,
         set_credential_disabled, set_credential_group,
         set_credential_overage, set_credential_priority, set_credential_rpm_limit,
         set_default_concurrency_limit, set_default_rpm_limit, set_global_cache,
@@ -112,6 +114,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/cache-skip-rate",
             get(get_cache_skip_rate).put(set_cache_skip_rate),
+        )
+        .route(
+            "/config/output-multiplier",
+            get(get_output_multiplier).put(set_output_multiplier),
         )
         .route("/config/proxy-groups", get(list_proxy_groups))
         .route(

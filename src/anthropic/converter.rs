@@ -215,6 +215,44 @@ pub fn injected_prompt_tokens() -> i32 {
     INJECTED_PROMPT_TOKENS.load(Ordering::Relaxed)
 }
 
+/// 输出 token 上报倍率（×10000 定点存储）。0 表示未启用（等价 1.0×）。
+///
+/// 仅放大计费 / 下游上报口径的 output_tokens（official_price、统计、message usage）；
+/// 上游真实成本（actual = upstream credit）与缓存命中率均不受影响。output 本身无上游
+/// 真值兜底，故放大不破坏任何输入侧对账。由 main 启动时用配置经
+/// [`set_output_token_multiplier`] 设入，admin 可热更新。
+static OUTPUT_TOKEN_MULTIPLIER_BP: AtomicI32 = AtomicI32::new(0);
+
+/// 设置输出 token 上报倍率。`None` 或 `<=0` 视为关闭（1.0×）。
+pub fn set_output_token_multiplier(mult: Option<f32>) {
+    let bp = match mult {
+        Some(m) if m.is_finite() && m > 0.0 => ((m as f64) * 10_000.0).round() as i32,
+        _ => 0,
+    };
+    OUTPUT_TOKEN_MULTIPLIER_BP.store(bp.max(0), Ordering::Relaxed);
+}
+
+/// 当前生效的输出倍率；未启用返回 `None`。
+pub fn output_token_multiplier() -> Option<f32> {
+    let bp = OUTPUT_TOKEN_MULTIPLIER_BP.load(Ordering::Relaxed);
+    if bp <= 0 {
+        None
+    } else {
+        Some(bp as f32 / 10_000.0)
+    }
+}
+
+/// 把真实 output token 数按倍率放大为计费 / 上报值（四舍五入，保底 1）。
+/// 未启用时原样返回，保持原行为。
+pub fn apply_output_token_multiplier(true_output: i32) -> i32 {
+    let bp = OUTPUT_TOKEN_MULTIPLIER_BP.load(Ordering::Relaxed);
+    if bp <= 0 {
+        return true_output;
+    }
+    let scaled = (true_output.max(0) as i64 * bp as i64 + 5_000) / 10_000;
+    scaled.max(1) as i32
+}
+
 /// 从上游反推总量里扣掉 Kiro 注入基线，得到计费用的「内容总量」。
 ///
 /// - `context_total`：上游 `contextUsage` 反推的 input_tokens（含注入）。
@@ -2047,6 +2085,34 @@ mod tests {
         assert!((official_price_usd("claude-opus-4-8", 0, 0, 0, 1_000_000, 0) - 10.0).abs() < 1e-9);
         // Haiku cache 读 = 0.1 × $1 = $0.10 / MTok。
         assert!((official_price_usd("claude-haiku-4-5", 0, 1_000_000, 0, 0, 0) - 0.10).abs() < 1e-9);
+    }
+
+    /// 输出倍率：未启用透传；启用后四舍五入并保底 1；关闭可还原。
+    /// 仅本测试触碰该全局，set→assert→reset 顺序保证并行安全。
+    #[test]
+    fn output_token_multiplier_scales_and_rounds() {
+        // 未启用：原样返回，且 getter 为 None。
+        set_output_token_multiplier(None);
+        assert_eq!(output_token_multiplier(), None);
+        assert_eq!(apply_output_token_multiplier(123), 123);
+
+        // 1.5×：100 → 150；四舍五入（7 × 1.5 = 10.5 → 11）。
+        set_output_token_multiplier(Some(1.5));
+        assert_eq!(output_token_multiplier(), Some(1.5));
+        assert_eq!(apply_output_token_multiplier(100), 150);
+        assert_eq!(apply_output_token_multiplier(7), 11);
+
+        // 非法值（<=0 / 非有限）视为关闭。
+        set_output_token_multiplier(Some(0.0));
+        assert_eq!(output_token_multiplier(), None);
+        assert_eq!(apply_output_token_multiplier(50), 50);
+
+        // 极小倍率也保底 1，避免上报 0。
+        set_output_token_multiplier(Some(0.001));
+        assert_eq!(apply_output_token_multiplier(1), 1);
+
+        // 还原，避免污染其它测试。
+        set_output_token_multiplier(None);
     }
 
     /// 动态窗口表存在时优先用上游 maxInputTokens（按 map_model 归一化匹配），

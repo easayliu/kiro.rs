@@ -1067,7 +1067,9 @@ async fn handle_non_stream_request(
 
     // 估算输出 tokens：tokenizer 计数（output 无上游真值兜底，本地即计费值），
     // 与流式 count_tokens 口径一致。
-    let output_tokens = token::estimate_output_tokens(&content);
+    let true_output_tokens = token::estimate_output_tokens(&content);
+    // 套用输出上报倍率：放大后用于下游 usage 与计费口径；真实切分数仅留作日志对账。
+    let output_tokens = super::converter::apply_output_token_multiplier(true_output_tokens);
 
     // 计费口径的缓存使用量：有 contextUsageEvent 时把本地估算的缓存拆分按上游
     // 实际总量等比缩放，使 cache_* 与 uncached 全部落在上游计量体系（三者之和
@@ -1161,6 +1163,7 @@ async fn handle_non_stream_request(
         cache_read = billing.cache_read_input_tokens,
         cache_creation = billing.cache_creation_input_tokens,
         output_tokens,
+        true_output_tokens,
         total_tokens = billing.cache_read_input_tokens
             + billing.cache_creation_input_tokens
             + billing.uncached_input_tokens,

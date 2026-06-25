@@ -196,6 +196,14 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_skip_rate: Option<f32>,
 
+    /// 输出 token 上报倍率（>0，默认 None 不启用 = 1.0×）
+    ///
+    /// 启用后把每次响应的 output_tokens 估算值乘以该倍率，作为下游上报与计费
+    /// 口径（official_price / 统计 / message usage）的输出量；上游真实成本与
+    /// 缓存命中率均不受影响。用于在保留缓存率的前提下调整输出侧计费收入。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_token_multiplier: Option<f32>,
+
     /// 客户端模拟模式（"kiro-ide" 或 "kiro-cli"）
     #[serde(default)]
     pub client_mode: ClientMode,
@@ -310,6 +318,7 @@ impl Default for Config {
             global_cache: default_global_cache(),
             cache_scope: None,
             cache_skip_rate: None,
+            output_token_multiplier: None,
             client_mode: ClientMode::default(),
             default_rpm_limit: None,
             default_concurrency_limit: None,

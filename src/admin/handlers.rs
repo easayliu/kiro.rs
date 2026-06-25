@@ -13,7 +13,7 @@ use super::{
         BatchSetCredentialGroupRequest,
         BatchSetDisabledRequest,
         BatchSetOverageRequest, BatchSetPriorityRequest, BatchSetRpmLimitRequest, MeResponse,
-        SetCacheSkipRateRequest, SetConcurrencyLimitRequest,
+        SetCacheSkipRateRequest, SetConcurrencyLimitRequest, SetOutputMultiplierRequest,
         SetCredentialGroupRequest, SetDefaultConcurrencyLimitRequest, SetDefaultRpmLimitRequest,
         SetDisabledRequest,
         SetGlobalCacheRequest, SetLoadBalancingModeRequest, SetOverageRequest, SetPriorityRequest,
@@ -369,6 +369,25 @@ pub async fn set_cache_skip_rate(
     Json(payload): Json<SetCacheSkipRateRequest>,
 ) -> impl IntoResponse {
     match state.service.set_cache_skip_rate(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/output-multiplier
+/// 获取输出 token 上报倍率
+pub async fn get_output_multiplier(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_output_multiplier();
+    Json(response)
+}
+
+/// PUT /api/admin/config/output-multiplier
+/// 设置输出 token 上报倍率（>0，传 null 关闭 = 1.0×）
+pub async fn set_output_multiplier(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetOutputMultiplierRequest>,
+) -> impl IntoResponse {
+    match state.service.set_output_multiplier(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

@@ -23,6 +23,8 @@ import {
   setCacheScope,
   getCacheSkipRate,
   setCacheSkipRate,
+  getOutputMultiplier,
+  setOutputMultiplier,
   listProxyGroups,
   upsertProxyGroup,
   deleteProxyGroup,
@@ -282,6 +284,25 @@ export function useSetCacheSkipRate() {
     mutationFn: setCacheSkipRate,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['cacheSkipRate'] })
+    },
+  })
+}
+
+// 获取输出 token 上报倍率
+export function useOutputMultiplier() {
+  return useQuery({
+    queryKey: ['outputMultiplier'],
+    queryFn: getOutputMultiplier,
+  })
+}
+
+// 设置输出 token 上报倍率
+export function useSetOutputMultiplier() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setOutputMultiplier,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['outputMultiplier'] })
     },
   })
 }

@@ -211,6 +211,9 @@ async fn main() {
     // 计费扣除 Kiro 服务端注入的固定提示词基线（终端用户只按真实内容计费）。
     anthropic::set_injected_prompt_tokens(config.kiro_injected_prompt_tokens);
 
+    // 输出 token 上报倍率（仅放大计费/上报口径，上游真实成本与缓存命中率不变）。
+    anthropic::set_output_token_multiplier(config.output_token_multiplier);
+
     // 解析缓存分桶策略：cache_scope 优先，否则回落到 global_cache 布尔
     let cache_scope = match config.cache_scope.as_deref() {
         Some(s) => anthropic::CacheScope::parse(s),

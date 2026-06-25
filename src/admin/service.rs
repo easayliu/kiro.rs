@@ -22,7 +22,7 @@ use super::types::{
     BatchSetConcurrencyLimitRequest, BatchSetConcurrencyLimitResponse,
     CacheSkipRateResponse, CredentialStatusItem,
     CredentialsStatusResponse, DefaultConcurrencyLimitResponse, DefaultRpmLimitResponse,
-    GlobalCacheResponse, ModelsResponse,
+    GlobalCacheResponse, ModelsResponse, OutputMultiplierResponse, SetOutputMultiplierRequest,
     LoadBalancingModeResponse, ProxyGroupsResponse, SetCacheSkipRateRequest,
     SetCredentialGroupRequest, SetDefaultConcurrencyLimitRequest, SetDefaultRpmLimitRequest,
     SetGlobalCacheRequest,
@@ -541,6 +541,48 @@ impl AdminService {
         }
 
         Ok(CacheSkipRateResponse { rate: req.rate })
+    }
+
+    /// 获取输出 token 上报倍率
+    pub fn get_output_multiplier(&self) -> OutputMultiplierResponse {
+        OutputMultiplierResponse {
+            multiplier: crate::anthropic::output_token_multiplier(),
+        }
+    }
+
+    /// 设置输出 token 上报倍率
+    pub fn set_output_multiplier(
+        &self,
+        req: SetOutputMultiplierRequest,
+    ) -> Result<OutputMultiplierResponse, AdminServiceError> {
+        if let Some(m) = req.multiplier {
+            if !m.is_finite() || m <= 0.0 || m > 100.0 {
+                return Err(AdminServiceError::InvalidParameter(format!(
+                    "输出 token 倍率必须在 (0, 100] 之间，收到: {}",
+                    m
+                )));
+            }
+        }
+
+        crate::anthropic::set_output_token_multiplier(req.multiplier);
+
+        if let Some(config_path) = self.token_manager.config().config_path() {
+            match crate::model::config::Config::load(config_path) {
+                Ok(mut config) => {
+                    config.output_token_multiplier = req.multiplier;
+                    if let Err(e) = config.save() {
+                        tracing::warn!("保存输出 token 倍率失败: {}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("加载配置文件失败: {}", e);
+                }
+            }
+        }
+
+        Ok(OutputMultiplierResponse {
+            multiplier: req.multiplier,
+        })
     }
 
     /// 强制刷新指定凭据的 Token

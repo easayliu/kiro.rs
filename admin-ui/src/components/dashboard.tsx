@@ -54,6 +54,8 @@ import {
   useSetCacheScope,
   useCacheSkipRate,
   useSetCacheSkipRate,
+  useOutputMultiplier,
+  useSetOutputMultiplier,
   useIsReadOnly,
   useBatchSetPriority,
   useBatchSetRpmLimit,
@@ -278,6 +280,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: setCacheSkipRateMutation, isPending: isSettingCacheSkipRate } = useSetCacheSkipRate()
   const [cacheSkipRateDialogOpen, setCacheSkipRateDialogOpen] = useState(false)
   const [cacheSkipRateInput, setCacheSkipRateInput] = useState('')
+  const { data: outputMultiplierData, isLoading: isLoadingOutputMultiplier } = useOutputMultiplier()
+  const { mutate: setOutputMultiplierMutation, isPending: isSettingOutputMultiplier } = useSetOutputMultiplier()
+  const [outputMultiplierDialogOpen, setOutputMultiplierDialogOpen] = useState(false)
+  const [outputMultiplierInput, setOutputMultiplierInput] = useState('')
 
   const allCreds = data?.credentials || []
   const totalCount = data?.total || 0
@@ -878,6 +884,34 @@ export function Dashboard({ onLogout }: DashboardProps) {
       onSuccess: () => {
         toast.success(rate == null ? '已关闭缓存跳过率' : `已设置跳过率为 ${(rate * 100).toFixed(0)}%`)
         setCacheSkipRateDialogOpen(false)
+      },
+      onError: err => toast.error(`设置失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
+  const handleOpenOutputMultiplierDialog = () => {
+    const current = outputMultiplierData?.multiplier
+    setOutputMultiplierInput(current == null ? '' : String(current))
+    setOutputMultiplierDialogOpen(true)
+  }
+
+  const handleSaveOutputMultiplier = () => {
+    if (isSettingOutputMultiplier) return
+    const trimmed = outputMultiplierInput.trim()
+    let multiplier: number | null
+    if (trimmed === '') multiplier = null
+    else {
+      const parsed = Number(trimmed)
+      if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 100) {
+        toast.error('请输入 0 - 100 之间的倍率（留空表示关闭 = 1.0×）')
+        return
+      }
+      multiplier = parsed
+    }
+    setOutputMultiplierMutation(multiplier, {
+      onSuccess: () => {
+        toast.success(multiplier == null ? '已关闭输出倍率' : `已设置输出倍率为 ${multiplier}×`)
+        setOutputMultiplierDialogOpen(false)
       },
       onError: err => toast.error(`设置失败: ${extractErrorMessage(err)}`),
     })
@@ -1596,6 +1630,18 @@ export function Dashboard({ onLogout }: DashboardProps) {
               onClick={() => { setPoliciesOpen(false); handleOpenCacheSkipRateDialog() }}
             />
             <PolicyRow
+              label="输出倍率"
+              sub={outputMultiplierData?.multiplier == null ? '按真实切分计费' : '放大输出计费/上报量'}
+              value={
+                isLoadingOutputMultiplier ? '—'
+                : outputMultiplierData?.multiplier == null ? '关闭'
+                : `${outputMultiplierData.multiplier}×`
+              }
+              loading={isLoadingOutputMultiplier}
+              disabled={isLoadingOutputMultiplier || isSettingOutputMultiplier}
+              onClick={() => { setPoliciesOpen(false); handleOpenOutputMultiplierDialog() }}
+            />
+            <PolicyRow
               label="负载均衡"
               sub={loadBalancingData?.mode === 'balanced' ? 'LRU · 最久未使用优先' : '固定最高优先级'}
               value={loadBalancingData?.mode === 'balanced' ? 'LRU 均衡' : '优先级'}
@@ -1985,6 +2031,41 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Button>
             <Button onClick={handleSaveCacheSkipRate} disabled={isSettingCacheSkipRate}>
               {isSettingCacheSkipRate ? '保存中…' : '保存'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={outputMultiplierDialogOpen} onOpenChange={setOutputMultiplierDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>输出 token 上报倍率</DialogTitle>
+            <DialogDescription>
+              输入 &gt;0 的倍率，放大下游上报与计费口径的 output_tokens（不影响上游成本与缓存命中率）。留空表示关闭（1.0×）。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 py-2">
+            <Input
+              type="number"
+              min={0}
+              max={100}
+              step={0.1}
+              placeholder="例如 1.2；留空关闭"
+              value={outputMultiplierInput}
+              onChange={e => setOutputMultiplierInput(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') handleSaveOutputMultiplier() }}
+              autoFocus
+            />
+            <p className="font-mono text-2xs uppercase tracking-wider text-muted-foreground">
+              当前：{outputMultiplierData?.multiplier == null ? '关闭' : `${outputMultiplierData.multiplier}×`}
+            </p>
+          </div>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button variant="outline" onClick={() => setOutputMultiplierInput('')} disabled={isSettingOutputMultiplier}>
+              清空
+            </Button>
+            <Button onClick={handleSaveOutputMultiplier} disabled={isSettingOutputMultiplier}>
+              {isSettingOutputMultiplier ? '保存中…' : '保存'}
             </Button>
           </DialogFooter>
         </DialogContent>

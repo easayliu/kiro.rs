@@ -34,5 +34,8 @@ mod websearch;
 
 pub use billing_stats::{global as billing_stats, init_persistence as init_billing_stats};
 pub use cache_tracker::{CacheScope, CacheTracker};
-pub use converter::{map_model, set_dynamic_model_windows, set_injected_prompt_tokens};
+pub use converter::{
+    map_model, output_token_multiplier, set_dynamic_model_windows, set_injected_prompt_tokens,
+    set_output_token_multiplier,
+};
 pub use router::create_router_with_provider;

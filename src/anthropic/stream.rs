@@ -1487,7 +1487,10 @@ impl StreamContext {
         // 输出 token 计数：对整段输出文本（thinking+正文+tool 入参）做一次 tokenizer
         // 计数（整串切分，避免逐 chunk 在 BPE 边界处的系统性偏差）。output 无上游真值
         // 兜底，本地 DeepSeek 切分数即最终上报/计费值。保底 1。
-        self.output_tokens = (crate::token::count_tokens(&self.output_buf) as i32).max(1);
+        let true_output_tokens = (crate::token::count_tokens(&self.output_buf) as i32).max(1);
+        // 套用输出上报倍率：放大后的值用于下游 usage 与计费口径（official_price/统计）；
+        // 真实切分数仅留作日志对账。未启用倍率时二者相等。
+        self.output_tokens = super::converter::apply_output_token_multiplier(true_output_tokens);
 
         let actual = credit_to_usd(self.upstream_credit.unwrap_or(0.0));
         let official = official_price_usd(
@@ -1533,6 +1536,7 @@ impl StreamContext {
             cache_read = billing.cache_read_input_tokens,
             cache_creation = billing.cache_creation_input_tokens,
             output_tokens = self.output_tokens,
+            true_output_tokens = true_output_tokens,
             total_tokens = billing.cache_read_input_tokens
                 + billing.cache_creation_input_tokens
                 + billing.uncached_input_tokens,

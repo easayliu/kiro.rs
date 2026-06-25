@@ -223,6 +223,22 @@ export async function setCacheSkipRate(rate: number | null): Promise<{ rate: num
   return data
 }
 
+// 获取输出 token 上报倍率
+export async function getOutputMultiplier(): Promise<{ multiplier: number | null }> {
+  const { data } = await api.get<{ multiplier: number | null }>('/config/output-multiplier')
+  return data
+}
+
+// 设置输出 token 上报倍率（>0，传 null 关闭 = 1.0×）
+export async function setOutputMultiplier(
+  multiplier: number | null,
+): Promise<{ multiplier: number | null }> {
+  const { data } = await api.put<{ multiplier: number | null }>('/config/output-multiplier', {
+    multiplier,
+  })
+  return data
+}
+
 // ============ 代理分组管理 ============
 
 export async function listProxyGroups(): Promise<ProxyGroupsResponse> {
