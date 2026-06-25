@@ -3,6 +3,7 @@
 //! 提供统一的 HTTP Client 构建功能，支持代理配置
 
 use reqwest::{Client, Proxy};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::model::config::TlsBackend;
@@ -96,6 +97,19 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
+    build_client_with_resolve(proxy, timeout_secs, tls_backend, None)
+}
+
+/// 构建 HTTP Client，可选 DNS 解析覆盖。
+///
+/// `resolve = Some((host, addrs))` 时，对 `host` 的连接强制走 `addrs`，但 TLS SNI / HTTP Host
+/// 仍是 `host` —— 用于"经中继（如 NLB L4 透传）连上游、但证书/Host 仍校验原服务域名"的场景。
+pub fn build_client_with_resolve(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+    resolve: Option<(&str, &[SocketAddr])>,
+) -> anyhow::Result<Client> {
     // 固定 HTTP/1.1：
     // 1. 与真实 Kiro IDE（aws-sdk-js / node）一致——抓包显示其用 HTTP/1.1 + Connection: close；
     // 2. 规避上游 HTTP/2 在传 body 中途发 RST_STREAM(INTERNAL_ERROR) 导致的
@@ -112,6 +126,13 @@ pub fn build_client(
 
     if tls_backend == TlsBackend::Rustls {
         builder = builder.use_rustls_tls();
+    }
+
+    // 中继：把 host 的连接定向到 addrs（SNI/Host 不变），失败时由调用方降级到直连。
+    if let Some((host, addrs)) = resolve {
+        if !addrs.is_empty() {
+            builder = builder.resolve_to_addrs(host, addrs);
+        }
     }
 
     if let Some(proxy_config) = proxy {

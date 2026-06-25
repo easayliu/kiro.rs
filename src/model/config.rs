@@ -229,6 +229,13 @@ pub struct Config {
     #[serde(default = "default_kiro_cli_version")]
     pub kiro_cli_version: String,
 
+    /// 上游中继地址（NLB DNS 名或 IP，可选 `:port`，默认 443）。设置后，对 API host
+    /// （`apiHostTemplate` 解析出的域名，如 `q.{region}.amazonaws.com`）的连接会被定向到此地址，
+    /// 但 SNI/Host 保持原域名 —— 适用于经 NLB→PrivateLink 中继优化到 AWS 的入口路由。
+    /// 中继连接失败时自动降级到公网直连（见 provider 调用循环）。仅作用于非 runtime 端点。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_host: Option<String>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -323,6 +330,7 @@ impl Default for Config {
             default_rpm_limit: None,
             default_concurrency_limit: None,
             kiro_cli_version: default_kiro_cli_version(),
+            relay_host: None,
             config_path: None,
         }
     }

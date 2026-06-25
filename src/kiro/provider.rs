@@ -6,12 +6,13 @@
 
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_client, build_client_with_resolve};
 use crate::kiro::errors::{UpstreamBodyError, UpstreamHttpError};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -56,9 +57,10 @@ pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
     /// 全局代理配置（用于凭据无自定义代理时的回退）
     global_proxy: Option<ProxyConfig>,
-    /// Client 缓存：key = effective proxy config, value = reqwest::Client
-    /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
-    client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
+    /// Client 缓存：key = (effective proxy config, 是否走中继), value = reqwest::Client
+    /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client；
+    /// 中继与直连各缓存一份（中继 Client 带 DNS 解析覆盖）。
+    client_cache: Mutex<HashMap<(Option<ProxyConfig>, bool), Client>>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
 }
@@ -81,7 +83,7 @@ impl KiroProvider {
         let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
             .expect("创建 HTTP 客户端失败");
         let mut cache = HashMap::new();
-        cache.insert(proxy.clone(), initial_client);
+        cache.insert((proxy.clone(), false), initial_client);
 
         Self {
             token_manager,
@@ -92,35 +94,87 @@ impl KiroProvider {
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
-    fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
+    fn client_for(&self, credentials: &KiroCredentials, use_relay: bool) -> anyhow::Result<Client> {
         let groups = self.token_manager.proxy_groups_snapshot();
         let effective = credentials.effective_proxy(self.global_proxy.as_ref(), &groups);
+        // 仅当确实拿到中继地址时才构建中继 Client（否则退化为直连缓存槽，避免空跑）。
+        let relay = if use_relay {
+            self.relay_resolve_for(credentials)
+        } else {
+            None
+        };
+        let key = (effective.clone(), relay.is_some());
         let mut cache = self.client_cache.lock();
-        if let Some(client) = cache.get(&effective) {
+        if let Some(client) = cache.get(&key) {
             return Ok(client.clone());
         }
 
-        // cache miss：首次为该代理组合构建 client，记一条 INFO 日志
+        // cache miss：首次为该(代理, 中继)组合构建 client，记一条 INFO 日志
         let source = resolve_proxy_source(credentials, &groups, self.global_proxy.is_some());
+        let relay_note = relay
+            .as_ref()
+            .map(|(h, a)| format!("，中继 {} → {:?}", h, a))
+            .unwrap_or_default();
         match &effective {
             Some(p) => tracing::info!(
-                "代理路由建立: credential #{} ({}) → {} [来源: {}]",
+                "代理路由建立: credential #{} ({}) → {} [来源: {}]{}",
                 credentials.id.unwrap_or(0),
                 credentials.email.as_deref().unwrap_or("-"),
                 p.url,
                 source,
+                relay_note,
             ),
             None => tracing::info!(
-                "代理路由建立: credential #{} ({}) → 直连 [来源: {}]",
+                "代理路由建立: credential #{} ({}) → 直连 [来源: {}]{}",
                 credentials.id.unwrap_or(0),
                 credentials.email.as_deref().unwrap_or("-"),
                 source,
+                relay_note,
             ),
         }
 
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
-        cache.insert(effective, client.clone());
+        let client = match &relay {
+            Some((host, addrs)) => build_client_with_resolve(
+                effective.as_ref(),
+                720,
+                self.tls_backend,
+                Some((host.as_str(), addrs)),
+            )?,
+            None => build_client(effective.as_ref(), 720, self.tls_backend)?,
+        };
+        cache.insert(key, client.clone());
         Ok(client)
+    }
+
+    /// 解析中继地址：把 API host 的连接定向到 `config.relay_host`。
+    ///
+    /// 返回 `Some((api_host, addrs))` 表示该走中继；relay_host 未配置 / 为空 / 解析失败时返回
+    /// `None`（退化为直连）。relay_host 可为 IP 或 DNS 名，可带 `:port`，默认 443。
+    /// 注：解析结果随 Client 缓存固定，relay_host 若为 DNS 名且其 IP 变动，需重启或清缓存。
+    fn relay_resolve_for(&self, credentials: &KiroCredentials) -> Option<(String, Vec<SocketAddr>)> {
+        let config = self.token_manager.config();
+        let relay = config.relay_host.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+        let host = self.base_domain_for(credentials);
+        let target = if relay.contains(':') {
+            relay.to_string()
+        } else {
+            format!("{relay}:443")
+        };
+        match target.to_socket_addrs() {
+            Ok(iter) => {
+                let addrs: Vec<SocketAddr> = iter.collect();
+                if addrs.is_empty() {
+                    tracing::warn!("中继地址 {} 解析为空，降级直连", target);
+                    None
+                } else {
+                    Some((host, addrs))
+                }
+            }
+            Err(e) => {
+                tracing::warn!("中继地址 {} 解析失败（{}），降级直连", target, e);
+                None
+            }
+        }
     }
 
     /// 获取凭据级 API 基础 URL
@@ -370,7 +424,7 @@ impl KiroProvider {
             params.push(("profileArn", arn));
         }
 
-        let mut request = self.client_for(&ctx.credentials)?.get(&url).query(&params);
+        let mut request = self.client_for(&ctx.credentials, false)?.get(&url).query(&params);
         if ctx.credentials.is_api_key_credential() {
             request = request.header("tokentype", "API_KEY");
         }
@@ -464,9 +518,9 @@ impl KiroProvider {
             let x_amz_user_agent = config.streaming_x_amz_user_agent(&machine_id, mode);
             let user_agent = config.streaming_user_agent(&machine_id, mode);
 
-            // 发送请求
+            // 发送请求（MCP 暂不走中继）
             let mut request = self
-                .client_for(&ctx.credentials)?
+                .client_for(&ctx.credentials, false)?
                 .post(&url)
                 .body(request_body.to_string())
                 .header("content-type", "application/json");
@@ -636,6 +690,8 @@ impl KiroProvider {
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
+        // 中继降级标志：一旦中继连接失败，本次请求后续轮次改走公网直连。
+        let mut relay_degraded = false;
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
@@ -695,8 +751,17 @@ impl KiroProvider {
                 "application/json"
             };
 
+            // 中继：配置了 relay_host 且未降级、且为非 runtime 端点时走中继；连接失败会降级。
+            let relay_use = !relay_degraded
+                && !is_runtime
+                && config
+                    .relay_host
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|s| !s.is_empty());
+
             let mut request = self
-                .client_for(&ctx.credentials)?
+                .client_for(&ctx.credentials, relay_use)?
                 .post(&url)
                 .body(outbound_body.clone())
                 .header("content-type", content_type)
@@ -732,6 +797,19 @@ impl KiroProvider {
             {
                 Ok(resp) => resp,
                 Err(e) => {
+                    // 走中继时连接失败 → 立即降级公网直连重试（不计退避、不切凭据），
+                    // 实现"中继不通就降级到公开地址"。后续轮次 relay_use 自动为 false。
+                    if relay_use && !relay_degraded {
+                        relay_degraded = true;
+                        tracing::warn!(
+                            "中继连接失败（尝试 {}/{}），降级公网直连重试: {}",
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        last_error = Some(e.into());
+                        continue;
+                    }
                     tracing::warn!(
                         "API 请求发送失败（尝试 {}/{}）: {}",
                         attempt + 1,
