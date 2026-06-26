@@ -114,7 +114,8 @@ fn extract_inline_userinfo(url: &str) -> Option<(String, String, String)> {
 ///
 /// # Arguments
 /// * `proxy` - 可选的代理配置
-/// * `timeout_secs` - 超时时间（秒）
+/// * `timeout_secs` - 空闲读超时（秒）：上游在该时长内无任何新字节才超时；
+///   非绝对总时限，健康的长流不受总时长限制。
 ///
 /// # Returns
 /// 配置好的 reqwest::Client
@@ -146,8 +147,19 @@ pub fn build_client_with_resolve(
     // NAT/防火墙/边缘会按 ~4 分钟 idle 上限把空闲 TLS 连接丢弃，rustls 随即报
     // "peer closed connection without sending TLS close_notify"，表现为回复中途截断。
     // 设 30s 首探针间隔（远小于观测到的 ~240s 截断点），空闲期持续产生探针保活。
+    //
+    // 超时策略：用 read_timeout（空闲读超时）而非 timeout（绝对总时限）。
+    // reqwest 的 `.timeout()` 是从请求起算的绝对 deadline，且对 `bytes_stream()` 的
+    // 流式读取同样生效——哪怕数据一直在健康流动，整条流累计超过该值就会在流中途被掐断
+    // （stop_reason 缺失、无 [DONE]，表现为回复截断）。长生成（如接近 128k 输出，
+    // 按 ~50 tok/s 约需 40min）会被这道墙拦在 ~timeout 处。
+    // `.read_timeout()` 改为"每次读操作的间隔超时、成功读一次即重置"：只在上游真正卡住
+    // （在 timeout_secs 内没有任何新字节）时才超时，健康的长流不论总时长都不受限。
+    // connect_timeout 单独给连接/TLS 握手兜底（原先这一段也靠总 timeout 兜，拆掉后需补），
+    // 顺带让连不通的端点更快故障转移。
     let mut builder = Client::builder()
-        .timeout(Duration::from_secs(timeout_secs))
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(timeout_secs))
         .tcp_keepalive(Duration::from_secs(30))
         .http1_only();
 
