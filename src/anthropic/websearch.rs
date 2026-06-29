@@ -305,8 +305,8 @@ fn generate_websearch_events(
     ));
 
     // 3. content_block_start (server_tool_use, index 1)
-    // server_tool_use 是服务端工具，input 在 content_block_start 中一次性完整发送，
-    // 不像客户端 tool_use 需要通过 input_json_delta 增量传输。
+    // 官方流式格式：server_tool_use 的 input 通过 input_json_delta 增量传输，
+    // content_block_start 中 input 为空对象，与客户端 tool_use 一致。
     events.push(SseEvent::new(
         "content_block_start",
         json!({
@@ -316,12 +316,27 @@ fn generate_websearch_events(
                 "id": tool_use_id,
                 "type": "server_tool_use",
                 "name": "web_search",
-                "input": {"query": query}
+                "input": {}
             }
         }),
     ));
 
-    // 4. content_block_stop (server_tool_use)
+    // 4. content_block_delta (input_json_delta) - 查询参数增量
+    // 标准 SDK 从空 input 起、按 partial_json 累积，缺此 delta 会重建出空 query。
+    let input_json = json!({ "query": query }).to_string();
+    events.push(SseEvent::new(
+        "content_block_delta",
+        json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": input_json
+            }
+        }),
+    ));
+
+    // 5. content_block_stop (server_tool_use)
     events.push(SseEvent::new(
         "content_block_stop",
         json!({
@@ -330,8 +345,8 @@ fn generate_websearch_events(
         }),
     ));
 
-    // 5. content_block_start (web_search_tool_result, index 2)
-    // 官方 API 的 web_search_tool_result 没有 tool_use_id 字段
+    // 6. content_block_start (web_search_tool_result, index 2)
+    // 官方格式：web_search_tool_result 带 tool_use_id，与 server_tool_use.id 对应。
     let search_content = if let Some(ref results) = search_results {
         results
             .results
@@ -361,12 +376,13 @@ fn generate_websearch_events(
             "index": 2,
             "content_block": {
                 "type": "web_search_tool_result",
+                "tool_use_id": tool_use_id,
                 "content": search_content
             }
         }),
     ));
 
-    // 6. content_block_stop (web_search_tool_result)
+    // 7. content_block_stop (web_search_tool_result)
     events.push(SseEvent::new(
         "content_block_stop",
         json!({
