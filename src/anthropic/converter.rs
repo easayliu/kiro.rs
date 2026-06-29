@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, EnvState, HistoryAssistantMessage,
-    HistoryUserMessage, KiroDocument, KiroImage, Message, UserInputMessage, UserInputMessageContext,
-    UserMessage,
+    HistoryUserMessage, KiroDocument, KiroImage, Message, ReasoningContent, UserInputMessage,
+    UserInputMessageContext, UserMessage,
 };
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
@@ -1416,6 +1416,7 @@ fn convert_assistant_message(
     tool_name_map: &mut HashMap<String, String>,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     let mut thinking_content = String::new();
+    let mut thinking_signature: Option<String> = None;
     let mut text_content = String::new();
     let mut tool_uses = Vec::new();
 
@@ -1430,6 +1431,12 @@ fn convert_assistant_message(
                         "thinking" => {
                             if let Some(thinking) = block.thinking {
                                 thinking_content.push_str(&thinking);
+                            }
+                            // 签名取最后一个非空值（与 thinking 文本对应）
+                            if let Some(sig) = block.signature {
+                                if !sig.is_empty() {
+                                    thinking_signature = Some(sig);
+                                }
                             }
                         }
                         "text" => {
@@ -1458,19 +1465,9 @@ fn convert_assistant_message(
         _ => {}
     }
 
-    // 组合 thinking 和 text 内容
-    // 格式: <thinking>思考内容</thinking>\n\ntext内容
-    // 注意: Kiro API 要求 content 字段不能为空，当只有 tool_use 时需要占位符
-    let final_content = if !thinking_content.is_empty() {
-        if !text_content.is_empty() {
-            format!(
-                "<thinking>{}</thinking>\n\n{}",
-                thinking_content, text_content
-            )
-        } else {
-            format!("<thinking>{}</thinking>", thinking_content)
-        }
-    } else if text_content.is_empty() && !tool_uses.is_empty() {
+    // content 只放最终文本，thinking 走独立 reasoningContent 字段（对齐 Kiro 抓包，
+    // 不再用 <thinking> 标签内联）。Kiro API 要求 content 非空，仅 tool_use 时占位。
+    let final_content = if text_content.is_empty() && !tool_uses.is_empty() {
         " ".to_string()
     } else {
         text_content
@@ -1479,6 +1476,12 @@ fn convert_assistant_message(
     let mut assistant = AssistantMessage::new(final_content);
     if !tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(tool_uses);
+    }
+    // 仅在签名存在时回传 reasoningContent：无签名无法通过上游校验，宁可不带。
+    if !thinking_content.is_empty() {
+        if let Some(sig) = thinking_signature {
+            assistant = assistant.with_reasoning_content(thinking_content, sig);
+        }
     }
 
     Ok(HistoryAssistantMessage {
@@ -1499,6 +1502,8 @@ fn merge_assistant_messages(
 
     let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
+    // 合并轮取第一个带签名的 reasoningContent（每条 assistantResponseMessage 仅一份）
+    let mut reasoning: Option<ReasoningContent> = None;
 
     for msg in messages {
         let converted = convert_assistant_message(msg, tool_name_map)?;
@@ -1508,6 +1513,9 @@ fn merge_assistant_messages(
         }
         if let Some(tus) = am.tool_uses {
             all_tool_uses.extend(tus);
+        }
+        if reasoning.is_none() {
+            reasoning = am.reasoning_content;
         }
     }
 
@@ -1521,6 +1529,7 @@ fn merge_assistant_messages(
     if !all_tool_uses.is_empty() {
         assistant = assistant.with_tool_uses(all_tool_uses);
     }
+    assistant.reasoning_content = reasoning;
     Ok(HistoryAssistantMessage {
         assistant_response_message: assistant,
     })
@@ -3507,12 +3516,50 @@ mod tests {
         let result = merge_assistant_messages(&messages, &mut HashMap::new()).expect("合并应成功");
 
         let content = &result.assistant_response_message.content;
-        assert!(content.contains("<thinking>"), "应包含 thinking 标签");
+        // thinking 不再以 <thinking> 标签内联进 content（移到 reasoningContent）
+        assert!(!content.contains("<thinking>"), "content 不应再含 thinking 标签");
         assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
+        // 本例 thinking 无签名，无法回传 reasoningContent
+        assert!(
+            result.assistant_response_message.reasoning_content.is_none(),
+            "无签名时不应带 reasoningContent"
+        );
 
         let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
+    }
+
+    #[test]
+    fn test_assistant_thinking_signature_roundtrip() {
+        // 带签名的 thinking 块应转成 reasoningContent.reasoningText.{text,signature}，
+        // 且 content 只保留最终文本、不内联 <thinking>。
+        use super::super::types::Message as AnthropicMessage;
+
+        let msg = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "thinking", "thinking": "Reasoning here", "signature": "EqkQsig123"},
+                {"type": "text", "text": "Final answer."}
+            ]),
+        };
+
+        let result =
+            convert_assistant_message(&msg, &mut HashMap::new()).expect("转换应成功");
+        let arm = result.assistant_response_message;
+
+        assert_eq!(arm.content, "Final answer.");
+        assert!(!arm.content.contains("<thinking>"), "content 不应含 thinking 标签");
+
+        // 序列化字段名对齐抓包：reasoningContent.reasoningText.{text,signature}
+        let json = serde_json::to_string(&arm).expect("序列化");
+
+        let rc = arm.reasoning_content.as_ref().expect("应有 reasoningContent");
+        assert_eq!(rc.reasoning_text.text, "Reasoning here");
+        assert_eq!(rc.reasoning_text.signature, "EqkQsig123");
+        assert!(json.contains("\"reasoningContent\""));
+        assert!(json.contains("\"reasoningText\""));
+        assert!(json.contains("\"signature\":\"EqkQsig123\""));
     }
 
     #[test]

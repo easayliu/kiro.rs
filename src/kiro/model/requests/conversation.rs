@@ -357,6 +357,23 @@ pub struct AssistantMessage {
     /// 工具使用列表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_uses: Option<Vec<ToolUseEntry>>,
+    /// 思维链内容（含加密签名），多轮对话回传供上游校验
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<ReasoningContent>,
+}
+
+/// 思维链内容（对齐 KiroIDE 抓包：reasoningContent.reasoningText.{text,signature}）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningContent {
+    pub reasoning_text: ReasoningText,
+}
+
+/// 思维链文本与签名
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningText {
+    pub text: String,
+    pub signature: String,
 }
 
 impl AssistantMessage {
@@ -365,12 +382,28 @@ impl AssistantMessage {
         Self {
             content: content.into(),
             tool_uses: None,
+            reasoning_content: None,
         }
     }
 
     /// 设置工具使用
     pub fn with_tool_uses(mut self, tool_uses: Vec<ToolUseEntry>) -> Self {
         self.tool_uses = Some(tool_uses);
+        self
+    }
+
+    /// 设置思维链内容（text + 签名）
+    pub fn with_reasoning_content(
+        mut self,
+        text: impl Into<String>,
+        signature: impl Into<String>,
+    ) -> Self {
+        self.reasoning_content = Some(ReasoningContent {
+            reasoning_text: ReasoningText {
+                text: text.into(),
+                signature: signature.into(),
+            },
+        });
         self
     }
 }
