@@ -260,6 +260,39 @@ fn build_search_result_blocks(search_results: &Option<WebSearchResults>) -> Vec<
     }
 }
 
+/// 构建最终文本块的 citations（web_search_result_location 数组）
+///
+/// 官方 web search 回答的 text 块必带引用。Kiro 不提供 encrypted_index，
+/// 用确定性 base64 占位（满足存在性/格式校验，无法通过密码学校验）。
+fn build_citations(search_results: &Option<WebSearchResults>) -> Vec<serde_json::Value> {
+    use base64::Engine as _;
+    match search_results {
+        Some(results) => results
+            .results
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let cited = r.snippet.clone().unwrap_or_default();
+                // cited_text 官方上限约 150 字符（安全处理 UTF-8）
+                let cited_text = match cited.char_indices().nth(150) {
+                    Some((idx, _)) => cited[..idx].to_string(),
+                    None => cited,
+                };
+                let encrypted_index = base64::engine::general_purpose::STANDARD
+                    .encode(format!("{}:{}", i + 1, r.url));
+                json!({
+                    "type": "web_search_result_location",
+                    "url": r.url,
+                    "title": r.title,
+                    "encrypted_index": encrypted_index,
+                    "cited_text": cited_text
+                })
+            })
+            .collect(),
+        None => vec![],
+    }
+}
+
 /// 生成 WebSearch 非流式 JSON 响应（stream:false 时使用）
 ///
 /// 与 SSE 路径同构：text 决策块 + server_tool_use + web_search_tool_result + text 摘要，
@@ -277,8 +310,15 @@ fn create_websearch_json_response(
     );
     let decision_text = format!("I'll search for \"{}\".", query);
     let search_content = build_search_result_blocks(&search_results);
+    let citations = build_citations(&search_results);
     let summary = generate_search_summary(query, &search_results);
     let output_tokens = (summary.len() as i32 + 3) / 4;
+
+    // 最终文本块带 citations（官方 web search 回答必有引用）；无结果时省略该字段
+    let mut answer_block = json!({ "type": "text", "text": summary });
+    if !citations.is_empty() {
+        answer_block["citations"] = json!(citations);
+    }
 
     json!({
         "id": message_id,
@@ -298,7 +338,7 @@ fn create_websearch_json_response(
                 "tool_use_id": tool_use_id,
                 "content": search_content
             },
-            { "type": "text", "text": summary }
+            answer_block
         ],
         "stop_reason": "end_turn",
         "stop_sequence": null,
@@ -477,6 +517,21 @@ fn generate_websearch_events(
                 "delta": {
                     "type": "text_delta",
                     "text": text
+                }
+            }),
+        ));
+    }
+
+    // 8b. citations_delta - 官方 web search 回答的引用，逐条随文本块发送
+    for citation in build_citations(&search_results) {
+        events.push(SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": 3,
+                "delta": {
+                    "type": "citations_delta",
+                    "citation": citation
                 }
             }),
         ));
