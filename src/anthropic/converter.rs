@@ -215,6 +215,13 @@ pub fn injected_prompt_tokens() -> i32 {
     INJECTED_PROMPT_TOKENS.load(Ordering::Relaxed)
 }
 
+/// 串行化所有读写注入基线全局量的测试。`INJECTED_PROMPT_TOKENS` 是进程级
+/// 全局，多个并行测试同时改/读它会互相串味（见 strip 相关计费测试）。依赖
+/// 该基线的测试需先 `lock()` 再显式 `set_injected_prompt_tokens(...)` 设定自己
+/// 的期望值，避免读到其它测试设的值。
+#[cfg(test)]
+pub(crate) static INJECTED_BASELINE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 输出 token 上报倍率（×10000 定点存储）。0 表示未启用（等价 1.0×）。
 ///
 /// 仅放大计费 / 下游上报口径的 output_tokens（official_price、统计、message usage）；
@@ -1921,7 +1928,10 @@ mod tests {
 
     #[test]
     fn strip_injected_prompt_subtracts_baseline_with_floor() {
-        // 串行设置全局基线后验证；该测试独占基线，避免与其它用例并发互扰故单独成测。
+        // 串行设置全局基线后验证：与其它依赖基线的并行测试共用一把锁，避免互扰。
+        let _guard = super::INJECTED_BASELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set_injected_prompt_tokens(6384);
 
         // 正常：从上游总量里扣掉基线，得到 Claude 口径的内容量。

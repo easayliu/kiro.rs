@@ -44,6 +44,9 @@ pub(crate) struct CacheUsageContext {
     pub uncached_input_tokens: i32,
     /// 命中条目持久化的「上游计费口径」累计 token（W），计费时钉住 cache_read 以守恒。
     pub cache_read_billed: Option<i32>,
+    /// 是否处于无缓存模式（CacheScope::Off）。为 true 时计费不再扣除 Kiro 服务端
+    /// 注入提示词基线（strip_injected_prompt），按上游反推总量原样计费。
+    pub cache_disabled: bool,
 }
 
 /// 粘性绑定解析：返回本次请求应优先使用的凭证 id。
@@ -547,6 +550,7 @@ async fn handle_stream_request(
         cache_creation_1h_input_tokens: cache_result.cache_creation_1h_input_tokens,
         uncached_input_tokens: cache_result.uncached_input_tokens,
         cache_read_billed: cache_result.cache_read_billed,
+        cache_disabled: matches!(cache_tracker.cache_scope(), CacheScope::Off),
     };
 
     // 创建流处理上下文
@@ -892,6 +896,7 @@ async fn handle_non_stream_request(
         cache_creation_1h_input_tokens: cache_result.cache_creation_1h_input_tokens,
         uncached_input_tokens: cache_result.uncached_input_tokens,
         cache_read_billed: cache_result.cache_read_billed,
+        cache_disabled: matches!(cache_tracker.cache_scope(), CacheScope::Off),
     };
 
     let body_bytes = api_result.body;
@@ -1084,8 +1089,12 @@ async fn handle_non_stream_request(
     let billing = match context_input_tokens {
         Some(context_total) => {
             // 计费前扣掉 Kiro 服务端注入的固定提示词基线（与流式路径同口径）。
-            let content_total =
-                super::converter::strip_injected_prompt(context_total, estimated_input_tokens);
+            // 无缓存模式（CacheScope::Off）下不扣除，按上游反推总量原样计费。
+            let content_total = if matches!(cache_tracker.cache_scope(), CacheScope::Off) {
+                context_total
+            } else {
+                super::converter::strip_injected_prompt(context_total, estimated_input_tokens)
+            };
             let billed = estimated_usage.billed_split(
                 estimated_input_tokens,
                 content_total,
@@ -1455,6 +1464,7 @@ async fn handle_stream_request_buffered(
         cache_creation_1h_input_tokens: cache_result.cache_creation_1h_input_tokens,
         uncached_input_tokens: cache_result.uncached_input_tokens,
         cache_read_billed: cache_result.cache_read_billed,
+        cache_disabled: matches!(cache_tracker.cache_scope(), CacheScope::Off),
     };
 
     // 创建缓冲流处理上下文

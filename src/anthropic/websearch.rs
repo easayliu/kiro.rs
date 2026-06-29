@@ -610,9 +610,6 @@ pub async fn handle_websearch_request(
     binding_table: Arc<BindingTable>,
     binding_key: Option<u64>,
 ) -> Response {
-    // [临时诊断] 打印完整入站请求，定位第三方检测的期望（system/messages/tools/stream）
-    tracing::info!(target: "websearch_capture", "WebSearch 入站请求: {:#?}", payload);
-
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
         Some(q) => q,

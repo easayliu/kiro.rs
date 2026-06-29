@@ -678,6 +678,8 @@ pub struct StreamContext {
     reasoning_seen: bool,
     /// 命中的凭据 id（由 handler 注入），用于按凭据维度的时序统计。
     credential_id: Option<i64>,
+    /// 是否无缓存模式（CacheScope::Off）。为 true 时计费不扣 Kiro 注入提示词基线。
+    cache_disabled: bool,
 }
 
 impl StreamContext {
@@ -714,6 +716,7 @@ impl StreamContext {
             strip_thinking_leading_newline: false,
             reasoning_seen: false,
             credential_id: None,
+            cache_disabled: false,
         }
     }
 
@@ -732,6 +735,7 @@ impl StreamContext {
             uncached_input_tokens: ctx.uncached_input_tokens,
         };
         self.cache_read_billed = ctx.cache_read_billed;
+        self.cache_disabled = ctx.cache_disabled;
     }
 
     /// 注入计费完成后的回写句柄。收到 contextUsageEvent 时，generate_final_events
@@ -1346,11 +1350,16 @@ impl StreamContext {
         match self.context_input_tokens {
             // 计费前先扣掉 Kiro 服务端注入的固定提示词基线（见 converter::strip_injected_prompt），
             // 使终端用户只按真实内容计费；注入恒落在 uncached，扣除即从 uncached 移除。
-            Some(context_total) => self.cache_usage.billed_split(
-                self.input_tokens,
-                super::converter::strip_injected_prompt(context_total, self.input_tokens),
-                self.cache_read_billed,
-            ),
+            // 无缓存模式（CacheScope::Off）下不扣除，按上游反推总量原样计费。
+            Some(context_total) => {
+                let content_total = if self.cache_disabled {
+                    context_total
+                } else {
+                    super::converter::strip_injected_prompt(context_total, self.input_tokens)
+                };
+                self.cache_usage
+                    .billed_split(self.input_tokens, content_total, self.cache_read_billed)
+            }
             None => self.cache_usage,
         }
     }
@@ -2625,7 +2634,14 @@ mod tests {
     /// 有 contextUsageEvent 时，message_delta 的 usage 用上游实际计量（等比缩放）。
     #[test]
     fn billing_scales_split_to_upstream_when_event_present() {
+        use super::super::converter::set_injected_prompt_tokens;
         use super::super::handlers::CacheUsageContext;
+
+        // 本测试假设注入基线为 0；与其它改基线的并行测试共用锁后显式置 0。
+        let _guard = super::super::converter::INJECTED_BASELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_injected_prompt_tokens(0);
 
         // 估算总量 1000；上游实际 2000 → scale = 2。
         let mut ctx = StreamContext::new_with_thinking("test-model", 1000, false, HashMap::new());
@@ -2660,7 +2676,14 @@ mod tests {
     /// 全部内容都命中缓存（估算 uncached=0）时，缩放后 uncached=0，message_delta 保底 1。
     #[test]
     fn billing_floors_reported_uncached_at_one_when_fully_cached() {
+        use super::super::converter::set_injected_prompt_tokens;
         use super::super::handlers::CacheUsageContext;
+
+        // 本测试假设注入基线为 0；与其它改基线的并行测试共用锁后显式置 0。
+        let _guard = super::super::converter::INJECTED_BASELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_injected_prompt_tokens(0);
 
         let mut ctx = StreamContext::new_with_thinking("test-model", 1000, false, HashMap::new());
         ctx.set_cache_usage(CacheUsageContext {
@@ -2685,11 +2708,48 @@ mod tests {
         assert_eq!(message_delta.data["usage"]["input_tokens"], 1);
     }
 
+    /// 无缓存模式（cache_disabled=true）下，计费不扣 Kiro 注入提示词基线：
+    /// 即便配置了较大的注入基线，billed uncached 仍等于上游反推总量原样。
+    /// 该路径完全不读取注入基线全局值，故对其它测试并发改值不敏感。
+    #[test]
+    fn billing_no_cache_mode_keeps_injected_prompt_tokens() {
+        use super::super::converter::set_injected_prompt_tokens;
+        use super::super::handlers::CacheUsageContext;
+
+        // 设一个较大的注入基线，证明无缓存模式确实没有去扣它（与其它基线测试共用锁）。
+        let _guard = super::super::converter::INJECTED_BASELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_injected_prompt_tokens(5000);
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1000, false, HashMap::new());
+        ctx.set_cache_usage(CacheUsageContext {
+            uncached_input_tokens: 1000,
+            cache_disabled: true,
+            ..Default::default()
+        });
+        ctx.context_input_tokens = Some(8000);
+
+        // Off：不扣基线，全额 8000 计入 uncached（而非 8000 − 5000 = 3000）。
+        let billing = ctx.billing_cache_usage();
+        assert_eq!(
+            billing.uncached_input_tokens, 8000,
+            "无缓存模式不应扣除注入基线"
+        );
+    }
+
     /// 缓冲流：收到 contextUsageEvent 后，message_start 与 message_delta 的
     /// 整个 usage（input_tokens + cache_*）都用上游计量且彼此一致。
     #[test]
     fn buffered_stream_rewrites_message_start_with_scaled_usage() {
+        use super::super::converter::set_injected_prompt_tokens;
         use super::super::handlers::CacheUsageContext;
+
+        // 本测试假设注入基线为 0；与其它改基线的并行测试共用锁后显式置 0。
+        let _guard = super::super::converter::INJECTED_BASELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_injected_prompt_tokens(0);
 
         let estimated_total = 1000;
         let mut ctx =
