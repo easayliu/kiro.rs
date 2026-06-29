@@ -209,7 +209,7 @@ export async function setGlobalCache(enabled: boolean): Promise<{ enabled: boole
 }
 
 // 缓存分桶策略（两种都按用户身份 metadata.user_id 分桶，PerCredential 在此之上再按凭据切分）
-export type CacheScope = 'global' | 'per_credential'
+export type CacheScope = 'global' | 'per_credential' | 'off'
 
 // 获取缓存分桶策略
 export async function getCacheScope(): Promise<{ scope: CacheScope }> {

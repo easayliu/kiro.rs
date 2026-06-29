@@ -139,10 +139,13 @@ const GLOBAL_CREDENTIAL_KEY: u64 = 0;
 ///   credential 共享 cache；无 metadata 时退化到共享 bucket（key=0）。
 /// - `PerCredential`：在用户身份基础上再按 credential_id 细分。同一用户
 ///   的不同凭据**互不共享** cache，适合想严格按凭据隔离的场景。
+/// - `Off`：完全关闭本地缓存模拟。不查找、不写入 checkpoint，usage 里
+///   `cache_read` / `cache_creation` 均为 0，整段 input 当作未缓存 input_tokens。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheScope {
     Global,
     PerCredential,
+    Off,
 }
 
 impl CacheScope {
@@ -150,12 +153,14 @@ impl CacheScope {
         match self {
             Self::Global => 0,
             Self::PerCredential => 1,
+            Self::Off => 2,
         }
     }
 
     fn from_u8(v: u8) -> Self {
         match v {
             1 => Self::PerCredential,
+            2 => Self::Off,
             _ => Self::Global,
         }
     }
@@ -164,6 +169,7 @@ impl CacheScope {
     pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
             "per_credential" | "percredential" => Self::PerCredential,
+            "off" | "none" | "disabled" | "no_cache" | "nocache" => Self::Off,
             _ => Self::Global,
         }
     }
@@ -271,7 +277,8 @@ impl CacheTracker {
         // 共享 key（Global）或按 credential 隔离（PerCredential）。
         let identity_key = profile.identity_key.unwrap_or(GLOBAL_CREDENTIAL_KEY);
         match self.cache_scope() {
-            CacheScope::Global => identity_key,
+            // Off 在 compute_and_update 入口已短路，不会走到这里；按 Global 兜底。
+            CacheScope::Global | CacheScope::Off => identity_key,
             CacheScope::PerCredential => {
                 // identity 作为 salt 与 credential_id 混合
                 let mut hasher = Sha256::new();
@@ -399,6 +406,18 @@ impl CacheTracker {
         credential_id: u64,
         profile: &CacheProfile,
     ) -> (CacheResult, CacheWriteback) {
+        // Off：完全关闭本地缓存模拟。直接整段未缓存返回，不查找/不写入 checkpoint，
+        // 也不产生 writeback（apply_billing_writeback 见到空 written 即 no-op）。
+        if matches!(self.cache_scope(), CacheScope::Off) {
+            return (
+                CacheResult {
+                    uncached_input_tokens: profile.total_input_tokens,
+                    ..Default::default()
+                },
+                CacheWriteback::default(),
+            );
+        }
+
         let effective_id = self.effective_bucket_key(credential_id, profile);
         let breakpoints_info: Vec<(usize, i32)> = profile
             .cacheable_breakpoints()
@@ -2252,5 +2271,39 @@ mod tests {
         let p2 = tracker.build_profile(&req, 10_000);
         let (r2, _) = tracker.compute_and_update(1, &p2);
         assert_eq!(r2.cache_read_input_tokens, 0, "rate=1.0 应强制跳过查找");
+    }
+
+    /// Off 模式：完全关闭本地缓存模拟。即便前缀稳定、本应命中，也始终
+    /// cache_read=0 且 cache_creation=0，整段计入 uncached input_tokens，
+    /// 且不写入任何 checkpoint（bucket 始终为空）。
+    #[test]
+    fn off_scope_disables_cache_simulation() {
+        let tracker = CacheTracker::new(DEFAULT_CACHE_TTL, CacheScope::Off, None);
+        let sys = large_text("S ", LARGE_SYSTEM_CHARS);
+        let req = build_request(
+            &sys,
+            vec![user_message(vec![json!({
+                "type": "text",
+                "text": "hi",
+                "cache_control": ephemeral_5m(),
+            })])],
+        );
+
+        // 第一轮：建立不了缓存，整段 uncached。
+        let p1 = tracker.build_profile(&req, 10_000);
+        let (r1, wb1) = tracker.compute_and_update(1, &p1);
+        assert_eq!(r1.cache_read_input_tokens, 0);
+        assert_eq!(r1.cache_creation_input_tokens, 0);
+        assert_eq!(r1.uncached_input_tokens, 10_000, "整段应计入未缓存 input_tokens");
+        assert!(wb1.written.is_empty(), "Off 模式不应写入 checkpoint");
+
+        // 第二轮：相同前缀，仍不命中，行为与第一轮一致。
+        let p2 = tracker.build_profile(&req, 10_000);
+        let (r2, _) = tracker.compute_and_update(1, &p2);
+        assert_eq!(r2.cache_read_input_tokens, 0, "Off 模式永不命中 cache_read");
+        assert_eq!(r2.cache_creation_input_tokens, 0);
+
+        // 内部表始终为空：没有任何 bucket 被创建。
+        assert_eq!(tracker.bucket_count(), 0, "Off 模式不应创建任何 bucket");
     }
 }

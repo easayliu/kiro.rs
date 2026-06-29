@@ -185,6 +185,7 @@ pub struct Config {
     /// 缓存分桶策略（覆盖 `global_cache`）。可选值：
     /// - `"global"`：按用户身份（metadata.user_id）分桶，同一用户跨 credential 共享
     /// - `"per_credential"`：在用户身份基础上再按 credential 隔离
+    /// - `"off"`：完全关闭本地缓存模拟，usage 不再上报 cache_read / cache_creation
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_scope: Option<String>,
 

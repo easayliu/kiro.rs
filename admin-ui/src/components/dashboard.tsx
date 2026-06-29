@@ -944,11 +944,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
   }
 
+  const cacheScopeLabel = (scope: CacheScope | undefined): string =>
+    scope === 'per_credential' ? '凭据隔离' : scope === 'off' ? '无缓存' : '全局共享'
+
   const handleCycleCacheScope = () => {
     const current = cacheScopeData?.scope ?? 'global'
-    const next: CacheScope = current === 'global' ? 'per_credential' : 'global'
+    // 三态循环：全局共享 → 凭据隔离 → 无缓存 → 全局共享
+    const next: CacheScope =
+      current === 'global' ? 'per_credential' : current === 'per_credential' ? 'off' : 'global'
     setCacheScopeMutation(next, {
-      onSuccess: () => toast.success(`缓存模式已切换到 ${next === 'per_credential' ? '凭据隔离' : '全局共享'}`),
+      onSuccess: () => toast.success(`缓存模式已切换到 ${cacheScopeLabel(next)}`),
       onError: err => toast.error(`切换失败: ${extractErrorMessage(err)}`),
     })
   }
@@ -1128,7 +1133,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 <span className="shrink-0">策略</span>
                 <span className="shrink-0 text-border">·</span>
                 <span className="shrink-0 text-foreground">
-                  {isLoadingCacheScope ? '—' : cacheScopeData?.scope === 'per_credential' ? '凭据隔离' : '全局共享'}
+                  {isLoadingCacheScope ? '—' : cacheScopeLabel(cacheScopeData?.scope)}
                 </span>
                 <span className="shrink-0 text-border">·</span>
                 <span className="shrink-0 text-foreground">
@@ -1638,8 +1643,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <div className="divide-y divide-border">
             <PolicyRow
               label="缓存分桶"
-              sub={cacheScopeData?.scope === 'per_credential' ? '按用户 + 凭据双层' : '按用户身份共享'}
-              value={cacheScopeData?.scope === 'per_credential' ? '凭据隔离' : '全局共享'}
+              sub={
+                cacheScopeData?.scope === 'per_credential' ? '按用户 + 凭据双层'
+                : cacheScopeData?.scope === 'off' ? '关闭本地缓存模拟'
+                : '按用户身份共享'
+              }
+              value={cacheScopeLabel(cacheScopeData?.scope)}
               loading={isLoadingCacheScope}
               disabled={isLoadingCacheScope || isSettingCacheScope}
               onClick={handleCycleCacheScope}

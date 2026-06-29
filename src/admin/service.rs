@@ -487,6 +487,7 @@ impl AdminService {
         let scope = match self.cache_tracker.cache_scope() {
             CacheScope::Global => "global",
             CacheScope::PerCredential => "per_credential",
+            CacheScope::Off => "off",
         };
         crate::admin::types::CacheScopeResponse {
             scope: scope.to_string(),
@@ -508,6 +509,7 @@ impl AdminService {
                     let canonical = match scope {
                         CacheScope::Global => "global",
                         CacheScope::PerCredential => "per_credential",
+                        CacheScope::Off => "off",
                     };
                     config.cache_scope = Some(canonical.to_string());
                     config.global_cache = matches!(scope, CacheScope::Global);
