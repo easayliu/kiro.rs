@@ -41,6 +41,19 @@ pub struct McpParams {
 #[derive(Debug, Serialize)]
 pub struct McpArguments {
     pub query: String,
+    #[serde(rename = "_meta")]
+    pub meta: McpArgumentsMeta,
+}
+
+/// MCP 参数元信息（对齐 KiroIDE 真实抓包，上游据此校验输入完整性）
+#[derive(Debug, Serialize)]
+pub struct McpArgumentsMeta {
+    #[serde(rename = "_isValid")]
+    pub is_valid: bool,
+    #[serde(rename = "_activePath")]
+    pub active_path: Vec<String>,
+    #[serde(rename = "_completedPaths")]
+    pub completed_paths: Vec<Vec<String>>,
 }
 
 /// MCP 响应
@@ -159,29 +172,11 @@ fn generate_random_id_22() -> String {
         .collect()
 }
 
-/// 生成8位小写字母和数字的随机字符串
-fn generate_random_id_8() -> String {
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    (0..8)
-        .map(|_| {
-            let idx = fastrand::usize(..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect()
-}
-
 /// 创建 MCP 请求
 ///
-/// ID 格式: web_search_tooluse_{22位随机}_{毫秒时间戳}_{8位随机}
+/// ID 格式: web_search_tooluse_{22位随机}（对齐 KiroIDE 真实抓包）
 pub fn create_mcp_request(query: &str) -> (String, McpRequest) {
-    let random_22 = generate_random_id_22();
-    let timestamp = chrono::Utc::now().timestamp_millis();
-    let random_8 = generate_random_id_8();
-
-    let request_id = format!(
-        "web_search_tooluse_{}_{}_{}",
-        random_22, timestamp, random_8
-    );
+    let request_id = format!("web_search_tooluse_{}", generate_random_id_22());
 
     // tool_use_id 使用相同格式
     let tool_use_id = format!(
@@ -197,6 +192,11 @@ pub fn create_mcp_request(query: &str) -> (String, McpRequest) {
             name: "web_search".to_string(),
             arguments: McpArguments {
                 query: query.to_string(),
+                meta: McpArgumentsMeta {
+                    is_valid: true,
+                    active_path: vec!["query".to_string()],
+                    completed_paths: vec![vec!["query".to_string()]],
+                },
             },
         },
     };
@@ -745,28 +745,14 @@ mod tests {
     fn test_mcp_request_id_format() {
         let (_, request) = create_mcp_request("test");
 
-        // 格式: web_search_tooluse_{22位}_{毫秒时间戳}_{8位}
+        // 格式: web_search_tooluse_{22位}（对齐 KiroIDE 真实抓包，无时间戳/8位后缀）
         let id = &request.id;
         assert!(id.starts_with("web_search_tooluse_"));
 
         let suffix = &id["web_search_tooluse_".len()..];
-        let parts: Vec<&str> = suffix.split('_').collect();
-        assert_eq!(parts.len(), 3, "应该有3个部分: 22位随机_时间戳_8位随机");
-
-        // 第一部分: 22位大小写字母和数字
-        assert_eq!(parts[0].len(), 22);
-        assert!(parts[0].chars().all(|c| c.is_ascii_alphanumeric()));
-
-        // 第二部分: 毫秒时间戳
-        assert!(parts[1].parse::<i64>().is_ok());
-
-        // 第三部分: 8位小写字母和数字
-        assert_eq!(parts[2].len(), 8);
-        assert!(
-            parts[2]
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        );
+        // 后缀应是单段 22 位大小写字母和数字，不含下划线
+        assert_eq!(suffix.len(), 22);
+        assert!(suffix.chars().all(|c| c.is_ascii_alphanumeric()));
     }
 
     #[test]

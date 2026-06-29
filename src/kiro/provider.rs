@@ -183,8 +183,37 @@ impl KiroProvider {
     }
 
     /// 获取凭据级 MCP API URL
+    ///
+    /// 新 runtime 端点为 RPC 风格：路径为根 `/`，方法由 `x-amz-target` 头指定
+    /// （`KiroRuntimeService.InvokeMCP`）；老 CodeWhisperer 端点用 `/mcp`。
     fn mcp_url_for(&self, credentials: &KiroCredentials) -> String {
-        format!("https://{}/mcp", self.base_domain_for(credentials))
+        let domain = self.base_domain_for(credentials);
+        if Self::is_kiro_runtime_host(&domain) {
+            format!("https://{}/", domain)
+        } else {
+            format!("https://{}/mcp", domain)
+        }
+    }
+
+    /// 向 MCP 请求体顶层注入 `profileArn`
+    ///
+    /// runtime RPC 协议要求 ARN 在 body 内（而非请求头）。解析失败或无 ARN 时原样返回。
+    fn inject_mcp_profile_arn(body: &str, profile_arn: &Option<String>) -> String {
+        let arn = match profile_arn {
+            Some(a) => a,
+            None => return body.to_string(),
+        };
+        match serde_json::from_str::<serde_json::Value>(body) {
+            Ok(serde_json::Value::Object(mut map)) => {
+                map.insert(
+                    "profileArn".to_string(),
+                    serde_json::Value::String(arn.clone()),
+                );
+                serde_json::to_string(&serde_json::Value::Object(map))
+                    .unwrap_or_else(|_| body.to_string())
+            }
+            _ => body.to_string(),
+        }
     }
 
     /// 获取凭据级 API 基础域名（受 `config.api_host_template` 控制）
@@ -499,20 +528,39 @@ impl KiroProvider {
                 .unwrap_or_default();
             let mode = ctx.credentials.effective_client_mode(config);
 
+            let domain = self.base_domain_for(&ctx.credentials);
+            let is_runtime = Self::is_kiro_runtime_host(&domain);
             let url = self.mcp_url_for(&ctx.credentials);
             let x_amz_user_agent = config.streaming_x_amz_user_agent(&machine_id, mode);
             let user_agent = config.streaming_user_agent(&machine_id, mode);
+
+            // profile ARN：effective_profile_arn 自带优先，Builder ID/Social 缺失时按
+            // auth_method 兜底共享 ARN，企业 IdC / api_key 返回 None 则不附带。
+            let profile_arn = ctx.credentials.effective_profile_arn();
+
+            // 新 runtime 端点走 AWS JSON 1.0 RPC：profileArn 注入 body 顶层、
+            // content-type 用 x-amz-json；老 CodeWhisperer 端点保持 application/json + profileArn 头。
+            let (outbound_body, content_type) = if is_runtime {
+                (
+                    Self::inject_mcp_profile_arn(request_body, &profile_arn),
+                    "application/x-amz-json-1.0",
+                )
+            } else {
+                (request_body.to_string(), "application/json")
+            };
 
             // 发送请求（MCP 暂不走中继）
             let mut request = self
                 .client_for(&ctx.credentials, false)?
                 .post(&url)
-                .body(request_body.to_string())
-                .header("content-type", "application/json");
+                .body(outbound_body)
+                .header("content-type", content_type);
 
-            // MCP 请求按需携带 profile ARN：effective_profile_arn 自带优先，Builder ID/Social
-            // 缺失时按 auth_method 兜底共享 ARN，企业 IdC / api_key 返回 None 则不附带。
-            if let Some(arn) = ctx.credentials.effective_profile_arn() {
+            if is_runtime {
+                // 新 runtime 端点：RPC 方法名走 x-amz-target，profileArn 已在 body 内。
+                request = request.header("x-amz-target", "KiroRuntimeService.InvokeMCP");
+            } else if let Some(arn) = &profile_arn {
+                // 老 CodeWhisperer 端点：profileArn 走请求头。
                 request = request.header("x-amzn-kiro-profile-arn", arn);
             }
 
@@ -524,7 +572,7 @@ impl KiroProvider {
             let response = match request
                 .header("x-amz-user-agent", &x_amz_user_agent)
                 .header("user-agent", &user_agent)
-                .header("host", &self.base_domain_for(&ctx.credentials))
+                .header("host", &domain)
                 .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
                 .header("amz-sdk-request", "attempt=1; max=3")
                 .header("Authorization", format!("Bearer {}", ctx.token))
