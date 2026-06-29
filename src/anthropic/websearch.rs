@@ -234,6 +234,84 @@ pub fn create_websearch_sse_stream(
     )
 }
 
+/// 构建 web_search_tool_result 的 content（搜索结果块数组）
+///
+/// 流式与非流式响应共用，确保两条路径结果结构一致。
+fn build_search_result_blocks(search_results: &Option<WebSearchResults>) -> Vec<serde_json::Value> {
+    match search_results {
+        Some(results) => results
+            .results
+            .iter()
+            .map(|r| {
+                let page_age = r.published_date.and_then(|ms| {
+                    chrono::DateTime::from_timestamp_millis(ms)
+                        .map(|dt| dt.format("%B %-d, %Y").to_string())
+                });
+                json!({
+                    "type": "web_search_result",
+                    "title": r.title,
+                    "url": r.url,
+                    "encrypted_content": r.snippet.clone().unwrap_or_default(),
+                    "page_age": page_age
+                })
+            })
+            .collect(),
+        None => vec![],
+    }
+}
+
+/// 生成 WebSearch 非流式 JSON 响应（stream:false 时使用）
+///
+/// 与 SSE 路径同构：text 决策块 + server_tool_use + web_search_tool_result + text 摘要，
+/// 聚合为官方 Messages 非流式响应体。
+fn create_websearch_json_response(
+    model: &str,
+    query: &str,
+    tool_use_id: &str,
+    search_results: Option<WebSearchResults>,
+    input_tokens: i32,
+) -> serde_json::Value {
+    let message_id = format!(
+        "msg_{}",
+        Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
+    );
+    let decision_text = format!("I'll search for \"{}\".", query);
+    let search_content = build_search_result_blocks(&search_results);
+    let summary = generate_search_summary(query, &search_results);
+    let output_tokens = (summary.len() as i32 + 3) / 4;
+
+    json!({
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [
+            { "type": "text", "text": decision_text },
+            {
+                "type": "server_tool_use",
+                "id": tool_use_id,
+                "name": "web_search",
+                "input": { "query": query }
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": tool_use_id,
+                "content": search_content
+            },
+            { "type": "text", "text": summary }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": { "web_search_requests": 1 }
+        }
+    })
+}
+
 /// 生成 WebSearch SSE 事件序列
 fn generate_websearch_events(
     model: &str,
@@ -347,27 +425,7 @@ fn generate_websearch_events(
 
     // 6. content_block_start (web_search_tool_result, index 2)
     // 官方格式：web_search_tool_result 带 tool_use_id，与 server_tool_use.id 对应。
-    let search_content = if let Some(ref results) = search_results {
-        results
-            .results
-            .iter()
-            .map(|r| {
-                let page_age = r.published_date.and_then(|ms| {
-                    chrono::DateTime::from_timestamp_millis(ms)
-                        .map(|dt| dt.format("%B %-d, %Y").to_string())
-                });
-                json!({
-                    "type": "web_search_result",
-                    "title": r.title,
-                    "url": r.url,
-                    "encrypted_content": r.snippet.clone().unwrap_or_default(),
-                    "page_age": page_age
-                })
-            })
-            .collect::<Vec<_>>()
-    } else {
-        vec![]
-    };
+    let search_content = build_search_result_blocks(&search_results);
 
     events.push(SseEvent::new(
         "content_block_start",
@@ -541,8 +599,14 @@ pub async fn handle_websearch_request(
         actual_credential,
     );
 
-    // 6. 生成 SSE 响应
+    // 6. 按 stream 标志生成响应：非流式聚合为单个 JSON，流式走 SSE
     let model = payload.model.clone();
+    if !payload.stream {
+        let body =
+            create_websearch_json_response(&model, &query, &tool_use_id, search_results, input_tokens);
+        return (StatusCode::OK, Json(body)).into_response();
+    }
+
     let stream =
         create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
 
@@ -791,6 +855,48 @@ mod tests {
         let results = results.unwrap();
         assert_eq!(results.results.len(), 1);
         assert_eq!(results.results[0].title, "Test");
+    }
+
+    #[test]
+    fn test_create_websearch_json_response() {
+        let results = WebSearchResults {
+            results: vec![WebSearchResult {
+                title: "Test Result".to_string(),
+                url: "https://example.com".to_string(),
+                snippet: Some("snippet".to_string()),
+                published_date: None,
+                id: None,
+                domain: None,
+                max_verbatim_word_limit: None,
+                public_domain: None,
+            }],
+            total_results: Some(1),
+            query: Some("q".to_string()),
+            error: None,
+        };
+        let v = create_websearch_json_response(
+            "claude-sonnet-4-5",
+            "q",
+            "srvtoolu_abc",
+            Some(results),
+            42,
+        );
+
+        // 顶层为完整 message 对象（非流式），非 SSE
+        assert_eq!(v["type"], "message");
+        assert_eq!(v["role"], "assistant");
+        assert_eq!(v["stop_reason"], "end_turn");
+        assert_eq!(v["usage"]["server_tool_use"]["web_search_requests"], 1);
+
+        let content = v["content"].as_array().expect("content 数组");
+        assert_eq!(content.len(), 4);
+        assert_eq!(content[1]["type"], "server_tool_use");
+        assert_eq!(content[1]["id"], "srvtoolu_abc");
+        assert_eq!(content[2]["type"], "web_search_tool_result");
+        // tool_use_id 与 server_tool_use.id 关联
+        assert_eq!(content[2]["tool_use_id"], "srvtoolu_abc");
+        assert_eq!(content[2]["content"][0]["type"], "web_search_result");
+        assert_eq!(content[2]["content"][0]["url"], "https://example.com");
     }
 
     #[test]

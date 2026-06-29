@@ -8,6 +8,8 @@ services:
       - "host.docker.internal:host-gateway"
     ports:
       - "8990:8990"
+    environment:
+      - RUST_LOG=debug
     volumes:
       - ./config/:/app/config/
     restart: unless-stopped
