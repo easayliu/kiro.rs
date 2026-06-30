@@ -1501,6 +1501,32 @@ fn merge_user_messages(
     })
 }
 
+/// 从已序列化的 Kiro 请求体里剥掉 history 中所有 `reasoningContent`（思考文本+签名）。
+///
+/// 上游 `THINKING_SIGNATURE_INVALID` 多由跨凭据 failover 回放旧签名引起（签名按账号绑定，
+/// A 账号签的签名发给 B 账号的 Bedrock 必失效）。历史思考块非必需，剥掉即可让请求通过。
+/// 返回 `Some(新 body)` 当且仅当确实删掉了东西；否则 `None`（无思考块可删，重试无意义）。
+pub fn strip_reasoning_content(request_body: &str) -> Option<String> {
+    let mut v: serde_json::Value = serde_json::from_str(request_body).ok()?;
+    let history = v
+        .pointer_mut("/conversationState/history")?
+        .as_array_mut()?;
+    let mut stripped = false;
+    for msg in history.iter_mut() {
+        if let Some(obj) = msg
+            .pointer_mut("/assistantResponseMessage")
+            .and_then(|a| a.as_object_mut())
+        {
+            stripped |= obj.remove("reasoningContent").is_some();
+        }
+    }
+    if stripped {
+        serde_json::to_string(&v).ok()
+    } else {
+        None
+    }
+}
+
 /// 转换 assistant 消息
 fn convert_assistant_message(
     msg: &super::types::Message,
@@ -1520,14 +1546,22 @@ fn convert_assistant_message(
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
                         "thinking" => {
-                            if let Some(thinking) = block.thinking {
-                                thinking_content.push_str(&thinking);
-                            }
-                            // 签名取最后一个非空值（与 thinking 文本对应）
-                            if let Some(sig) = block.signature {
-                                if !sig.is_empty() {
+                            // 每个 thinking 块自带 text+signature，签名只签自己这块文本。
+                            // 多块时绝不能拼接文本却只留末签名——sig 与 text 失配会被上游判
+                            // THINKING_SIGNATURE_INVALID。故带签名的块整体覆盖（text 与 sig 成对），
+                            // 永远保留最后一个完整 (text, signature) 对。
+                            match block.signature.filter(|s| !s.is_empty()) {
+                                Some(sig) => {
+                                    thinking_content = block.thinking.unwrap_or_default();
                                     thinking_signature = Some(sig);
                                 }
+                                // 无签名块：仅当尚未遇到带签名块时累计文本（最终若仍无签名整体丢弃）
+                                None if thinking_signature.is_none() => {
+                                    if let Some(thinking) = block.thinking {
+                                        thinking_content.push_str(&thinking);
+                                    }
+                                }
+                                None => {}
                             }
                         }
                         "text" => {
@@ -3654,6 +3688,69 @@ mod tests {
         assert!(json.contains("\"reasoningContent\""));
         assert!(json.contains("\"reasoningText\""));
         assert!(json.contains("\"signature\":\"EqkQsig123\""));
+    }
+
+    #[test]
+    fn test_assistant_multi_thinking_block_keeps_paired_signature() {
+        // 一条 assistant 消息含多个 thinking 块时，绝不能拼接全部文本却只留末签名
+        // （会 text/signature 失配 → 上游 THINKING_SIGNATURE_INVALID）。
+        // 期望：保留最后一个完整 (text, signature) 对，text 不被前块污染。
+        use super::super::types::Message as AnthropicMessage;
+
+        let msg = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "thinking", "thinking": "first block", "signature": "sigAAA"},
+                {"type": "thinking", "thinking": "second block", "signature": "sigBBB"},
+                {"type": "text", "text": "Done."}
+            ]),
+        };
+
+        let arm = convert_assistant_message(&msg, &mut HashMap::new())
+            .expect("转换应成功")
+            .assistant_response_message;
+
+        let rc = arm.reasoning_content.as_ref().expect("应有 reasoningContent");
+        // text 必须与 signature 成对：留最后一块，不能是 "first blocksecond block"
+        assert_eq!(rc.reasoning_text.text, "second block");
+        assert_eq!(rc.reasoning_text.signature, "sigBBB");
+    }
+
+    #[test]
+    fn test_strip_reasoning_content_removes_history_thinking() {
+        // strip_reasoning_content 应剥掉 history 中所有 assistant 的 reasoningContent，
+        // 保留其余字段；无思考块时返回 None。
+        let body = serde_json::json!({
+            "conversationState": {
+                "conversationId": "c1",
+                "currentMessage": {"userInputMessage": {"content": "hi", "modelId": "m", "userInputMessageContext": {}}},
+                "history": [
+                    {"userInputMessage": {"content": "q", "modelId": "m", "userInputMessageContext": {}}},
+                    {"assistantResponseMessage": {
+                        "content": "a",
+                        "reasoningContent": {"reasoningText": {"text": "t", "signature": "s"}}
+                    }}
+                ]
+            }
+        })
+        .to_string();
+
+        let stripped = strip_reasoning_content(&body).expect("有思考块应返回 Some");
+        assert!(!stripped.contains("reasoningContent"), "应剥掉 reasoningContent");
+        assert!(stripped.contains("\"content\":\"a\""), "应保留 assistant 其余字段");
+
+        // 无思考块：返回 None，避免无谓重试
+        let no_thinking = serde_json::json!({
+            "conversationState": {
+                "conversationId": "c1",
+                "currentMessage": {"userInputMessage": {"content": "hi", "modelId": "m", "userInputMessageContext": {}}},
+                "history": [
+                    {"assistantResponseMessage": {"content": "a"}}
+                ]
+            }
+        })
+        .to_string();
+        assert!(strip_reasoning_content(&no_thinking).is_none(), "无思考块应返回 None");
     }
 
     #[test]

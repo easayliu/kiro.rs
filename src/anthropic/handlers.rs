@@ -608,6 +608,54 @@ pub async fn post_messages(
     }
 }
 
+/// 上游错误是否为思考签名失效（`THINKING_SIGNATURE_INVALID`）。
+///
+/// 多由跨凭据 failover 回放旧签名引起（签名按账号绑定）。命中后剥掉历史思考块降级重试。
+fn is_thinking_signature_invalid(err: &Error) -> bool {
+    err.downcast_ref::<UpstreamHttpError>()
+        .is_some_and(|u| u.status == 400 && u.body.contains("THINKING_SIGNATURE_INVALID"))
+}
+
+/// 调用流式 API；遇 `THINKING_SIGNATURE_INVALID` 时剥离历史 `reasoningContent` 降级重试一次。
+async fn call_api_stream_with_signature_fallback(
+    provider: &KiroProvider,
+    request_body: &str,
+    preferred: Option<u64>,
+) -> anyhow::Result<crate::kiro::provider::ApiCallResult> {
+    match provider.call_api_stream(request_body, preferred).await {
+        Err(e) if is_thinking_signature_invalid(&e) => {
+            match super::converter::strip_reasoning_content(request_body) {
+                Some(retry_body) => {
+                    tracing::warn!("思考签名失效，剥离历史 reasoningContent 后重试一次");
+                    provider.call_api_stream(&retry_body, preferred).await
+                }
+                None => Err(e),
+            }
+        }
+        other => other,
+    }
+}
+
+/// 缓冲（非流式）调用，遇 `THINKING_SIGNATURE_INVALID` 时同样剥离思考块重试一次。
+async fn call_api_buffered_with_signature_fallback(
+    provider: &KiroProvider,
+    request_body: &str,
+    preferred: Option<u64>,
+) -> anyhow::Result<crate::kiro::provider::BufferedApiCallResult> {
+    match provider.call_api_buffered(request_body, preferred).await {
+        Err(e) if is_thinking_signature_invalid(&e) => {
+            match super::converter::strip_reasoning_content(request_body) {
+                Some(retry_body) => {
+                    tracing::warn!("思考签名失效，剥离历史 reasoningContent 后重试一次");
+                    provider.call_api_buffered(&retry_body, preferred).await
+                }
+                None => Err(e),
+            }
+        }
+        other => other,
+    }
+}
+
 /// 处理流式请求
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -622,8 +670,8 @@ async fn handle_stream_request(
     binding_key: Option<u64>,
     preferred: Option<u64>,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let api_result = match provider.call_api_stream(request_body, preferred).await {
+    // 调用 Kiro API（支持多凭据故障转移；思考签名失效时剥离历史思考块重试一次）
+    let api_result = match call_api_stream_with_signature_fallback(provider.as_ref(), request_body, preferred).await {
         Ok(resp) => resp,
         Err(e) => {
             update_binding_after_call(
@@ -985,8 +1033,8 @@ async fn handle_non_stream_request(
 ) -> Response {
     let request_start = Instant::now();
     // 调用 Kiro API 并缓冲完整响应体（支持多凭据故障转移；body 中途被上游 RST/EOF
-    // 时会重新发起整轮调用并换凭据，见 call_api_buffered）
-    let api_result = match provider.call_api_buffered(request_body, preferred).await {
+    // 时会重新发起整轮调用并换凭据，见 call_api_buffered；思考签名失效时剥离思考块重试一次）
+    let api_result = match call_api_buffered_with_signature_fallback(provider.as_ref(), request_body, preferred).await {
         Ok(resp) => resp,
         Err(e) => {
             update_binding_after_call(
@@ -1569,8 +1617,8 @@ async fn handle_stream_request_buffered(
     binding_key: Option<u64>,
     preferred: Option<u64>,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let api_result = match provider.call_api_stream(request_body, preferred).await {
+    // 调用 Kiro API（支持多凭据故障转移；思考签名失效时剥离历史思考块重试一次）
+    let api_result = match call_api_stream_with_signature_fallback(provider.as_ref(), request_body, preferred).await {
         Ok(resp) => resp,
         Err(e) => {
             update_binding_after_call(
