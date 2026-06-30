@@ -24,4 +24,14 @@
 /kiro.db-shm
 .DS_Store
 **/.DS_Store
-./cap
+
+# 抓包 / 调试临时文件
+/cap/
+*.raw
+*.raw.log
+/server.log
+/system-prompt.md
+/kiro-test.pdf
+/012_*.json
+# 误放的凭据副本（含带空格的 "credentials copy*.json"）
+/credentials*.json
