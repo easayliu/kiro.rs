@@ -119,17 +119,10 @@ fn resolve_request_id(headers: &HeaderMap) -> Option<String> {
 /// request-id 中间件：解析/生成关联 id 注入请求扩展，并在响应回写 `x-request-id`，
 /// 实现上游 request-id 的透传保留（请求侧沿用、响应侧回显）。
 pub async fn request_id_middleware(mut request: Request<Body>, next: Next) -> Response {
-    let id = match resolve_request_id(request.headers()) {
-        Some(id) => id,
-        None => {
-            // 诊断：已知候选头都未命中，上游 request-id 没透传过来。打印全部入站 header
-            // 名（不含值，避免泄露 Authorization 等），用于发现 newapi 实际使用的头名，
-            // 之后把该头名补进 REQUEST_ID_HEADERS。命中后此分支不再触发，无日志开销。
-            let names: Vec<&str> = request.headers().keys().map(|k| k.as_str()).collect();
-            tracing::info!(inbound_headers = ?names, "request-id 透传未命中，回退 UUID");
-            Uuid::new_v4().to_string()
-        }
-    };
+    // newapi 转发上游时不带任何 request-id 头（实测入站仅 anthropic 必需头 + x-api-key），
+    // 故未命中候选头时静默兜底 UUID。若 newapi 侧改为转发（如 X-Request-Id），
+    // REQUEST_ID_HEADERS 已认得、自动透传，无需改此处。
+    let id = resolve_request_id(request.headers()).unwrap_or_else(|| Uuid::new_v4().to_string());
     request.extensions_mut().insert(RequestId(id.clone()));
     let mut response = next.run(request).await;
     if let Ok(value) = HeaderValue::from_str(&id) {
