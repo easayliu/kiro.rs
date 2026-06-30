@@ -99,8 +99,9 @@ const REQUEST_ID_HEADERS: &[&str] = &[
     "x-trace-id",
 ];
 
-/// 从入站头中解析 request-id：取首个非空、可打印、长度 ≤200 的候选头，否则生成 UUID。
-fn resolve_request_id(headers: &HeaderMap) -> String {
+/// 从入站头中解析上游 request-id：取首个非空、可打印、长度 ≤200 的候选头。
+/// 命中返回 `Some(id)`；无候选命中返回 `None`（由调用方决定如何兜底）。
+fn resolve_request_id(headers: &HeaderMap) -> Option<String> {
     for name in REQUEST_ID_HEADERS {
         if let Some(value) = headers.get(*name).and_then(|v| v.to_str().ok()) {
             let value = value.trim();
@@ -108,17 +109,27 @@ fn resolve_request_id(headers: &HeaderMap) -> String {
                 && value.len() <= 200
                 && value.chars().all(|c| !c.is_control())
             {
-                return value.to_string();
+                return Some(value.to_string());
             }
         }
     }
-    Uuid::new_v4().to_string()
+    None
 }
 
 /// request-id 中间件：解析/生成关联 id 注入请求扩展，并在响应回写 `x-request-id`，
 /// 实现上游 request-id 的透传保留（请求侧沿用、响应侧回显）。
 pub async fn request_id_middleware(mut request: Request<Body>, next: Next) -> Response {
-    let id = resolve_request_id(request.headers());
+    let id = match resolve_request_id(request.headers()) {
+        Some(id) => id,
+        None => {
+            // 诊断：已知候选头都未命中，上游 request-id 没透传过来。打印全部入站 header
+            // 名（不含值，避免泄露 Authorization 等），用于发现 newapi 实际使用的头名，
+            // 之后把该头名补进 REQUEST_ID_HEADERS。命中后此分支不再触发，无日志开销。
+            let names: Vec<&str> = request.headers().keys().map(|k| k.as_str()).collect();
+            tracing::info!(inbound_headers = ?names, "request-id 透传未命中，回退 UUID");
+            Uuid::new_v4().to_string()
+        }
+    };
     request.extensions_mut().insert(RequestId(id.clone()));
     let mut response = next.run(request).await;
     if let Ok(value) = HeaderValue::from_str(&id) {
@@ -163,23 +174,26 @@ mod tests {
     #[test]
     fn preserves_upstream_request_id() {
         let h = headers(&[("x-request-id", "4c4f9fad-d444-430c-a502-2ea5535df668")]);
-        assert_eq!(resolve_request_id(&h), "4c4f9fad-d444-430c-a502-2ea5535df668");
+        assert_eq!(
+            resolve_request_id(&h).as_deref(),
+            Some("4c4f9fad-d444-430c-a502-2ea5535df668")
+        );
     }
 
     #[test]
     fn follows_header_priority() {
         let h = headers(&[("x-trace-id", "trace"), ("x-request-id", "primary")]);
-        assert_eq!(resolve_request_id(&h), "primary");
+        assert_eq!(resolve_request_id(&h).as_deref(), Some("primary"));
     }
 
     #[test]
-    fn falls_back_to_uuid_when_absent_or_invalid() {
-        // 缺失 → 生成 UUID（36 字符）
-        assert_eq!(resolve_request_id(&HeaderMap::new()).len(), 36);
-        // 空白 → 回退
-        assert_eq!(resolve_request_id(&headers(&[("x-request-id", "   ")])).len(), 36);
-        // 超长 → 回退
+    fn returns_none_when_absent_or_invalid() {
+        // 缺失 → None（由中间件兜底生成 UUID）
+        assert!(resolve_request_id(&HeaderMap::new()).is_none());
+        // 空白 → None
+        assert!(resolve_request_id(&headers(&[("x-request-id", "   ")])).is_none());
+        // 超长 → None
         let long = "a".repeat(201);
-        assert_eq!(resolve_request_id(&headers(&[("x-request-id", &long)])).len(), 36);
+        assert!(resolve_request_id(&headers(&[("x-request-id", &long)])).is_none());
     }
 }
