@@ -196,13 +196,18 @@ pub fn get_context_window_size(model: &str) -> i32 {
 /// Kiro 服务端为 agentic 端点（`agentTaskType=vibe`）强制注入的固定系统提示词 token 数。
 ///
 /// 该提示词**不在**我们发出的请求体里，而是上游在 `GenerateAssistantResponse` 端点服务端
-/// 拼入后喂给模型的，因此会计入 `contextUsage` 反推出的 input_tokens。实测（kiro-ide 模式）：
-/// 一句话请求 input=6393，其中 ~6384 即该注入；agentMode 改任何值无效，agentTaskType 只接受
-/// "vibe"（换值直接上游 400），即注入无法在请求侧关闭。每请求全价计费、无缓存折扣。
+/// 拼入后喂给模型的，因此会计入 `contextUsage` 反推出的 input_tokens。agentMode 改任何值无效，
+/// agentTaskType 只接受 "vibe"（换值直接上游 400），即注入无法在请求侧关闭。每请求全价、无缓存。
 ///
-/// 计费上报时从上游反推总量里扣除该基线，使终端用户只按**真实内容**计费（见
-/// [`strip_injected_prompt`]）。由 main 启动时用配置值经 [`set_injected_prompt_tokens`] 设入；
-/// 0 表示不扣除（保持原始上游口径）。Kiro 更新提示词或切换 client_mode 时需重新实测调整配置。
+/// **地板因模型而异**（2026-06-30 裸请求实测、与 ide/cli 模式无关）：opus-4.8≈6485、
+/// opus-4.7≈5975、sonnet-4.6≈4109、opus-4.6≈4170、opus-4.5/sonnet-4.5/haiku-4.5≈4.1K。
+/// 但 [`strip_injected_prompt`] 有 `.max(local_estimate)` 兜底——只要基线 ≥ 模型真实地板，
+/// 结果就 floor 回真实内容，故**单一基线取所有模型地板的最大值**即可覆盖全部，无需 per-model 表
+/// （基线 < 地板才会漏差额进账单）。默认 6500 = max≈6485 + 余量。
+///
+/// 计费上报时从上游反推总量里扣除该基线，使终端用户只按**真实内容**计费。由 main 启动时用配置值
+/// 经 [`set_injected_prompt_tokens`] 设入；0 表示不扣除。Kiro 更新提示词时需重新实测
+/// （曾观察到 opus-4.8 由 6393 漂移至 6485）。
 static INJECTED_PROMPT_TOKENS: AtomicI32 = AtomicI32::new(0);
 
 /// 设置 Kiro 注入提示词的扣除基线（启动时由配置注入）。负值按 0 处理。

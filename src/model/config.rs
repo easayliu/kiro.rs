@@ -125,11 +125,17 @@ pub struct Config {
     #[serde(default = "default_count_tokens_auth_type")]
     pub count_tokens_auth_type: String,
 
-    /// Kiro 服务端注入提示词的计费扣除基线（token 数，默认 6384）。
+    /// Kiro 服务端注入提示词的计费扣除基线（token 数，默认 6500）。
     ///
-    /// 上游 agentic 端点会在服务端强制注入固定系统提示词（实测 kiro-ide ≈ 6384 token），
-    /// 计入 contextUsage 反推的 input。计费时从上游总量里扣掉该值，使终端用户只按真实内容
-    /// 计费。设为 0 关闭扣除（保持原始上游口径）。Kiro 改提示词 / 切 clientMode 时需重新实测。
+    /// 上游 agentic 端点会在服务端强制注入固定系统提示词，计入 contextUsage 反推的 input。
+    /// 计费时从上游总量里扣掉该值（见 `strip_injected_prompt`，结果 floor 到本地内容估算），
+    /// 使终端用户只按真实内容计费。设为 0 关闭扣除（保持原始上游口径）。
+    ///
+    /// 取值原则：因 `.max(local_estimate)` 兜底，只要基线 ≥ 各模型真实地板，账单就 floor 回
+    /// 真实内容；基线 < 地板才会把差额漏进用户账单。故取**所有模型地板的最大值**即可覆盖全部，
+    /// 无需 per-model 表。2026-06-30 实测地板（裸请求、与 ide/cli 模式无关）：opus-4.8≈6485、
+    /// opus-4.7≈5975、sonnet-4.6/opus-4.6/4.5代≈4.1K；故默认 6500（max≈6485 + 余量）。
+    /// Kiro 改提示词时需重新实测（曾观察到 opus-4.8 由 6393 漂移至 6485）。
     #[serde(default = "default_kiro_injected_prompt_tokens")]
     pub kiro_injected_prompt_tokens: i32,
 
@@ -287,9 +293,10 @@ fn default_count_tokens_auth_type() -> String {
     "x-api-key".to_string()
 }
 
-/// Kiro 服务端注入提示词的默认扣除基线（实测 kiro-ide ≈ 6384 token）。
+/// Kiro 服务端注入提示词的默认扣除基线。
+/// 取所有模型实测地板的最大值 + 余量（2026-06-30 实测 max≈6485，opus-4.8）。
 fn default_kiro_injected_prompt_tokens() -> i32 {
-    6384
+    6500
 }
 
 fn default_tls_backend() -> TlsBackend {
