@@ -54,6 +54,8 @@ import {
   useSetRelayHost,
   useCacheScope,
   useSetCacheScope,
+  useInjectionScan,
+  useSetInjectionScan,
   useCacheSkipRate,
   useSetCacheSkipRate,
   useOutputMultiplier,
@@ -282,6 +284,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const { data: cacheScopeData, isLoading: isLoadingCacheScope } = useCacheScope()
   const { mutate: setCacheScopeMutation, isPending: isSettingCacheScope } = useSetCacheScope()
+  const { data: injectionScanData, isLoading: isLoadingInjectionScan } = useInjectionScan()
+  const { mutate: setInjectionScanMutation, isPending: isSettingInjectionScan } = useSetInjectionScan()
   const { data: cacheSkipRateData, isLoading: isLoadingCacheSkipRate } = useCacheSkipRate()
   const { mutate: setCacheSkipRateMutation, isPending: isSettingCacheSkipRate } = useSetCacheSkipRate()
   const [cacheSkipRateDialogOpen, setCacheSkipRateDialogOpen] = useState(false)
@@ -954,6 +958,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
       current === 'global' ? 'per_credential' : current === 'per_credential' ? 'off' : 'global'
     setCacheScopeMutation(next, {
       onSuccess: () => toast.success(`缓存模式已切换到 ${cacheScopeLabel(next)}`),
+      onError: err => toast.error(`切换失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
+  const handleToggleInjectionScan = () => {
+    const next = !(injectionScanData?.enabled ?? true)
+    setInjectionScanMutation(next, {
+      onSuccess: () => toast.success(next ? '已开启注入扫描' : '已关闭注入扫描'),
       onError: err => toast.error(`切换失败: ${extractErrorMessage(err)}`),
     })
   }
@@ -1652,6 +1664,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
               loading={isLoadingCacheScope}
               disabled={isLoadingCacheScope || isSettingCacheScope}
               onClick={handleCycleCacheScope}
+            />
+            <PolicyRow
+              label="注入扫描"
+              sub={injectionScanData?.enabled ?? true ? '扫描入站工具输出并记日志' : '已关闭，不扫描不记录'}
+              value={isLoadingInjectionScan ? '—' : (injectionScanData?.enabled ?? true) ? '开启' : '关闭'}
+              loading={isLoadingInjectionScan}
+              disabled={isLoadingInjectionScan || isSettingInjectionScan}
+              onClick={handleToggleInjectionScan}
             />
             <PolicyRow
               label="缓存跳过率"

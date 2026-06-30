@@ -21,6 +21,8 @@ import {
   setRelayHost,
   getGlobalCache,
   setGlobalCache,
+  getInjectionScan,
+  setInjectionScan,
   getCacheScope,
   setCacheScope,
   getCacheSkipRate,
@@ -266,6 +268,25 @@ export function useSetGlobalCache() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['globalCache'] })
       queryClient.invalidateQueries({ queryKey: ['cacheScope'] })
+    },
+  })
+}
+
+// 获取入站注入扫描开关
+export function useInjectionScan() {
+  return useQuery({
+    queryKey: ['injectionScan'],
+    queryFn: getInjectionScan,
+  })
+}
+
+// 设置入站注入扫描开关
+export function useSetInjectionScan() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setInjectionScan,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['injectionScan'] })
     },
   })
 }

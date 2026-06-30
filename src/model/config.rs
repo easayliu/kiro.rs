@@ -189,6 +189,20 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_scope: Option<String>,
 
+    /// 入站内容 prompt injection 启发式扫描开关（默认开）。
+    ///
+    /// 开启后对每个 `/v1/messages`、`/cc/v1/messages` 请求的入站文本与 tool_result
+    /// 做签名扫描，命中只记日志（外发/隐瞒/伪装系统提示/密钥外泄等），不拦截不改写。
+    /// 前端可实时切换。
+    #[serde(default = "default_injection_scan")]
+    pub injection_scan: bool,
+
+    /// 分块写入引导注入开关（默认开）。检测到客户端的写文件工具时，向 system 注入
+    /// 「大文件分块写、单次工具入参 < ~1500 字符」的英文引导，规避上游对大工具入参的
+    /// 截断（sonnet 系模型尤其需要；opus 系一次写满、不受影响）。前端可实时切换。
+    #[serde(default = "default_chunked_write_guidance")]
+    pub chunked_write_guidance: bool,
+
     /// 缓存查找跳过率（0.0-1.0，默认 None 不启用）
     ///
     /// 启用后，每个有 breakpoint 的请求以此概率跳过 cache 查找（当作
@@ -294,6 +308,14 @@ fn default_global_cache() -> bool {
     true
 }
 
+fn default_injection_scan() -> bool {
+    true
+}
+
+fn default_chunked_write_guidance() -> bool {
+    true
+}
+
 fn default_kiro_cli_version() -> String {
     "1.29.3".to_string()
 }
@@ -327,6 +349,8 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             global_cache: default_global_cache(),
             cache_scope: None,
+            injection_scan: default_injection_scan(),
+            chunked_write_guidance: default_chunked_write_guidance(),
             cache_skip_rate: None,
             output_token_multiplier: None,
             client_mode: ClientMode::default(),

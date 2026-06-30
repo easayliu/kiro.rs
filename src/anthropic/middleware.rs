@@ -5,10 +5,11 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{HeaderMap, HeaderValue, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
+use uuid::Uuid;
 
 use crate::common::auth;
 use crate::kiro::binding::BindingTable;
@@ -82,6 +83,50 @@ pub async fn auth_middleware(
     }
 }
 
+/// 请求关联 id：优先沿用上游（如 newapi）带来的 request-id，否则生成新 UUID。
+///
+/// 由 [`request_id_middleware`] 注入到请求扩展，handler 用 `Extension<RequestId>` 取出，
+/// 全链路日志据此与上游对齐排查。
+#[derive(Clone, Debug)]
+pub struct RequestId(pub String);
+
+/// 候选入站 request-id 头（按优先级）。newapi/one-api 系默认用 `x-request-id`。
+const REQUEST_ID_HEADERS: &[&str] = &[
+    "x-request-id",
+    "x-oneapi-request-id",
+    "x-new-api-request-id",
+    "request-id",
+    "x-trace-id",
+];
+
+/// 从入站头中解析 request-id：取首个非空、可打印、长度 ≤200 的候选头，否则生成 UUID。
+fn resolve_request_id(headers: &HeaderMap) -> String {
+    for name in REQUEST_ID_HEADERS {
+        if let Some(value) = headers.get(*name).and_then(|v| v.to_str().ok()) {
+            let value = value.trim();
+            if !value.is_empty()
+                && value.len() <= 200
+                && value.chars().all(|c| !c.is_control())
+            {
+                return value.to_string();
+            }
+        }
+    }
+    Uuid::new_v4().to_string()
+}
+
+/// request-id 中间件：解析/生成关联 id 注入请求扩展，并在响应回写 `x-request-id`，
+/// 实现上游 request-id 的透传保留（请求侧沿用、响应侧回显）。
+pub async fn request_id_middleware(mut request: Request<Body>, next: Next) -> Response {
+    let id = resolve_request_id(request.headers());
+    request.extensions_mut().insert(RequestId(id.clone()));
+    let mut response = next.run(request).await;
+    if let Ok(value) = HeaderValue::from_str(&id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
+}
+
 /// CORS 中间件层
 ///
 /// **安全说明**：当前配置允许所有来源（Any），这是为了支持公开 API 服务。
@@ -98,4 +143,43 @@ pub fn cors_layer() -> tower_http::cors::CorsLayer {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn preserves_upstream_request_id() {
+        let h = headers(&[("x-request-id", "4c4f9fad-d444-430c-a502-2ea5535df668")]);
+        assert_eq!(resolve_request_id(&h), "4c4f9fad-d444-430c-a502-2ea5535df668");
+    }
+
+    #[test]
+    fn follows_header_priority() {
+        let h = headers(&[("x-trace-id", "trace"), ("x-request-id", "primary")]);
+        assert_eq!(resolve_request_id(&h), "primary");
+    }
+
+    #[test]
+    fn falls_back_to_uuid_when_absent_or_invalid() {
+        // 缺失 → 生成 UUID（36 字符）
+        assert_eq!(resolve_request_id(&HeaderMap::new()).len(), 36);
+        // 空白 → 回退
+        assert_eq!(resolve_request_id(&headers(&[("x-request-id", "   ")])).len(), 36);
+        // 超长 → 回退
+        let long = "a".repeat(201);
+        assert_eq!(resolve_request_id(&headers(&[("x-request-id", &long)])).len(), 36);
+    }
 }

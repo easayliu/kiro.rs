@@ -214,6 +214,12 @@ async fn main() {
     // 输出 token 上报倍率（仅放大计费/上报口径，上游真实成本与缓存命中率不变）。
     anthropic::set_output_token_multiplier(config.output_token_multiplier);
 
+    // 入站 prompt injection 启发式扫描开关（前端可实时切换）。
+    anthropic::set_injection_scan_enabled(config.injection_scan);
+
+    // 分块写入引导注入开关（检测写文件工具时向 system 注入分块引导；前端可实时切换）。
+    anthropic::set_chunked_write_guidance(config.chunked_write_guidance);
+
     // 解析缓存分桶策略：cache_scope 优先，否则回落到 global_cache 布尔
     let cache_scope = match config.cache_scope.as_deref() {
         Some(s) => anthropic::CacheScope::parse(s),

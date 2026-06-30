@@ -340,6 +340,38 @@ pub struct SetGlobalCacheRequest {
     pub enabled: bool,
 }
 
+/// 注入扫描开关响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InjectionScanResponse {
+    /// 是否启用入站 prompt injection 扫描
+    pub enabled: bool,
+}
+
+/// 设置注入扫描开关请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetInjectionScanRequest {
+    /// 是否启用入站 prompt injection 扫描
+    pub enabled: bool,
+}
+
+/// 分块写入引导开关响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChunkedWriteGuidanceResponse {
+    /// 是否启用分块写入引导注入
+    pub enabled: bool,
+}
+
+/// 设置分块写入引导开关请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetChunkedWriteGuidanceRequest {
+    /// 是否启用分块写入引导注入
+    pub enabled: bool,
+}
+
 /// 缓存分桶策略响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

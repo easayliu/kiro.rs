@@ -26,6 +26,7 @@ mod billing_stats;
 mod cache_tracker;
 mod converter;
 mod handlers;
+mod injection_scan;
 mod middleware;
 mod router;
 mod stream;
@@ -35,7 +36,11 @@ mod websearch;
 pub use billing_stats::{global as billing_stats, init_persistence as init_billing_stats};
 pub use cache_tracker::{CacheScope, CacheTracker};
 pub use converter::{
-    map_model, output_token_multiplier, set_dynamic_model_windows, set_injected_prompt_tokens,
+    chunked_write_guidance_enabled, map_model, output_token_multiplier,
+    set_chunked_write_guidance, set_dynamic_model_windows, set_injected_prompt_tokens,
     set_output_token_multiplier,
+};
+pub use injection_scan::{
+    is_enabled as injection_scan_enabled, set_enabled as set_injection_scan_enabled,
 };
 pub use router::create_router_with_provider;

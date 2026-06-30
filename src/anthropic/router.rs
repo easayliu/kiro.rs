@@ -11,7 +11,7 @@ use crate::kiro::provider::KiroProvider;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
-    middleware::{AppState, auth_middleware, cors_layer},
+    middleware::{AppState, auth_middleware, cors_layer, request_id_middleware},
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -69,6 +69,7 @@ pub fn create_router_with_provider(
     let router = Router::new()
         .nest("/v1", v1_routes)
         .nest("/cc/v1", cc_v1_routes)
+        .layer(middleware::from_fn(request_id_middleware))
         .layer(cors_layer())
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .with_state(state.clone());

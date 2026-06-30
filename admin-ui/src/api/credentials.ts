@@ -208,6 +208,18 @@ export async function setGlobalCache(enabled: boolean): Promise<{ enabled: boole
   return data
 }
 
+// 获取入站注入扫描开关
+export async function getInjectionScan(): Promise<{ enabled: boolean }> {
+  const { data } = await api.get<{ enabled: boolean }>('/config/injection-scan')
+  return data
+}
+
+// 设置入站注入扫描开关
+export async function setInjectionScan(enabled: boolean): Promise<{ enabled: boolean }> {
+  const { data } = await api.put<{ enabled: boolean }>('/config/injection-scan', { enabled })
+  return data
+}
+
 // 缓存分桶策略（两种都按用户身份 metadata.user_id 分桶，PerCredential 在此之上再按凭据切分）
 export type CacheScope = 'global' | 'per_credential' | 'off'
 

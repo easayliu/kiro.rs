@@ -481,6 +481,72 @@ impl AdminService {
         })
     }
 
+    /// 获取注入扫描开关
+    pub fn get_injection_scan(&self) -> crate::admin::types::InjectionScanResponse {
+        crate::admin::types::InjectionScanResponse {
+            enabled: crate::anthropic::injection_scan_enabled(),
+        }
+    }
+
+    /// 设置注入扫描开关（同时持久化到 config.json）
+    pub fn set_injection_scan(
+        &self,
+        req: crate::admin::types::SetInjectionScanRequest,
+    ) -> Result<crate::admin::types::InjectionScanResponse, AdminServiceError> {
+        crate::anthropic::set_injection_scan_enabled(req.enabled);
+
+        if let Some(config_path) = self.token_manager.config().config_path() {
+            match crate::model::config::Config::load(config_path) {
+                Ok(mut config) => {
+                    config.injection_scan = req.enabled;
+                    if let Err(e) = config.save() {
+                        tracing::warn!("保存注入扫描开关失败: {}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("加载配置文件失败: {}", e);
+                }
+            }
+        }
+
+        Ok(crate::admin::types::InjectionScanResponse {
+            enabled: req.enabled,
+        })
+    }
+
+    /// 获取分块写入引导开关
+    pub fn get_chunked_write_guidance(&self) -> crate::admin::types::ChunkedWriteGuidanceResponse {
+        crate::admin::types::ChunkedWriteGuidanceResponse {
+            enabled: crate::anthropic::chunked_write_guidance_enabled(),
+        }
+    }
+
+    /// 设置分块写入引导开关（同时持久化到 config.json）
+    pub fn set_chunked_write_guidance(
+        &self,
+        req: crate::admin::types::SetChunkedWriteGuidanceRequest,
+    ) -> Result<crate::admin::types::ChunkedWriteGuidanceResponse, AdminServiceError> {
+        crate::anthropic::set_chunked_write_guidance(req.enabled);
+
+        if let Some(config_path) = self.token_manager.config().config_path() {
+            match crate::model::config::Config::load(config_path) {
+                Ok(mut config) => {
+                    config.chunked_write_guidance = req.enabled;
+                    if let Err(e) = config.save() {
+                        tracing::warn!("保存分块写入引导开关失败: {}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("加载配置文件失败: {}", e);
+                }
+            }
+        }
+
+        Ok(crate::admin::types::ChunkedWriteGuidanceResponse {
+            enabled: req.enabled,
+        })
+    }
+
     /// 获取缓存分桶策略
     pub fn get_cache_scope(&self) -> crate::admin::types::CacheScopeResponse {
         use crate::anthropic::CacheScope;

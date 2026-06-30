@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use base64::Engine;
 use parking_lot::RwLock;
@@ -1289,24 +1289,108 @@ fn build_additional_model_request_fields(req: &MessagesRequest) -> Option<serde_
 /// * `messages` - 消息切片；最后一条作为 currentMessage（可能是 user，也可能是
 ///   末尾 assistant(prefill 透传)），其余进入历史。
 /// * `model_id` - 已映射的 Kiro 模型 ID
+/// 分块写入引导注入开关（默认开）。
+///
+/// 背景：上游 sonnet 系模型倾向「先写一小块、再多次 append/edit 追加」来写大文件
+/// （对齐 Kiro IDE 的 fs_write + fs_append 行为）；若客户端只给一个单次创建的写文件
+/// 工具、且无引导，模型会吐完路径就停（表现为 Write Failed / 工具入参残缺）。opus 系
+/// 模型一次性写满、不受影响。开启后，检测到「写文件工具」即向 system 注入分块引导，
+/// 引用客户端实际的工具名，让模型把单次工具入参控制在阈值内、分块写完。
+static CHUNKED_WRITE_GUIDANCE: AtomicBool = AtomicBool::new(true);
+
+/// 设置分块写入引导开关（启动时由 config 注入）。
+pub fn set_chunked_write_guidance(on: bool) {
+    CHUNKED_WRITE_GUIDANCE.store(on, Ordering::Relaxed);
+}
+
+/// 当前分块写入引导开关。
+pub fn chunked_write_guidance_enabled() -> bool {
+    CHUNKED_WRITE_GUIDANCE.load(Ordering::Relaxed)
+}
+
+/// 写文件工具名（创建/覆盖整文件）。
+const WRITE_TOOL_NAMES: &[&str] =
+    &["write", "fs_write", "create_file", "write_file", "write_to_file", "createfile"];
+/// 追加/编辑工具名（向已有文件追加或替换片段）。
+const APPEND_TOOL_NAMES: &[&str] = &[
+    "append", "fs_append", "edit", "str_replace", "str_replace_editor",
+    "str_replace_based_edit_tool", "insert_edit_into_file", "apply_patch",
+];
+
+/// 从请求里检测「写文件工具」（必有）与「追加/编辑工具」（可选），返回它们的原始名称。
+fn detect_file_write_tools(req: &MessagesRequest) -> Option<(String, Option<String>)> {
+    let tools = req.tools.as_ref()?;
+    let find = |names: &[&str]| {
+        tools
+            .iter()
+            .find(|t| names.contains(&t.name.to_lowercase().as_str()))
+            .map(|t| t.name.clone())
+    };
+    let write = find(WRITE_TOOL_NAMES)?;
+    let append = find(APPEND_TOOL_NAMES);
+    Some((write, append))
+}
+
+/// 构造英文分块写入引导（引用客户端实际的工具名）。
+fn chunked_write_instruction(write: &str, append: Option<&str>) -> String {
+    match append {
+        Some(a) => format!(
+            "<file_writing_chunking>\n\
+             When creating a large file, do NOT put the whole file content in a single tool call \
+             (the upstream truncates oversized tool input, which causes the write to fail). \
+             Instead: call `{write}` with ONLY the first chunk of the file (at most ~40 lines / under ~1500 characters), \
+             then call `{a}` repeatedly, each appending at most ~40 lines / under ~1500 characters, until the file is complete. \
+             Keep every single `{write}`/`{a}` call's content under ~1500 characters. Never write all content at once.\n\
+             </file_writing_chunking>"
+        ),
+        None => format!(
+            "<file_writing_chunking>\n\
+             When creating a large file, do NOT put the whole file content in a single `{write}` call \
+             (the upstream truncates oversized tool input, which causes the write to fail). \
+             Split the content across multiple sequential tool calls, each carrying at most ~40 lines / under ~1500 characters. \
+             Never write all content at once.\n\
+             </file_writing_chunking>"
+        ),
+    }
+}
+
 fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
-    // 1. 处理系统消息
-    if let Some(ref system) = req.system {
-        let system_content: String = system
-            .iter()
-            .map(|s| s.text.clone())
-            .collect::<Vec<_>>()
-            .join("\n");
+    // 1. 处理系统消息（+ 可选的分块写入引导注入）
+    let mut system_content: String = req
+        .system
+        .as_ref()
+        .map(|system| {
+            system
+                .iter()
+                .map(|s| s.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
 
-        if !system_content.is_empty() {
-            // 系统消息原样透传，不注入分块写入策略提示词。
-            // 系统消息作为 user 放入历史。新端点不要求 user/assistant 严格交替，
-            // 故不再补配 "I will follow these instructions." 的伪造 assistant 应答（会污染上下文）。
-            let user_msg = HistoryUserMessage::new(system_content, model_id);
-            history.push(Message::User(user_msg));
+    // 检测到写文件工具时，向 system 注入分块写入引导（引用客户端真实工具名）。
+    // 仅对 sonnet 系注入：实测只有 sonnet 有「吐完路径就停 / Write Failed」的早停问题；
+    // opus 系本来一次写满更高效，若被引导强制分块只会徒增 append 轮次（opus-4.8 实测会碎到
+    // ~260 字符/块），故用模型闸门排除；haiku 无视该引导，注入与否无影响。
+    if CHUNKED_WRITE_GUIDANCE.load(Ordering::Relaxed) && model_id.starts_with("claude-sonnet") {
+        if let Some((write, append)) = detect_file_write_tools(req) {
+            let guidance = chunked_write_instruction(&write, append.as_deref());
+            if system_content.is_empty() {
+                system_content = guidance;
+            } else {
+                system_content.push_str("\n\n");
+                system_content.push_str(&guidance);
+            }
         }
+    }
+
+    if !system_content.is_empty() {
+        // 系统消息作为 user 放入历史。新端点不要求 user/assistant 严格交替，
+        // 故不再补配 "I will follow these instructions." 的伪造 assistant 应答（会污染上下文）。
+        let user_msg = HistoryUserMessage::new(system_content, model_id);
+        history.push(Message::User(user_msg));
     }
 
     // 2. 处理常规消息历史

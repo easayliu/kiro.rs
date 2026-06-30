@@ -16,7 +16,9 @@ use super::{
         SetCacheSkipRateRequest, SetConcurrencyLimitRequest, SetOutputMultiplierRequest,
         SetCredentialGroupRequest, SetDefaultConcurrencyLimitRequest, SetDefaultRpmLimitRequest,
         SetDisabledRequest,
-        SetGlobalCacheRequest, SetLoadBalancingModeRequest, SetOverageRequest, SetPriorityRequest,
+        SetChunkedWriteGuidanceRequest,
+        SetGlobalCacheRequest, SetInjectionScanRequest, SetLoadBalancingModeRequest,
+        SetOverageRequest, SetPriorityRequest,
         SetRelayHostRequest, SetRpmLimitRequest, SuccessResponse, UpsertProxyGroupRequest,
     },
 };
@@ -349,6 +351,44 @@ pub async fn set_global_cache(
     Json(payload): Json<SetGlobalCacheRequest>,
 ) -> impl IntoResponse {
     match state.service.set_global_cache(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/injection-scan
+/// 获取入站注入扫描开关
+pub async fn get_injection_scan(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_injection_scan();
+    Json(response)
+}
+
+/// PUT /api/admin/config/injection-scan
+/// 设置入站注入扫描开关
+pub async fn set_injection_scan(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetInjectionScanRequest>,
+) -> impl IntoResponse {
+    match state.service.set_injection_scan(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/chunked-write-guidance
+/// 获取分块写入引导开关
+pub async fn get_chunked_write_guidance(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_chunked_write_guidance();
+    Json(response)
+}
+
+/// PUT /api/admin/config/chunked-write-guidance
+/// 设置分块写入引导开关
+pub async fn set_chunked_write_guidance(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetChunkedWriteGuidanceRequest>,
+) -> impl IntoResponse {
+    match state.service.set_chunked_write_guidance(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

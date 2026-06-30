@@ -13,9 +13,10 @@ use super::{
         batch_set_priority, batch_set_rpm_limit, delete_credential, delete_proxy_group,
         force_refresh_token,
         get_all_credentials, get_billing_stats,
-        get_cache_scope, get_cache_skip_rate, get_credential_balance, get_credential_models,
+        get_cache_scope, get_cache_skip_rate, get_chunked_write_guidance,
+        get_credential_balance, get_credential_models,
         get_default_concurrency_limit, get_default_rpm_limit,
-        get_global_cache, get_load_balancing_mode, get_me, get_output_multiplier,
+        get_global_cache, get_injection_scan, get_load_balancing_mode, get_me, get_output_multiplier,
         get_stats_summary, get_stats_timeseries,
         list_proxy_groups,
         reset_failure_count,
@@ -23,7 +24,8 @@ use super::{
         set_output_multiplier,
         set_credential_disabled, set_credential_group,
         set_credential_overage, set_credential_priority, set_credential_rpm_limit,
-        set_default_concurrency_limit, set_default_rpm_limit, set_global_cache,
+        set_chunked_write_guidance,
+        set_default_concurrency_limit, set_default_rpm_limit, set_global_cache, set_injection_scan,
         set_load_balancing_mode, get_relay_host, set_relay_host, upsert_proxy_group,
     },
     middleware::{AdminState, admin_auth_middleware},
@@ -112,6 +114,14 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/global-cache",
             get(get_global_cache).put(set_global_cache),
+        )
+        .route(
+            "/config/injection-scan",
+            get(get_injection_scan).put(set_injection_scan),
+        )
+        .route(
+            "/config/chunked-write-guidance",
+            get(get_chunked_write_guidance).put(set_chunked_write_guidance),
         )
         .route(
             "/config/cache-scope",

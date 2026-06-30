@@ -228,6 +228,20 @@ impl EventStreamDecoder {
         self.buffer.len()
     }
 
+    /// 容错恢复期间累计跳过的字节数（仅用于诊断）。
+    ///
+    /// > 0 说明上游流里出现过 CRC 失败 / 帧长异常并触发了跳字节/跳帧恢复——
+    /// 此时下游可能丢了若干事件帧（含 tool 入参分片），是“客户端拿到残缺工具调用”
+    /// 的一种**代理侧**成因，需与“模型自己收笔”区分（见 handlers 收尾诊断日志）。
+    pub fn bytes_skipped(&self) -> usize {
+        self.bytes_skipped
+    }
+
+    /// 已成功解出的帧数（仅用于诊断）。
+    pub fn frames_decoded(&self) -> usize {
+        self.frames_decoded
+    }
+
     /// 尝试容错恢复
     ///
     /// 根据错误类型采用不同的恢复策略（参考 kiro-kt 的设计）：

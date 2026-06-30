@@ -9,6 +9,7 @@ use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::token;
 use axum::{
+    Extension,
     Json as JsonExtractor,
     body::Body,
     extract::State,
@@ -25,8 +26,9 @@ use uuid::Uuid;
 use std::sync::Arc;
 
 use super::cache_tracker::{CacheProfile, CacheScope, CacheTracker};
-use super::converter::{ConversionError, convert_request};
-use super::middleware::AppState;
+use super::converter::{ConversionError, convert_request, injected_prompt_tokens};
+use super::injection_scan;
+use super::middleware::{AppState, RequestId};
 use super::stream::{BufferedStreamContext, CacheUsage, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse};
 use super::websearch;
@@ -325,20 +327,67 @@ pub async fn get_models() -> impl IntoResponse {
     })
 }
 
+/// 扫描入站内容的 prompt injection 启发式签名并按结构化字段告警。
+///
+/// 只记录、不拦截：命中通常意味着可疑指令（外发/隐瞒/伪装系统提示/密钥外泄等）藏在
+/// 客户端的工具输出里，而非中转注入。日志带 `request_id` 与 `content_sha`，排查时可凭此
+/// 定位具体消息块并证明可疑内容来自入站数据。每请求最多记录 8 条，避免日志爆量。
+fn log_injection_scan(request_id: &str, payload: &MessagesRequest) {
+    if !injection_scan::is_enabled() {
+        return;
+    }
+    let findings = injection_scan::scan_request(payload);
+    if findings.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        request_id = %request_id,
+        hit_count = findings.len(),
+        "检测到潜在 prompt injection（来自入站内容，非中转注入）"
+    );
+    for f in findings.iter().take(8) {
+        tracing::warn!(
+            request_id = %request_id,
+            rule = %f.rule,
+            msg_index = f.msg_index,
+            role = %f.role,
+            block_kind = %f.block_kind,
+            tool_use_id = f.tool_use_id.as_deref().unwrap_or("-"),
+            content_sha = %f.content_sha,
+            snippet = %f.snippet,
+            "潜在 prompt injection 命中"
+        );
+    }
+    if findings.len() > 8 {
+        tracing::warn!(
+            request_id = %request_id,
+            omitted = findings.len() - 8,
+            "命中过多，已省略后续条目"
+        );
+    }
+}
+
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
     JsonExtractor(payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    // 关联 id 由 request_id_middleware 注入：优先沿用上游（newapi）带来的 request-id。
     tracing::debug!(
+        request_id = %request_id,
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
+
+    // 入站内容的 prompt injection 启发式扫描（只记录、不拦截）。
+    log_injection_scan(&request_id, &payload);
+
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -408,6 +457,16 @@ pub async fn post_messages(
             return (status, Json(ErrorResponse::new(error_type, message))).into_response();
         }
     };
+
+    // 注入溯源：记录中转层实际加进上游请求的固定内容，便于排查时证明
+    // 中转只加了这些（系统提示词基线 + cli 模式 env_state + origin），未参与可疑指令。
+    tracing::info!(
+        request_id = %request_id,
+        injected_system_tokens = injected_prompt_tokens(),
+        inject_env_state = provider.is_cli_mode(),
+        origin = %provider.origin(),
+        "中转注入溯源（仅固定内容）"
+    );
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
@@ -745,6 +804,7 @@ fn create_sse_stream(
                                 saw_metering = stats.saw_metering,
                                 saw_context_usage = stats.saw_context_usage,
                                 likely_complete = likely_complete,
+                                bytes_skipped = decoder.bytes_skipped(),
                                 output_tokens = ctx.output_tokens,
                                 "流式响应中断：读取上游响应流失败（likely_complete=false→发 error 事件让客户端重试；likely_complete=true→疑似 rustls 缺 close_notify 误判、响应其实已完整，照常补干净收尾）: {}",
                                 describe_reqwest_error(&e)
@@ -798,19 +858,35 @@ fn create_sse_stream(
                                 );
                             } else {
                                 // 计费汇总由 generate_final_events 的「请求完成（流式）」承担；
-                                // 此处仅记 transport 层 EOF/耗时，降级 debug 避免每请求双 info 行。
-                                tracing::debug!(
-                                    model = %ctx.model,
-                                    termination = "clean_eof",
-                                    elapsed_secs = stats.start.elapsed().as_secs_f64(),
-                                    output_tokens = ctx.output_tokens,
-                                    "上游流正常结束（EOF）"
-                                );
-                                tracing::debug!(
-                                    bytes = stats.bytes,
-                                    frames = stats.frames,
-                                    "上游流正常结束（EOF）"
-                                );
+                                // 此处仅记 transport 层 EOF/耗时。
+                                // bytes_skipped>0：解码器在 CRC/帧长错误时跳过过字节/整帧 —— 即便
+                                // 传输层干净结束，下游也可能丢了事件帧（含 tool 入参分片），是
+                                // “客户端拿到残缺工具调用” 的代理侧成因；=0 则排除丢帧、指向模型收笔。
+                                let skipped = decoder.bytes_skipped();
+                                if skipped > 0 {
+                                    tracing::warn!(
+                                        model = %ctx.model,
+                                        termination = "clean_eof_with_skips",
+                                        elapsed_secs = stats.start.elapsed().as_secs_f64(),
+                                        bytes = stats.bytes,
+                                        frames = stats.frames,
+                                        frames_decoded = decoder.frames_decoded(),
+                                        bytes_skipped = skipped,
+                                        output_tokens = ctx.output_tokens,
+                                        "上游流干净结束但解码期间跳过过字节/帧（CRC/帧长错误）：下游可能丢了事件帧，疑似代理侧截断而非模型收笔"
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        model = %ctx.model,
+                                        termination = "clean_eof",
+                                        elapsed_secs = stats.start.elapsed().as_secs_f64(),
+                                        bytes = stats.bytes,
+                                        frames = stats.frames,
+                                        bytes_skipped = skipped,
+                                        output_tokens = ctx.output_tokens,
+                                        "上游流正常结束（EOF）"
+                                    );
+                                }
                             }
                             // 输出中断处理：pending>0（解码器残留半帧）是流被切在帧中间的
                             // 铁证 = 真·输出中断。此时发 error 事件让客户端重试，**不**补
@@ -1240,15 +1316,21 @@ pub async fn count_tokens(
 /// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
 pub async fn post_messages_cc(
     State(state): State<AppState>,
+    Extension(RequestId(request_id)): Extension<RequestId>,
     JsonExtractor(payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    // 关联 id 由 request_id_middleware 注入：优先沿用上游（newapi）带来的 request-id。
     tracing::debug!(
+        request_id = %request_id,
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+
+    // 入站内容的 prompt injection 启发式扫描（只记录、不拦截）。
+    log_injection_scan(&request_id, &payload);
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -1319,6 +1401,16 @@ pub async fn post_messages_cc(
             return (status, Json(ErrorResponse::new(error_type, message))).into_response();
         }
     };
+
+    // 注入溯源：记录中转层实际加进上游请求的固定内容，便于排查时证明
+    // 中转只加了这些（系统提示词基线 + cli 模式 env_state + origin），未参与可疑指令。
+    tracing::info!(
+        request_id = %request_id,
+        injected_system_tokens = injected_prompt_tokens(),
+        inject_env_state = provider.is_cli_mode(),
+        origin = %provider.origin(),
+        "中转注入溯源（仅固定内容）"
+    );
 
     // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
     let kiro_request = KiroRequest {
@@ -1669,4 +1761,270 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    //! 复现客户端 “Write Failed / 会话卡死”：上游在事件帧中间断流时，代理应发
+    //! `event: error`（[`create_truncation_error_sse`]）让客户端重试，而**不是**伪造
+    //! 一个干净的 `message_stop`。靠提示词无法触发（模型不会在单个 tool 入参里吐
+    //! 几 MB 文本），故用本地 mock 上游：发「一个完整帧 + 半个帧」后直接关连接，
+    //! 走真实的 [`create_sse_stream`] EOF-残留半帧（`pending_bytes>0`）路径。
+
+    use super::*;
+    use std::collections::HashMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// 编码一个 String 类型的 event-stream 头部：`[name_len][name][type=7][val_len_be16][val]`
+    fn header_str(name: &str, value: &str) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.push(name.len() as u8);
+        h.extend_from_slice(name.as_bytes());
+        h.push(7u8); // HeaderValueType::String
+        h.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        h.extend_from_slice(value.as_bytes());
+        h
+    }
+
+    /// 构造一个合法的 AWS event-stream 帧（prelude + headers + payload + msg_crc，CRC 均正确）。
+    fn build_event_frame(event_type: &str, payload: &[u8]) -> Vec<u8> {
+        use crate::kiro::parser::crc::crc32;
+        use crate::kiro::parser::frame::PRELUDE_SIZE;
+
+        let mut headers = Vec::new();
+        headers.extend_from_slice(&header_str(":event-type", event_type));
+        headers.extend_from_slice(&header_str(":content-type", "application/json"));
+        headers.extend_from_slice(&header_str(":message-type", "event"));
+
+        let header_length = headers.len() as u32;
+        let total_length = (PRELUDE_SIZE + headers.len() + payload.len() + 4) as u32;
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&total_length.to_be_bytes());
+        msg.extend_from_slice(&header_length.to_be_bytes());
+        let prelude_crc = crc32(&msg[..8]);
+        msg.extend_from_slice(&prelude_crc.to_be_bytes());
+        msg.extend_from_slice(&headers);
+        msg.extend_from_slice(payload);
+        let message_crc = crc32(&msg);
+        msg.extend_from_slice(&message_crc.to_be_bytes());
+        msg
+    }
+
+    /// 起一个只服务一次的 mock 上游：写完 `body` 后立刻关闭连接（无 Content-Length，
+    /// 以 connection-close 界定 body → reqwest 读到干净 EOF）。返回监听地址。
+    async fn spawn_mock_upstream(body: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // 先把请求读掉，避免未读数据导致 close 发出 RST。
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let mut resp = Vec::new();
+            resp.extend_from_slice(
+                b"HTTP/1.1 200 OK\r\n\
+                  Content-Type: application/vnd.amazon.eventstream\r\n\
+                  Connection: close\r\n\r\n",
+            );
+            resp.extend_from_slice(&body);
+            let _ = socket.write_all(&resp).await;
+            let _ = socket.flush().await;
+            // socket drop → FIN，制造流中途的 EOF。
+        });
+        format!("http://{addr}/")
+    }
+
+    /// 收集 SSE 输出流为字符串。
+    async fn collect_sse(
+        stream: impl Stream<Item = Result<Bytes, Infallible>>,
+    ) -> String {
+        futures::pin_mut!(stream);
+        let mut out = String::new();
+        while let Some(Ok(bytes)) = stream.next().await {
+            out.push_str(&String::from_utf8_lossy(&bytes));
+        }
+        out
+    }
+
+    /// 上游在事件帧中间断流（EOF 时解码器残留半帧）→ 代理应发 `event: error`、
+    /// 不发 `message_stop`，即客户端看到的 “Write Failed / 回复中断、需重试”。
+    #[tokio::test]
+    async fn write_failed_on_mid_frame_truncation() {
+        // body = 一个完整的 assistantResponseEvent（产生部分正文）+ 第二帧的前半截。
+        let full = build_event_frame(
+            "assistantResponseEvent",
+            br#"{"content":"Hello, this is a partial reply"}"#,
+        );
+        let frame2 = build_event_frame(
+            "assistantResponseEvent",
+            br#"{"content":" that gets cut off mid-stream"}"#,
+        );
+        let half = &frame2[..frame2.len() - 12]; // 切在帧中间，prelude 之后缺尾
+
+        let mut body = full.clone();
+        body.extend_from_slice(half);
+
+        let url = spawn_mock_upstream(body).await;
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4-5", 10, false, HashMap::new());
+        let initial = ctx.generate_initial_events();
+        let out = collect_sse(create_sse_stream(resp, ctx, initial)).await;
+
+        // 1) 部分正文应已下发给客户端
+        assert!(out.contains("Hello, this is a partial reply"), "缺少已下发的部分正文:\n{out}");
+        // 2) 断流应转成 error 事件（Write Failed 的触发源）
+        assert!(out.contains("event: error"), "未发 error 事件:\n{out}");
+        assert!(out.contains("truncated"), "error 文案应说明被截断:\n{out}");
+        // 3) 关键：绝不能补干净收尾，否则客户端把半截当成功收下、不重试
+        assert!(!out.contains("message_stop"), "真截断时不应发 message_stop:\n{out}");
+        assert!(
+            !out.contains("\"stop_reason\":\"end_turn\""),
+            "真截断时不应伪造 end_turn:\n{out}"
+        );
+    }
+
+    /// 构造一个 toolUseEvent 帧（name/toolUseId/input 分片/stop）。
+    fn build_tool_frame(name: &str, id: &str, input_fragment: &str, stop: bool) -> Vec<u8> {
+        let payload = serde_json::json!({
+            "name": name,
+            "toolUseId": id,
+            "input": input_fragment,
+            "stop": stop,
+        })
+        .to_string();
+        build_event_frame("toolUseEvent", payload.as_bytes())
+    }
+
+    /// 忠实性验证：上游把一段**完整**的 tool 入参 JSON 切成多个 toolUseEvent 分片
+    /// 逐个下发（最后一个 stop=true），代理必须把所有分片原样拼回——一个字节都不能丢。
+    /// 若本测试通过，则“客户端拿到残缺入参”不是代理在转发链路上丢分片造成的，
+    /// 而是上游/模型本身就只发了残缺入参。
+    #[tokio::test]
+    async fn fragmented_tool_input_is_forwarded_intact() {
+        // 一段完整、合法的写文件入参，含中文路径与较长 content（模拟真实写文件调用）。
+        let full_input = r#"{"file_path": "d:/AI文档设计/M1-退件列表-PC.html", "content": "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body><h1>退件列表</h1><table><tr><td>1</td></tr></table></body></html>"}"#;
+
+        // 按字符边界切成 11 段（含可能切在转义序列、中文字节、JSON token 中间的情况）。
+        let chunks: Vec<&str> = {
+            let mut v = Vec::new();
+            let bytes = full_input.as_bytes();
+            let mut start = 0;
+            let step = bytes.len() / 11;
+            while start < full_input.len() {
+                let mut end = (start + step).min(full_input.len());
+                while end < full_input.len() && !full_input.is_char_boundary(end) {
+                    end += 1;
+                }
+                v.push(&full_input[start..end]);
+                start = end;
+            }
+            v
+        };
+
+        let mut body = Vec::new();
+        let id = "tooluse_w23qiWBrnqCYuzKmftW2xv";
+        for (i, frag) in chunks.iter().enumerate() {
+            let stop = i == chunks.len() - 1;
+            body.extend_from_slice(&build_tool_frame("Write", id, frag, stop));
+        }
+
+        let url = spawn_mock_upstream(body).await;
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4-5", 10, false, HashMap::new());
+        let initial = ctx.generate_initial_events();
+        let out = collect_sse(create_sse_stream(resp, ctx, initial)).await;
+
+        let reassembled = reassemble_tool_input(&out);
+        assert_eq!(
+            reassembled, full_input,
+            "分片转发必须无损：拼回的入参与原始入参逐字节一致"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&reassembled).is_ok(),
+            "拼回的入参应是合法 JSON"
+        );
+        assert!(out.contains("\"stop_reason\":\"tool_use\""), "应为 tool_use 收尾:\n{out}");
+        assert!(out.contains("message_stop"));
+    }
+
+    /// 对照组：完整帧 + 协议结束符（无残留半帧）→ 正常收尾，应有 message_stop、无 error。
+    #[tokio::test]
+    async fn clean_finish_emits_message_stop() {
+        let full = build_event_frame(
+            "assistantResponseEvent",
+            br#"{"content":"complete reply"}"#,
+        );
+        let url = spawn_mock_upstream(full).await;
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4-5", 10, false, HashMap::new());
+        let initial = ctx.generate_initial_events();
+        let out = collect_sse(create_sse_stream(resp, ctx, initial)).await;
+
+        assert!(out.contains("complete reply"), "缺少正文:\n{out}");
+        assert!(out.contains("message_stop"), "正常结束应有 message_stop:\n{out}");
+        assert!(!out.contains("event: error"), "正常结束不应有 error 事件:\n{out}");
+    }
+
+    /// 把 SSE 输出里某个 tool_use 块的 input_json_delta 拼接还原成入参 JSON 字符串。
+    fn reassemble_tool_input(sse: &str) -> String {
+        sse.lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+            .filter(|v| v["type"] == "content_block_delta" && v["delta"]["type"] == "input_json_delta")
+            .filter_map(|v| v["delta"]["partial_json"].as_str().map(String::from))
+            .collect()
+    }
+
+    /// 修复验证 —— “Write failed / 工具参数缺失” 的正解：上游发来一个 **入参残缺**
+    /// （只有 file_path、缺必填 content、JSON 未闭合）但 **stop=true** 的 toolUseEvent，
+    /// 随后干净结束。代理收尾时检测到该 tool 块入参非空且非法 JSON，按官方契约把
+    /// stop_reason 改为 **max_tokens**（而非 tool_use）——流仍干净收尾，但客户端据此
+    /// 知道该工具调用不完整、不会拿去执行。
+    #[tokio::test]
+    async fn incomplete_tool_input_sets_max_tokens_stop() {
+        // toolUseEvent.input 是“入参 JSON 的字符串片段”。这里给一段残缺的：缺 content、未闭合。
+        let tool_payload = serde_json::json!({
+            "name": "Write",
+            "toolUseId": "tooluse_w23qiWBrnqCYuzKmftW2xv",
+            "input": r#"{"file_path": "d:/demo/M1-退件列表-PC.html""#,
+            "stop": true
+        })
+        .to_string();
+        let body = build_event_frame("toolUseEvent", tool_payload.as_bytes());
+
+        let url = spawn_mock_upstream(body).await;
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-sonnet-4-5", 10, false, HashMap::new());
+        let initial = ctx.generate_initial_events();
+        let out = collect_sse(create_sse_stream(resp, ctx, initial)).await;
+
+        // 前提：客户端拿到的入参确实是“非法 JSON、缺 content”
+        let tool_input = reassemble_tool_input(&out);
+        assert_eq!(tool_input, r#"{"file_path": "d:/demo/M1-退件列表-PC.html""#);
+        assert!(serde_json::from_str::<serde_json::Value>(&tool_input).is_err());
+
+        // 修复后的行为：干净收尾，但 stop_reason=max_tokens（不是 tool_use）→ 客户端不执行该残缺调用。
+        assert!(out.contains("\"name\":\"Write\""), "应有 Write 工具块:\n{out}");
+        assert!(out.contains("content_block_stop"), "工具块仍被干净关闭:\n{out}");
+        assert!(
+            out.contains("\"stop_reason\":\"max_tokens\""),
+            "残缺入参收尾应置 stop_reason=max_tokens:\n{out}"
+        );
+        assert!(
+            !out.contains("\"stop_reason\":\"tool_use\""),
+            "不应再标成 tool_use（那会让客户端执行残缺调用）:\n{out}"
+        );
+        assert!(out.contains("message_stop"), "干净 message_stop:\n{out}");
+        assert!(!out.contains("event: error"), "干净 EOF 不应发断流 error:\n{out}");
+    }
 }

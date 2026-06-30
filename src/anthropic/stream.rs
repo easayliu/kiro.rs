@@ -680,6 +680,11 @@ pub struct StreamContext {
     credential_id: Option<i64>,
     /// 是否无缓存模式（CacheScope::Off）。为 true 时计费不扣 Kiro 注入提示词基线。
     cache_disabled: bool,
+    /// 各 tool_use 块累积的入参 JSON 分片（block_index → 拼接串）。收尾时校验其完整性：
+    /// 非空但无法解析为合法 JSON ⇒ 该工具调用被截断（上游/模型在入参中途收笔，或
+    /// 传输层丢帧），按官方契约置 stop_reason=max_tokens，使客户端不去执行残缺调用
+    /// （避免 Write Failed / 工具参数缺失）。
+    tool_input_acc: HashMap<i32, String>,
 }
 
 impl StreamContext {
@@ -717,7 +722,18 @@ impl StreamContext {
             reasoning_seen: false,
             credential_id: None,
             cache_disabled: false,
+            tool_input_acc: HashMap::new(),
         }
+    }
+
+    /// 是否存在「非空但非法 JSON」的 tool 入参 —— 即被截断的工具调用。
+    ///
+    /// 空入参（`{}` 或从未下发）不算：无参工具合法，且我们无从得知各工具的必填字段。
+    /// 仅当某个 tool 块累积的 partial_json 非空且 `serde_json::from_str` 失败时判定截断。
+    fn has_incomplete_tool_input(&self) -> bool {
+        self.tool_input_acc.values().any(|acc| {
+            !acc.is_empty() && serde_json::from_str::<serde_json::Value>(acc).is_err()
+        })
     }
 
     /// 注入命中的凭据 id（供按凭据维度的时序统计）。
@@ -1313,6 +1329,11 @@ impl StreamContext {
         if !tool_use.input.is_empty() {
             // tool 入参 JSON 也计入输出（与非流式 estimate_output_tokens 口径一致）
             self.output_buf.push_str(&tool_use.input);
+            // 按块累积入参分片，供收尾时校验完整性（截断 ⇒ stop_reason=max_tokens）。
+            self.tool_input_acc
+                .entry(block_index)
+                .or_default()
+                .push_str(&tool_use.input);
 
             if let Some(delta_event) = self.state_manager.handle_content_block_delta(
                 block_index,
@@ -1448,6 +1469,15 @@ impl StreamContext {
                 self.state_manager.set_stop_reason("max_tokens");
             }
             events.extend(self.create_text_delta_events(" "));
+        }
+
+        // 截断的工具调用：某个 tool 块累积入参非空但非法 JSON ⇒ 上游在入参中途收笔
+        // （或传输层丢帧）。按官方契约置 stop_reason=max_tokens —— 流仍干净收尾
+        // （照常关块 + message_delta + message_stop），但客户端据此知道该工具调用不完整、
+        // 不应执行（这是 “Write Failed / 参数缺失” 的正解；客户端无法从事件序列判断完整性，
+        // 只能信 stop_reason）。
+        if self.has_incomplete_tool_input() {
+            self.state_manager.set_stop_reason("max_tokens");
         }
 
         // 计费口径：有 contextUsageEvent 时钉住 cache_read 到历史 billed 值（守恒）、
