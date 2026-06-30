@@ -327,11 +327,14 @@ pub async fn get_models() -> impl IntoResponse {
     })
 }
 
-/// 扫描入站内容的 prompt injection 启发式签名并按结构化字段告警。
+/// 扫描入站工具输出的 prompt injection 启发式签名并按结构化字段分级输出。
 ///
 /// 只记录、不拦截：命中通常意味着可疑指令（外发/隐瞒/伪装系统提示/密钥外泄等）藏在
 /// 客户端的工具输出里，而非中转注入。日志带 `request_id` 与 `content_sha`，排查时可凭此
-/// 定位具体消息块并证明可疑内容来自入站数据。每请求最多记录 8 条，避免日志爆量。
+/// 定位具体消息块并证明可疑内容来自入站数据。
+///
+/// 分级：高置信命中（强注入信号）走 WARN；低置信命中（裸 curl/打包/邮件库名等 dev 输出
+/// 常见信号）走 DEBUG，作为「可能的异常」保留可观测、不刷 WARN。每级最多记录 8 条。
 fn log_injection_scan(request_id: &str, payload: &MessagesRequest) {
     if !injection_scan::is_enabled() {
         return;
@@ -340,29 +343,73 @@ fn log_injection_scan(request_id: &str, payload: &MessagesRequest) {
     if findings.is_empty() {
         return;
     }
-    tracing::warn!(
-        request_id = %request_id,
-        hit_count = findings.len(),
-        "检测到潜在 prompt injection（来自入站内容，非中转注入）"
-    );
-    for f in findings.iter().take(8) {
+    let high_count = findings
+        .iter()
+        .filter(|f| f.severity == injection_scan::Severity::High)
+        .count();
+    let low_count = findings.len() - high_count;
+
+    if high_count > 0 {
         tracing::warn!(
             request_id = %request_id,
-            rule = %f.rule,
-            msg_index = f.msg_index,
-            role = %f.role,
-            block_kind = %f.block_kind,
-            tool_use_id = f.tool_use_id.as_deref().unwrap_or("-"),
-            content_sha = %f.content_sha,
-            snippet = %f.snippet,
-            "潜在 prompt injection 命中"
+            high_count,
+            low_count,
+            "检测到潜在 prompt injection（来自入站工具输出，非中转注入）"
         );
     }
-    if findings.len() > 8 {
+
+    let mut high_shown = 0usize;
+    let mut low_shown = 0usize;
+    for f in &findings {
+        match f.severity {
+            injection_scan::Severity::High => {
+                if high_shown >= 8 {
+                    continue;
+                }
+                high_shown += 1;
+                tracing::warn!(
+                    request_id = %request_id,
+                    rule = %f.rule,
+                    msg_index = f.msg_index,
+                    role = %f.role,
+                    block_kind = %f.block_kind,
+                    tool_use_id = f.tool_use_id.as_deref().unwrap_or("-"),
+                    content_sha = %f.content_sha,
+                    snippet = %f.snippet,
+                    "潜在 prompt injection 命中"
+                );
+            }
+            injection_scan::Severity::Low => {
+                if low_shown >= 8 {
+                    continue;
+                }
+                low_shown += 1;
+                tracing::debug!(
+                    request_id = %request_id,
+                    rule = %f.rule,
+                    msg_index = f.msg_index,
+                    role = %f.role,
+                    block_kind = %f.block_kind,
+                    tool_use_id = f.tool_use_id.as_deref().unwrap_or("-"),
+                    content_sha = %f.content_sha,
+                    snippet = %f.snippet,
+                    "可能的异常信号（低置信，dev 工具输出常见）"
+                );
+            }
+        }
+    }
+    if high_count > high_shown {
         tracing::warn!(
             request_id = %request_id,
-            omitted = findings.len() - 8,
-            "命中过多，已省略后续条目"
+            omitted = high_count - high_shown,
+            "高置信命中过多，已省略后续条目"
+        );
+    }
+    if low_count > low_shown {
+        tracing::debug!(
+            request_id = %request_id,
+            omitted = low_count - low_shown,
+            "低置信命中过多，已省略后续条目"
         );
     }
 }
