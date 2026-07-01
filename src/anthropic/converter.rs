@@ -617,7 +617,11 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
         // 仅有 tool_results：kiro API 不接受空 content（Smithy @length(min:1)），空格即可满足。
         " ".to_string()
     } else {
-        text_content
+        // 末尾消息无任何有效内容（空 user 或空 assistant prefill）：若原样发出空 content，
+        // 上游直接判 "Improperly formed request." / REQUEST_BODY_INVALID（实测）。history 仍作为
+        // 上下文，这里补一个非空占位（Smithy @length(min:1)）让上游正常应答，避免 400。
+        tracing::warn!("当前消息内容为空（末尾空消息/prefill），使用占位空格避免上游 400");
+        " ".to_string()
     };
 
     let mut user_input = UserInputMessage::new(content, &model_id)
@@ -2671,6 +2675,50 @@ mod tests {
         let tools = &result.conversation_state.current_message.user_input_message
             .user_input_message_context.tools;
         assert_eq!(tools[0].tool_specification.name, *short);
+    }
+
+    #[test]
+    fn test_convert_request_empty_last_message_fills_placeholder() {
+        // 回归：末尾为空消息（空 user / 空 assistant prefill）时，真实内容进 history，
+        // currentMessage.content 不能为空——否则上游判 "Improperly formed request." /
+        // REQUEST_BODY_INVALID（实测 kiro-400.raw.log）。必须补非空占位。
+        use super::super::types::Message as AnthropicMessage;
+
+        for last in [
+            AnthropicMessage { role: "user".to_string(), content: serde_json::json!("") },
+            AnthropicMessage { role: "assistant".to_string(), content: serde_json::json!("") },
+        ] {
+            let req = MessagesRequest {
+                model: "claude-opus-4-7".to_string(),
+                max_tokens: 1024,
+                messages: vec![
+                    AnthropicMessage {
+                        role: "user".to_string(),
+                        content: serde_json::json!("rephrase this question"),
+                    },
+                    last.clone(),
+                ],
+                system: None,
+                stream: true,
+                tools: None,
+                thinking: None,
+                tool_choice: None,
+                output_config: None,
+                metadata: None,
+            };
+
+            let result = convert_request(&req, "AI_EDITOR", false).unwrap();
+            let content = &result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content;
+            assert!(
+                !content.is_empty(),
+                "末尾 {} 空消息时 currentMessage.content 不应为空",
+                last.role
+            );
+        }
     }
 
     #[test]
