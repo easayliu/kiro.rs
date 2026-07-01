@@ -879,11 +879,17 @@ fn create_sse_stream(
                                 }
                             }
 
-                            // 转换为 SSE 字节流
-                            let bytes: Vec<Result<Bytes, Infallible>> = events
-                                .into_iter()
-                                .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                .collect();
+                            // 转换为 SSE 字节流：把本 chunk 解出的所有事件拼进一个缓冲区，
+                            // 只包一次 Bytes、只向下游产出一个流元素（减少 framing/poll 开销）。
+                            let mut sse_buf = String::new();
+                            for e in &events {
+                                e.append_sse(&mut sse_buf);
+                            }
+                            let bytes: Vec<Result<Bytes, Infallible>> = if sse_buf.is_empty() {
+                                Vec::new()
+                            } else {
+                                vec![Ok(Bytes::from(sse_buf))]
+                            };
 
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, stats)))
                         }

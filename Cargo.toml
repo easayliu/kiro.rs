@@ -6,6 +6,10 @@ edition = "2024"
 [profile.release]
 lto = true
 strip = true
+codegen-units = 1   # 单一 codegen 单元，允许更激进的跨模块内联/优化（代价：编译更慢）
+# 注意：不启用 panic = "abort"。本服务是高并发流式代理，靠 tokio/axum 的任务级 panic
+# 隔离让「单请求崩溃」只断该连接、进程继续服务其他在途流；abort 会把任一 panic 放大成
+# 整个进程退出、杀掉所有并发流，健壮性得不偿失。
 
 [dependencies]
 axum = "0.8"

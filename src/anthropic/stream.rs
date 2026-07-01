@@ -243,13 +243,26 @@ impl SseEvent {
         }
     }
 
+    /// 将 SSE 帧直接追加到既有缓冲区（热路径用）。
+    ///
+    /// 相比 `to_sse_string`，避免了 `format!` 额外分配的临时串：一个 chunk 里的多个
+    /// 事件可以拼进同一个 `String`，最终只包一次 `Bytes`、只向下游产出一个流元素。
+    pub fn append_sse(&self, out: &mut String) {
+        out.push_str("event: ");
+        out.push_str(&self.event);
+        out.push_str("\ndata: ");
+        // serde_json 无 fmt::Write 适配，仍需一次 to_string；但省去了外层 format! 的分配。
+        if let Ok(s) = serde_json::to_string(&self.data) {
+            out.push_str(&s);
+        }
+        out.push_str("\n\n");
+    }
+
     /// 格式化为 SSE 字符串
     pub fn to_sse_string(&self) -> String {
-        format!(
-            "event: {}\ndata: {}\n\n",
-            self.event,
-            serde_json::to_string(&self.data).unwrap_or_default()
-        )
+        let mut out = String::new();
+        self.append_sse(&mut out);
+        out
     }
 }
 
@@ -1007,8 +1020,9 @@ impl StreamContext {
                     // 进入 thinking 块
                     self.in_thinking_block = true;
                     self.strip_thinking_leading_newline = true;
-                    self.thinking_buffer =
-                        self.thinking_buffer[start_pos + "<thinking>".len()..].to_string();
+                    // 原地移除已消费的前缀（含 `<thinking>` 标签），避免整串重分配
+                    self.thinking_buffer
+                        .drain(..start_pos + "<thinking>".len());
 
                     // 创建 thinking 块的 content_block_start 事件
                     let thinking_index = self.state_manager.next_block_index();
@@ -1043,7 +1057,7 @@ impl StreamContext {
                         // 导致 text 块先于 thinking 块出现的问题。
                         if !safe_content.is_empty() && !safe_content.trim().is_empty() {
                             events.extend(self.create_text_delta_events(&safe_content));
-                            self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
+                            self.thinking_buffer.drain(..safe_len);
                         }
                     }
                     break;
@@ -1052,7 +1066,7 @@ impl StreamContext {
                 // 剥离 <thinking> 标签后紧跟的换行符（可能跨 chunk）
                 if self.strip_thinking_leading_newline {
                     if self.thinking_buffer.starts_with('\n') {
-                        self.thinking_buffer = self.thinking_buffer[1..].to_string();
+                        self.thinking_buffer.drain(..1);
                         self.strip_thinking_leading_newline = false;
                     } else if !self.thinking_buffer.is_empty() {
                         // buffer 非空但不以 \n 开头，不再需要剥离
@@ -1090,8 +1104,8 @@ impl StreamContext {
                     }
 
                     // 剥离 `</thinking>\n\n`（find_real_thinking_end_tag 已确认 \n\n 存在）
-                    self.thinking_buffer =
-                        self.thinking_buffer[end_pos + "</thinking>\n\n".len()..].to_string();
+                    self.thinking_buffer
+                        .drain(..end_pos + "</thinking>\n\n".len());
                 } else {
                     // 没有找到结束标签，发送当前缓冲区内容作为 thinking_delta。
                     // 保留末尾可能是部分 `</thinking>\n\n` 的内容：
@@ -1113,15 +1127,15 @@ impl StreamContext {
                                 );
                             }
                         }
-                        self.thinking_buffer = self.thinking_buffer[safe_len..].to_string();
+                        self.thinking_buffer.drain(..safe_len);
                     }
                     break;
                 }
             } else {
                 // thinking 已提取完成，剩余内容作为 text_delta
                 if !self.thinking_buffer.is_empty() {
-                    let remaining = self.thinking_buffer.clone();
-                    self.thinking_buffer.clear();
+                    // 直接夺取所有权（留下空串），省掉 clone 的整串拷贝
+                    let remaining = std::mem::take(&mut self.thinking_buffer);
                     events.extend(self.create_text_delta_events(&remaining));
                 }
                 break;
