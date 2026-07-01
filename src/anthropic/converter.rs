@@ -131,6 +131,7 @@ fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
 ///
 /// 按照用户要求：
 /// - fable → claude-opus-4.8（上游暂无 fable 系列，2026-06-10 实测 opus-4.8 可用）
+/// - sonnet 5 → claude-sonnet-5（2026-07-01 上游上线，支持 adaptive thinking + effort 到 xhigh/max）
 /// - sonnet 4.6/4-6 → claude-sonnet-4.6
 /// - 其他 sonnet → claude-sonnet-4.5
 /// - opus 4.8/4-8 → claude-opus-4.8（透传，不兜底）
@@ -144,7 +145,9 @@ pub fn map_model(model: &str) -> Option<String> {
     if model_lower.contains("fable") {
         Some("claude-opus-4.8".to_string())
     } else if model_lower.contains("sonnet") {
-        if model_lower.contains("4-6") || model_lower.contains("4.6") {
+        if model_lower.contains("sonnet-5") || model_lower.contains("sonnet5") {
+            Some("claude-sonnet-5".to_string())
+        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
         } else {
             Some("claude-sonnet-4.5".to_string())
@@ -299,7 +302,9 @@ fn model_price_per_mtok(model: &str) -> (f64, f64) {
         | Some("claude-opus-4.7")
         | Some("claude-opus-4.6")
         | Some("claude-opus-4.5") => (5.0, 25.0),
-        Some("claude-sonnet-4.6") | Some("claude-sonnet-4.5") => (3.0, 15.0),
+        Some("claude-sonnet-5") | Some("claude-sonnet-4.6") | Some("claude-sonnet-4.5") => {
+            (3.0, 15.0)
+        }
         Some("claude-haiku-4.5") => (1.0, 5.0),
         _ => (3.0, 15.0),
     }
@@ -341,7 +346,8 @@ fn window_size_for(model: &str, dynamic: &HashMap<String, i32>) -> i32 {
     }
     // 回退：硬编码常量
     match mapped.as_deref() {
-        Some("claude-sonnet-4.6")
+        Some("claude-sonnet-5")
+        | Some("claude-sonnet-4.6")
         | Some("claude-opus-4.6")
         | Some("claude-opus-4.7")
         | Some("claude-opus-4.8") => 1_000_000,
@@ -1250,10 +1256,11 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
 ///   "budget_tokens":<n>}}`（暂无对应抓包，待实测校正）。
 /// 该（已归一化的）模型是否支持 `additionalModelRequestFields.thinking`
 ///
-/// 新 Kiro runtime 端点实测：仅 4.6 及以上世代支持（opus 4.6/4.7/4.8、sonnet 4.6）；
+/// 新 Kiro runtime 端点实测：仅 4.6 及以上世代支持（opus 4.6/4.7/4.8、sonnet 4.6、sonnet-5）；
 /// 对 opus-4.5 / sonnet-4.5 下发该字段会以 `additionalModelRequestFields is not supported
 /// for this model` 400；haiku 不在新端点提供。不支持的模型直接不发该字段（thinking 静默
 /// 降级为普通响应），避免带 thinking 的请求整体失败。
+/// sonnet-5：2026-07-01 裸请求实测 adaptive thinking + effort(high/xhigh/max) 均 200。
 fn model_supports_thinking(model: &str) -> bool {
     matches!(
         map_model(model).as_deref(),
@@ -1261,6 +1268,7 @@ fn model_supports_thinking(model: &str) -> bool {
             | Some("claude-opus-4.7")
             | Some("claude-opus-4.8")
             | Some("claude-sonnet-4.6")
+            | Some("claude-sonnet-5")
     )
 }
 
@@ -2081,6 +2089,25 @@ mod tests {
                 .unwrap()
                 .contains("sonnet")
         );
+    }
+
+    #[test]
+    fn test_map_model_sonnet_5() {
+        // sonnet-5 透传上游 claude-sonnet-5，且不被 4.5/4.6 分支误吞
+        assert_eq!(map_model("claude-sonnet-5").as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(
+            map_model("claude-sonnet-5-20260701").as_deref(),
+            Some("claude-sonnet-5")
+        );
+        // 邻近版本不受影响
+        assert_eq!(
+            map_model("claude-sonnet-4-5-20250929").as_deref(),
+            Some("claude-sonnet-4.5")
+        );
+        assert_eq!(map_model("claude-sonnet-4-6").as_deref(), Some("claude-sonnet-4.6"));
+        // 支持 thinking + effort，且窗口 1M
+        assert!(model_supports_thinking("claude-sonnet-5"));
+        assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
     }
 
     #[test]
