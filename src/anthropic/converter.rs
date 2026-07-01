@@ -1384,10 +1384,11 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
         .unwrap_or_default();
 
     // 检测到写文件工具时，向 system 注入分块写入引导（引用客户端真实工具名）。
-    // 仅对 sonnet 系注入：实测只有 sonnet 有「吐完路径就停 / Write Failed」的早停问题；
+    // 仅对 sonnet-4.x 注入：实测只有 sonnet-4.5/4.6 有「吐完路径就停 / Write Failed」的早停
+    // 问题；sonnet-5 已能一次性写满、不再截断，故排除（映射后 id 为 claude-sonnet-5）。
     // opus 系本来一次写满更高效，若被引导强制分块只会徒增 append 轮次（opus-4.8 实测会碎到
     // ~260 字符/块），故用模型闸门排除；haiku 无视该引导，注入与否无影响。
-    if CHUNKED_WRITE_GUIDANCE.load(Ordering::Relaxed) && model_id.starts_with("claude-sonnet") {
+    if CHUNKED_WRITE_GUIDANCE.load(Ordering::Relaxed) && model_id.starts_with("claude-sonnet-4") {
         if let Some((write, append)) = detect_file_write_tools(req) {
             let guidance = chunked_write_instruction(&write, append.as_deref());
             if system_content.is_empty() {
