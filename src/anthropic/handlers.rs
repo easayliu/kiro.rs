@@ -26,7 +26,7 @@ use uuid::Uuid;
 use std::sync::Arc;
 
 use super::cache_tracker::{CacheProfile, CacheScope, CacheTracker};
-use super::converter::{ConversionError, convert_request, injected_prompt_tokens};
+use super::converter::{ConversionError, convert_request, injected_prompt_tokens, max_request_body_size};
 use super::injection_scan;
 use super::middleware::{AppState, RequestId};
 use super::stream::{BufferedStreamContext, CacheUsage, SseEvent, StreamContext};
@@ -339,6 +339,34 @@ pub async fn get_models() -> impl IntoResponse {
 /// 扫描入站工具输出的 prompt injection 启发式签名并按结构化字段分级输出。
 ///
 /// 只记录、不拦截：命中通常意味着可疑指令（外发/隐瞒/伪装系统提示/密钥外泄等）藏在
+/// 出站请求体字节预检：超过上游 ~12.5 MiB 硬阈值前提前拦截，返回可读 413，
+/// 避免撞上游那句含糊的 `Input content length exceeds threshold`、并省一次上游往返。
+/// 阈值由 config `maxRequestBodySize` 配置（0 表示关闭）。命中返回 `Some(响应)`。
+fn reject_if_body_too_large(request_id: &str, body_len: usize) -> Option<Response> {
+    let max = max_request_body_size();
+    if max == 0 || body_len <= max {
+        return None;
+    }
+    tracing::warn!(
+        request_id = %request_id,
+        body_bytes = body_len,
+        max_bytes = max,
+        "出站请求体超过上限，提前拒绝（413）"
+    );
+    let message = format!(
+        "请求体 {:.2}MB 超过上游上限（≈{:.1}MB），请减少历史消息 / 图片 / 附件后重试",
+        body_len as f64 / 1_000_000.0,
+        max as f64 / 1_000_000.0
+    );
+    Some(
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(ErrorResponse::new("request_too_large", message)),
+        )
+            .into_response(),
+    )
+}
+
 /// 客户端的工具输出里，而非中转注入。日志带 `request_id` 与 `content_sha`，排查时可凭此
 /// 定位具体消息块并证明可疑内容来自入站数据。
 ///
@@ -548,6 +576,11 @@ pub async fn post_messages(
     };
 
     tracing::debug!("Kiro request body: {}", request_body);
+
+    // 出站体积预检：超过上游字节阈值前提前返回可读 413
+    if let Some(resp) = reject_if_body_too_large(&request_id, request_body.len()) {
+        return resp;
+    }
 
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
@@ -1547,6 +1580,11 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
+    // 出站体积预检：超过上游字节阈值前提前返回可读 413
+    if let Some(resp) = reject_if_body_too_large(&request_id, request_body.len()) {
+        return resp;
+    }
+
     // 估算输入 tokens
     let input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -2136,5 +2174,32 @@ mod truncation_tests {
         );
         assert!(out.contains("message_stop"), "干净 message_stop:\n{out}");
         assert!(!out.contains("event: error"), "干净 EOF 不应发断流 error:\n{out}");
+    }
+}
+
+#[cfg(test)]
+mod oversize_guard_tests {
+    //! 出站请求体字节预检：超过上游 ~12.5 MiB 阈值前返回可读 413，避免撞
+    //! `Input content length exceeds threshold`。阈值由 config 可配、0 表示关闭。
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn test_reject_if_body_too_large() {
+        // 默认 12 MiB：略低于阈值放行、略高于阈值拒绝
+        super::super::converter::set_max_request_body_size(12 * 1024 * 1024);
+        assert!(reject_if_body_too_large("r", 12 * 1024 * 1024).is_none());
+        assert!(reject_if_body_too_large("r", 12 * 1024 * 1024 + 1).is_some());
+        let resp = reject_if_body_too_large("r", 20 * 1024 * 1024).unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // 0 关闭预检：任意大小都放行
+        super::super::converter::set_max_request_body_size(0);
+        assert!(reject_if_body_too_large("r", 999 * 1024 * 1024).is_none());
+
+        // 复位默认，避免影响同进程其它测试
+        super::super::converter::set_max_request_body_size(
+            super::super::converter::KIRO_MAX_REQUEST_BODY_SIZE_DEFAULT,
+        );
     }
 }

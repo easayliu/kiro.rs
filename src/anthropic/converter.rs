@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use base64::Engine;
 use parking_lot::RwLock;
@@ -1054,6 +1054,14 @@ pub const KIRO_MAX_IMAGE_SIDE: u32 = 8000;
 /// 提前在转换阶段拦截，避免触发上游错误。
 pub const KIRO_MAX_DOCUMENT_SIZE: usize = 4_500_000; // 4.5 MB（十进制，实测上游边界）
 
+/// 出站请求体字节上限的默认值（12 MiB）。上游 Kiro runtime 对整个请求体有 ~12.5 MiB
+/// 的硬阈值，超过会以 400 `Input content length exceeds threshold`（reason
+/// REQUEST_BODY_INVALID）拒绝——这不是 token 窗口、也不是单图/单文档限制，而是**整体
+/// body 字节**（实测：出站 body ≤12.49 MiB 放行、≥12.74 MiB 被拒，边界≈12.5 MiB）。
+/// 默认取 12 MiB 留 ~0.5 MiB 余量，提前在中转层拦截给出可读错误、省一次上游往返。
+/// 可由 config `maxRequestBodySize` 覆盖。
+pub const KIRO_MAX_REQUEST_BODY_SIZE_DEFAULT: usize = 12 * 1024 * 1024;
+
 /// 估算 base64 解码后的字节数（标准带填充编码，`data` 字段无空白）。
 /// 不做完整解码，按 `len/4*3 - padding` 计算，足够用于大小阈值判断。
 fn base64_decoded_len(s: &str) -> usize {
@@ -1318,6 +1326,20 @@ static CHUNKED_WRITE_GUIDANCE: AtomicBool = AtomicBool::new(true);
 /// 设置分块写入引导开关（启动时由 config 注入）。
 pub fn set_chunked_write_guidance(on: bool) {
     CHUNKED_WRITE_GUIDANCE.store(on, Ordering::Relaxed);
+}
+
+/// 出站请求体字节上限（0 表示不限制）。启动时由 config 注入，默认 12 MiB。
+static MAX_REQUEST_BODY_SIZE: AtomicUsize =
+    AtomicUsize::new(KIRO_MAX_REQUEST_BODY_SIZE_DEFAULT);
+
+/// 设置出站请求体字节上限（启动时由 config 注入；0 表示关闭该预检）。
+pub fn set_max_request_body_size(bytes: usize) {
+    MAX_REQUEST_BODY_SIZE.store(bytes, Ordering::Relaxed);
+}
+
+/// 当前出站请求体字节上限（0 表示不限制）。
+pub fn max_request_body_size() -> usize {
+    MAX_REQUEST_BODY_SIZE.load(Ordering::Relaxed)
 }
 
 /// 当前分块写入引导开关。

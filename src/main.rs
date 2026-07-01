@@ -220,6 +220,9 @@ async fn main() {
     // 分块写入引导注入开关（检测写文件工具时向 system 注入分块引导；前端可实时切换）。
     anthropic::set_chunked_write_guidance(config.chunked_write_guidance);
 
+    // 出站请求体字节上限（超过上游 ~12.5 MiB 阈值前提前拦截，返回可读 413）。
+    anthropic::set_max_request_body_size(config.max_request_body_size);
+
     // 解析缓存分桶策略：cache_scope 优先，否则回落到 global_cache 布尔
     let cache_scope = match config.cache_scope.as_deref() {
         Some(s) => anthropic::CacheScope::parse(s),

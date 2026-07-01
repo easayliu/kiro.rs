@@ -209,6 +209,12 @@ pub struct Config {
     #[serde(default = "default_chunked_write_guidance")]
     pub chunked_write_guidance: bool,
 
+    /// 出站请求体字节上限（默认 12 MiB；0 表示关闭该预检）。上游 Kiro runtime 对整个
+    /// 请求体有 ~12.5 MiB 硬阈值，超过会以 400 `Input content length exceeds threshold`
+    /// 拒绝（整体 body 字节，非 token 窗口 / 单图 / 单文档）。中转层提前拦截给出可读错误。
+    #[serde(default = "default_max_request_body_size")]
+    pub max_request_body_size: usize,
+
     /// 缓存查找跳过率（0.0-1.0，默认 None 不启用）
     ///
     /// 启用后，每个有 breakpoint 的请求以此概率跳过 cache 查找（当作
@@ -323,6 +329,10 @@ fn default_chunked_write_guidance() -> bool {
     true
 }
 
+fn default_max_request_body_size() -> usize {
+    crate::anthropic::KIRO_MAX_REQUEST_BODY_SIZE_DEFAULT
+}
+
 fn default_kiro_cli_version() -> String {
     "1.29.3".to_string()
 }
@@ -358,6 +368,7 @@ impl Default for Config {
             cache_scope: None,
             injection_scan: default_injection_scan(),
             chunked_write_guidance: default_chunked_write_guidance(),
+            max_request_body_size: default_max_request_body_size(),
             cache_skip_rate: None,
             output_token_multiplier: None,
             client_mode: ClientMode::default(),

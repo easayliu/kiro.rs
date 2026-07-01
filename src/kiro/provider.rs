@@ -1252,12 +1252,23 @@ impl KiroProvider {
         body.contains("TOOL_USE_RESULT_MISMATCH")
     }
 
+    /// 判断 400 响应是否为"输入超长"：
+    /// 形如 `{"message":"Input content length exceeds threshold.","reason":"REQUEST_BODY_INVALID"}`。
+    /// 这是用户输入太大（整体请求体超过上游阈值），不是我们的格式 bug，
+    /// 绝不能 dump 那个巨大的 outbound payload（会把日志撑到 MB 级）。
+    fn is_content_length_exceeded(body: &str) -> bool {
+        body.contains("content length exceeds")
+    }
+
     /// 判断 400 响应是否为请求体格式校验失败：
     /// 形如 `{"message":"Invalid tool use format.","reason":"REQUEST_BODY_INVALID"}`，
     /// 涵盖 tool_use/tool_result 单块结构非法等情况，同样是我们发出的请求格式问题，
     /// 需要 dump outbound payload 离线复现。
+    ///
+    /// 注意：`Input content length exceeds threshold.` 也自称 `REQUEST_BODY_INVALID`，
+    /// 但那是输入超长而非格式 bug，须排除，否则会误触发超大 payload dump。
     fn is_request_body_invalid(body: &str) -> bool {
-        body.contains("REQUEST_BODY_INVALID")
+        body.contains("REQUEST_BODY_INVALID") && !Self::is_content_length_exceeded(body)
     }
 
     /// 判断 400 是否属于"请求格式 bug"（应 dump outbound payload 离线复现）。
@@ -1369,6 +1380,16 @@ mod tests {
         let body = r#"{"__type":"com.amazon.kiro.runtimeservice#ValidationException","message":"Invalid tool use format.","reason":"REQUEST_BODY_INVALID"}"#;
         assert!(KiroProvider::is_request_body_invalid(body));
         assert!(KiroProvider::is_malformed_request(body));
+    }
+
+    #[test]
+    fn test_content_length_exceeded_not_malformed() {
+        // "Input content length exceeds threshold." 也自称 REQUEST_BODY_INVALID，但属于输入超长，
+        // 不能被判为格式 bug（否则会 dump 那个 MB 级 outbound payload 撑爆日志）。
+        let body = r#"{"__type":"com.amazon.kiro.runtimeservice#ValidationException","message":"Input content length exceeds threshold.","reason":"REQUEST_BODY_INVALID"}"#;
+        assert!(KiroProvider::is_content_length_exceeded(body));
+        assert!(!KiroProvider::is_request_body_invalid(body));
+        assert!(!KiroProvider::is_malformed_request(body));
     }
 
     fn body_with_user_input(origin: &str, with_env_state: bool) -> String {

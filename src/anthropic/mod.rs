@@ -38,7 +38,7 @@ pub use cache_tracker::{CacheScope, CacheTracker};
 pub use converter::{
     chunked_write_guidance_enabled, map_model, output_token_multiplier,
     set_chunked_write_guidance, set_dynamic_model_windows, set_injected_prompt_tokens,
-    set_output_token_multiplier,
+    set_max_request_body_size, set_output_token_multiplier, KIRO_MAX_REQUEST_BODY_SIZE_DEFAULT,
 };
 pub use injection_scan::{
     is_enabled as injection_scan_enabled, set_enabled as set_injection_scan_enabled,
