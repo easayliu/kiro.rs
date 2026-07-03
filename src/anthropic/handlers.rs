@@ -89,6 +89,29 @@ fn resolve_sticky_preference(
     binding_table.resolve(identity, &available)
 }
 
+/// 解析绑定身份键并给出来源标签：优先 `metadata.user_id`（device+account），无则
+/// 回退到请求前缀指纹（官方 cache_control checkpoint，见 `prefix_binding_key`）。
+/// 返回 `(key, 来源)`，来源用于完成日志区分匿名前缀绑定 vs user_id 绑定。
+fn resolve_binding_key(cache_profile: &CacheProfile) -> (Option<u64>, &'static str) {
+    if let Some(k) = cache_profile.binding_key() {
+        (Some(k), "user_id")
+    } else if let Some(k) = cache_profile.prefix_binding_key() {
+        (Some(k), "prefix")
+    } else {
+        (None, "none")
+    }
+}
+
+/// 绑定路由结果标签：`hit`=落在 preferred；`spill`=有 preferred 但落到他号
+/// （并发上限 / 限流 / 故障让位）；`none`=无 preferred，纯负载均衡。
+fn binding_outcome_label(preferred: Option<u64>, actual: u64) -> &'static str {
+    match preferred {
+        Some(p) if p == actual => "hit",
+        Some(_) => "spill",
+        None => "none",
+    }
+}
+
 /// 调用完成后的粘性绑定维护。
 ///
 /// - 成功但落在非 preferred 凭证 → preferred 本轮失败，累计错误，必要时改绑
@@ -606,9 +629,8 @@ pub async fn post_messages(
 
     // 粘性绑定：解析 user_id → preferred 凭证；无 user_id 时回退到前缀指纹，
     // 让相同前缀的请求也钉在同一凭证上以复用上游 prefix cache。
-    let binding_key = cache_profile
-        .binding_key()
-        .or_else(|| cache_profile.prefix_binding_key());
+    // binding_src 记录绑定身份来源（user_id / prefix / none），供完成日志区分。
+    let (binding_key, binding_src) = resolve_binding_key(&cache_profile);
     let binding_table = state.binding_table.clone();
     let preferred = resolve_sticky_preference(
         &cache_tracker,
@@ -641,6 +663,7 @@ pub async fn post_messages(
             binding_table,
             binding_key,
             preferred,
+            binding_src,
         )
         .await
     } else {
@@ -658,6 +681,7 @@ pub async fn post_messages(
             binding_table,
             binding_key,
             preferred,
+            binding_src,
         )
         .await
     }
@@ -724,6 +748,7 @@ async fn handle_stream_request(
     binding_table: Arc<BindingTable>,
     binding_key: Option<u64>,
     preferred: Option<u64>,
+    binding_src: &'static str,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移；思考签名失效时剥离历史思考块重试一次）
     let api_result = match call_api_stream_with_signature_fallback(provider.as_ref(), request_body, preferred).await {
@@ -768,6 +793,10 @@ async fn handle_stream_request(
     ctx.set_ttft_origin(api_result.upstream_request_at);
     ctx.set_cache_usage(cache_context);
     ctx.set_credential_id(api_result.credential_id as i64);
+    ctx.set_binding(
+        binding_outcome_label(preferred, api_result.credential_id),
+        binding_src,
+    );
     // 计费完成后（流末尾 contextUsageEvent）把缩放后的 billed 累计回写缓存，供下次命中守恒。
     ctx.set_billing_writeback(cache_tracker.clone(), cache_writeback);
 
@@ -1091,6 +1120,7 @@ async fn handle_non_stream_request(
     binding_table: Arc<BindingTable>,
     binding_key: Option<u64>,
     preferred: Option<u64>,
+    binding_src: &'static str,
 ) -> Response {
     let request_start = Instant::now();
     // 调用 Kiro API 并缓冲完整响应体（支持多凭据故障转移；body 中途被上游 RST/EOF
@@ -1400,6 +1430,12 @@ async fn handle_non_stream_request(
     });
     tracing::info!(
         model = %model,
+        // 实际承接本次请求的凭据 id（粘性命中 / 并发 spill / 前缀回退后的最终落点）。
+        credential_id = api_result.credential_id,
+        // 绑定路由结果：hit=落在 preferred / spill=让位他号 / none=无 preferred；
+        // binding_src=绑定身份来源：user_id / prefix（前缀回退）/ none。
+        binding = binding_outcome_label(preferred, api_result.credential_id),
+        binding_src = binding_src,
         input_tokens = billed_input_tokens,
         cache_read = billing.cache_read_input_tokens,
         cache_creation = billing.cache_creation_input_tokens,
@@ -1612,9 +1648,8 @@ pub async fn post_messages_cc(
 
     // 粘性绑定：解析 user_id → preferred 凭证；无 user_id 时回退到前缀指纹，
     // 让相同前缀的请求也钉在同一凭证上以复用上游 prefix cache。
-    let binding_key = cache_profile
-        .binding_key()
-        .or_else(|| cache_profile.prefix_binding_key());
+    // binding_src 记录绑定身份来源（user_id / prefix / none），供完成日志区分。
+    let (binding_key, binding_src) = resolve_binding_key(&cache_profile);
     let binding_table = state.binding_table.clone();
     let preferred = resolve_sticky_preference(
         &cache_tracker,
@@ -1647,6 +1682,7 @@ pub async fn post_messages_cc(
             binding_table,
             binding_key,
             preferred,
+            binding_src,
         )
         .await
     } else {
@@ -1664,6 +1700,7 @@ pub async fn post_messages_cc(
             binding_table,
             binding_key,
             preferred,
+            binding_src,
         )
         .await
     }
@@ -1685,6 +1722,7 @@ async fn handle_stream_request_buffered(
     binding_table: Arc<BindingTable>,
     binding_key: Option<u64>,
     preferred: Option<u64>,
+    binding_src: &'static str,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移；思考签名失效时剥离历史思考块重试一次）
     let api_result = match call_api_stream_with_signature_fallback(provider.as_ref(), request_body, preferred).await {
@@ -1729,6 +1767,10 @@ async fn handle_stream_request_buffered(
     ctx.set_ttft_origin(api_result.upstream_request_at);
     ctx.set_cache_usage(cache_context);
     ctx.set_credential_id(api_result.credential_id as i64);
+    ctx.set_binding(
+        binding_outcome_label(preferred, api_result.credential_id),
+        binding_src,
+    );
     // 计费完成后（流末尾 contextUsageEvent）把缩放后的 billed 累计回写缓存，供下次命中守恒。
     ctx.set_billing_writeback(cache_tracker.clone(), cache_writeback);
 

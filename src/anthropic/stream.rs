@@ -691,6 +691,10 @@ pub struct StreamContext {
     reasoning_seen: bool,
     /// 命中的凭据 id（由 handler 注入），用于按凭据维度的时序统计。
     credential_id: Option<i64>,
+    /// 绑定路由结果标签（hit=命中 preferred / spill=让位他号 / none=无 preferred）
+    /// 与身份来源（user_id / prefix / none），由 handler 注入，供完成日志观测。
+    binding_label: &'static str,
+    binding_src: &'static str,
     /// 是否无缓存模式（CacheScope::Off）。为 true 时计费不扣 Kiro 注入提示词基线。
     cache_disabled: bool,
     /// 各 tool_use 块累积的入参 JSON 分片（block_index → 拼接串）。收尾时校验其完整性：
@@ -734,6 +738,8 @@ impl StreamContext {
             strip_thinking_leading_newline: false,
             reasoning_seen: false,
             credential_id: None,
+            binding_label: "none",
+            binding_src: "none",
             cache_disabled: false,
             tool_input_acc: HashMap::new(),
         }
@@ -752,6 +758,12 @@ impl StreamContext {
     /// 注入命中的凭据 id（供按凭据维度的时序统计）。
     pub fn set_credential_id(&mut self, id: i64) {
         self.credential_id = Some(id);
+    }
+
+    /// 注入绑定路由标签（供完成日志区分 preferred 命中 / spill / 前缀回退）。
+    pub fn set_binding(&mut self, label: &'static str, src: &'static str) {
+        self.binding_label = label;
+        self.binding_src = src;
     }
 
     /// 注入 prompt caching 结果
@@ -1589,6 +1601,12 @@ impl StreamContext {
         });
         tracing::info!(
             model = %self.model,
+            // 实际承接本次请求的凭据 id（粘性命中 / 并发 spill / 前缀回退后的最终落点）。
+            credential_id = self.credential_id.unwrap_or(0),
+            // 绑定路由结果：hit=落在 preferred / spill=让位他号 / none=无 preferred；
+            // binding_src=绑定身份来源：user_id / prefix（前缀回退）/ none。
+            binding = self.binding_label,
+            binding_src = self.binding_src,
             input_tokens = billing.uncached_input_tokens.max(1),
             cache_read = billing.cache_read_input_tokens,
             cache_creation = billing.cache_creation_input_tokens,
@@ -1674,6 +1692,11 @@ impl BufferedStreamContext {
     /// 注入命中的凭据 id（透传到内部 StreamContext，用于按凭据维度的时序统计）
     pub fn set_credential_id(&mut self, id: i64) {
         self.inner.set_credential_id(id);
+    }
+
+    /// 注入绑定路由标签（透传到内部 StreamContext，供完成日志观测）
+    pub fn set_binding(&mut self, label: &'static str, src: &'static str) {
+        self.inner.set_binding(label, src);
     }
 
     /// 标记上游首字节到达时刻（透传到内部 StreamContext，用于 TTFT 统计）
