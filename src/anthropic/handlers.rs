@@ -55,16 +55,24 @@ pub(crate) struct CacheUsageContext {
 
 /// 粘性绑定解析：返回本次请求应优先使用的凭证 id。
 ///
-/// 粘性仅在 cache scope 为 `PerCredential` 时启用——此模式下本地 prompt cache
-/// 模拟按 credential 隔离，同一用户换号会 miss，故需要把同一身份钉在同一凭据上。
-/// 默认 `Global` 模式下 cache 命中只取决于用户身份、与选到哪个凭据无关（Kiro 上游
-/// 本身也无真实 prompt cache），粘性零收益却会把负载倾斜到单号，因此直接跳过，
-/// 让选号走纯 least-request / LRU 均衡。
+/// 粘性对 `Global` 与 `PerCredential` 均启用，仅 `Off` 跳过。
+/// 上游 prompt cache 是**真实存在、按凭证（身份）隔离**的：实测同一前缀换到未预热
+/// 的凭证会吃满冷 prefill（80k 前缀 ~8s，命中降到 ~4s；见 scratchpad/bench_iso2.py
+/// 与 test_proxy_cache.py）。因此把同一用户（device+account）钉在同一凭证上，才能
+/// 复用它已预热的公共前缀，避免 Global 轮询到冷凭证造成的“冷前缀”。`Off` 表示完全
+/// 不模拟缓存，保持纯均衡不绑定。
+///
+/// 负载均衡在绑定下仍成立：新身份按 `pick_least_bound` 铺到最空凭证，凭证不可用或
+/// 连续报错会 `rebind` 迁走——只是把**单个身份**的请求钉在一处以吃到上游缓存。
+///
+/// 传入的 `binding_key` 由调用方解析：优先 user_id（device+account），无则回退到
+/// 请求前缀指纹（见 `CacheProfile::prefix_binding_key`），故匿名请求也能按前缀绑定。
 ///
 /// 其余短路条件：
-/// - 未提供 binding_key（没有 metadata.user_id）→ 返回 None，走默认选择
+/// - `Off` scope → 返回 None，走纯默认选择
+/// - binding_key 仍为 None（既无 user_id 又无可缓存前缀块）→ 返回 None，走默认选择
 /// - 无可用凭证 → 返回 None
-/// - 首次见到的用户会在绑定表中创建新绑定
+/// - 首次见到的身份会在绑定表中创建新绑定
 fn resolve_sticky_preference(
     cache_tracker: &CacheTracker,
     binding_table: &BindingTable,
@@ -72,8 +80,8 @@ fn resolve_sticky_preference(
     binding_key: Option<u64>,
     model: &str,
 ) -> Option<u64> {
-    // Global 模式：换号不影响 cache 命中，禁用粘性以保留负载均衡。
-    if !matches!(cache_tracker.cache_scope(), CacheScope::PerCredential) {
+    // 仅 Off 跳过粘性；Global/PerCredential 均绑定，以复用上游按凭证隔离的 prompt cache。
+    if matches!(cache_tracker.cache_scope(), CacheScope::Off) {
         return None;
     }
     let identity = binding_key?;
@@ -596,8 +604,11 @@ pub async fn post_messages(
     let cache_tracker = state.cache_tracker.clone();
     let cache_profile = cache_tracker.build_profile(&payload, input_tokens);
 
-    // 粘性绑定：解析 user_id → preferred 凭证
-    let binding_key = cache_profile.binding_key();
+    // 粘性绑定：解析 user_id → preferred 凭证；无 user_id 时回退到前缀指纹，
+    // 让相同前缀的请求也钉在同一凭证上以复用上游 prefix cache。
+    let binding_key = cache_profile
+        .binding_key()
+        .or_else(|| cache_profile.prefix_binding_key());
     let binding_table = state.binding_table.clone();
     let preferred = resolve_sticky_preference(
         &cache_tracker,
@@ -1599,8 +1610,11 @@ pub async fn post_messages_cc(
     let cache_tracker = state.cache_tracker.clone();
     let cache_profile = cache_tracker.build_profile(&payload, input_tokens);
 
-    // 粘性绑定：解析 user_id → preferred 凭证
-    let binding_key = cache_profile.binding_key();
+    // 粘性绑定：解析 user_id → preferred 凭证；无 user_id 时回退到前缀指纹，
+    // 让相同前缀的请求也钉在同一凭证上以复用上游 prefix cache。
+    let binding_key = cache_profile
+        .binding_key()
+        .or_else(|| cache_profile.prefix_binding_key());
     let binding_table = state.binding_table.clone();
     let preferred = resolve_sticky_preference(
         &cache_tracker,

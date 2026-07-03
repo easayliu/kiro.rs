@@ -100,6 +100,26 @@ impl CacheProfile {
     pub fn binding_key(&self) -> Option<u64> {
         self.binding_key
     }
+
+    /// 无 `metadata.user_id` 时的**前缀回退**绑定 key（官方 prompt caching 口径）。
+    ///
+    /// 官方可缓存前缀由 `cache_control` breakpoint 界定（且需达模型最小可缓存
+    /// token），并非任意分段。这里取**第一个 cacheable breakpoint** 所在 block 的
+    /// `prefix_fingerprint`——即最内层、跨轮最稳定的官方缓存 checkpoint，与
+    /// `compute_and_update` 写入/查找缓存用的指纹**完全同源**。让共享该官方前缀的
+    /// 请求落到同一凭证，复用其上游已预热的 prefix cache，即使客户端没带 user_id。
+    ///
+    /// 无 cacheable breakpoint（未标 `cache_control`，或不足最小 token）→ `None`：
+    /// 官方视角下本就无可缓存前缀，不按前缀绑定，走默认选择。
+    ///
+    /// 粒度取舍：共享同一官方前缀（如 tools+system 段带 breakpoint）的匿名请求会
+    /// 集中到同一凭证（利于命中、弱于分散）；不同前缀仍由 `pick_least_bound` 铺开，
+    /// 凭证过载 `report_error` 达阈值会 rebind 释放。仅在 user_id 缺失时兜底。
+    pub fn prefix_binding_key(&self) -> Option<u64> {
+        let bp = self.cacheable_breakpoints().into_iter().next()?;
+        let block = self.blocks.get(bp.block_index)?;
+        Some(fingerprint_to_u64(&block.prefix_fingerprint))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1026,6 +1046,13 @@ fn hash_to_u64(s: String) -> u64 {
     let hash: [u8; 32] = Sha256::digest(s.as_bytes()).into();
     u64::from_be_bytes([
         hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+    ])
+}
+
+/// 取 32 字节前缀指纹的前 8 字节作 u64 绑定 key（与 `hash_to_u64` 同口径）。
+fn fingerprint_to_u64(fp: &[u8; 32]) -> u64 {
+    u64::from_be_bytes([
+        fp[0], fp[1], fp[2], fp[3], fp[4], fp[5], fp[6], fp[7],
     ])
 }
 
@@ -2305,5 +2332,112 @@ mod tests {
 
         // 内部表始终为空：没有任何 bucket 被创建。
         assert_eq!(tracker.bucket_count(), 0, "Off 模式不应创建任何 bucket");
+    }
+
+    // ---- prefix_binding_key：无 metadata.user_id 时的官方前缀回退绑定键 ----
+
+    /// 一个带 5m cache_control breakpoint 的大 user 消息（~4k tokens，稳过 sonnet-4-6
+    /// 的 2048 最小可缓存门槛）。marker 决定内容，从而决定前缀指纹。
+    fn big_user_cc(marker: &str) -> Message {
+        user_message(vec![json!({
+            "type": "text",
+            "text": large_text(marker, 16_000),
+            "cache_control": ephemeral_5m(),
+        })])
+    }
+
+    #[test]
+    fn prefix_binding_key_some_with_cacheable_breakpoint() {
+        let req = build_request("sys", vec![big_user_cc("PREFIX ")]);
+        let key = tracker().build_profile(&req, 5_000).prefix_binding_key();
+        assert!(key.is_some(), "有达标 cache_control breakpoint → 应返回 Some");
+    }
+
+    #[test]
+    fn prefix_binding_key_none_without_cache_control() {
+        // 大内容但完全没有 cache_control → 官方视角无可缓存前缀
+        let req = build_request(
+            "sys",
+            vec![user_message(vec![json!({
+                "type": "text",
+                "text": large_text("PREFIX ", 16_000),
+            })])],
+        );
+        assert_eq!(
+            tracker().build_profile(&req, 5_000).prefix_binding_key(),
+            None,
+            "无 cache_control → None"
+        );
+    }
+
+    #[test]
+    fn prefix_binding_key_none_below_min_cacheable() {
+        // 有 cache_control 但累计 token 不足最小可缓存门槛 → breakpoint 被过滤
+        let req = build_request(
+            "s",
+            vec![user_message(vec![json!({
+                "type": "text",
+                "text": "short",
+                "cache_control": ephemeral_5m(),
+            })])],
+        );
+        assert_eq!(
+            tracker().build_profile(&req, 5).prefix_binding_key(),
+            None,
+            "低于最小可缓存 token 的 breakpoint 应被过滤 → None"
+        );
+    }
+
+    #[test]
+    fn prefix_binding_key_stable_across_tail() {
+        // 相同 system + 相同首个 breakpoint(user1)，尾部消息不同 → 绑定键不变（支持多轮）
+        let a = build_request("SYS", vec![big_user_cc("SAME ")]);
+        let b = build_request(
+            "SYS",
+            vec![
+                big_user_cc("SAME "),
+                assistant_text("reply"),
+                user_message(vec![json!({ "type": "text", "text": "different tail" })]),
+            ],
+        );
+        let ka = tracker().build_profile(&a, 5_000).prefix_binding_key();
+        let kb = tracker().build_profile(&b, 5_000).prefix_binding_key();
+        assert!(ka.is_some());
+        assert_eq!(ka, kb, "首个 breakpoint 相同 → 绑定键与后续消息无关");
+    }
+
+    #[test]
+    fn prefix_binding_key_differs_for_different_prefix() {
+        let a = build_request("SYS", vec![big_user_cc("PREFIX-A ")]);
+        let b = build_request("SYS", vec![big_user_cc("PREFIX-B ")]);
+        let ka = tracker().build_profile(&a, 5_000).prefix_binding_key();
+        let kb = tracker().build_profile(&b, 5_000).prefix_binding_key();
+        assert!(ka.is_some() && kb.is_some());
+        assert_ne!(ka, kb, "不同前缀 → 不同绑定键（分散）");
+    }
+
+    #[test]
+    fn no_user_id_falls_back_to_prefix_key() {
+        // 复刻调用点 or_else 逻辑：无 user_id → 身份键 None，回退到前缀键
+        let req = build_request("SYS", vec![big_user_cc("PREFIX ")]);
+        let profile = tracker().build_profile(&req, 5_000);
+        assert_eq!(profile.binding_key(), None, "无 user_id → 身份绑定键 None");
+        assert!(
+            profile
+                .binding_key()
+                .or_else(|| profile.prefix_binding_key())
+                .is_some(),
+            "回退到前缀键 → 仍有可用绑定身份"
+        );
+    }
+
+    #[test]
+    fn user_id_present_prefers_identity_binding_key() {
+        let md = make_metadata("dev-1", "acct-1", "sess-1");
+        let req = build_request_with_metadata("SYS", vec![big_user_cc("PREFIX ")], md);
+        let profile = tracker().build_profile(&req, 5_000);
+        let resolved = profile.binding_key().or_else(|| profile.prefix_binding_key());
+        assert!(profile.binding_key().is_some(), "有 user_id → 身份键 Some");
+        assert_eq!(resolved, profile.binding_key(), "有 user_id 时优先身份键，不落前缀");
     }
 }
