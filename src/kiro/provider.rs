@@ -800,15 +800,40 @@ impl KiroProvider {
                 .header("host", &domain)
                 .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
                 .header("amz-sdk-request", "attempt=1; max=3")
-                .header("Authorization", format!("Bearer {}", ctx.token))
-                .header("Connection", "close");
+                .header("Authorization", format!("Bearer {}", ctx.token));
+
+            // Connection 头按模式对齐真实客户端抓包：
+            // - KiroCli：真实 AmazonQ-For-CLI（aws-sdk-rust）抓包请求侧**不发** Connection 头
+            //   （HTTP/1.1 默认 keep-alive，响应亦 keep-alive），故这里省略，让 reqwest 连接池
+            //   复用连接，省掉每请求一次 TCP+TLS 握手（实测配对 A/B：p50 首词 ~−0.7s / −27%）。
+            //   连接按 (host,代理) 池化、与凭证无关——多凭证切换/同 socket 换 token 均实测通过，
+            //   不影响负载均衡；断连由既有重试兜底。
+            // - KiroIde：沿用 Connection: close，对齐 aws-sdk-js IDE 口径（低频端点亦维持原行为）。
+            if !mode.is_cli() {
+                request = request.header("Connection", "close");
+            }
 
             if is_runtime {
                 // 新 runtime 端点：RPC 方法名走 x-amz-target，agentMode 改由 body 顶层携带
                 // （故不再发 x-amzn-kiro-agent-mode 头），并显式声明 telemetry opt-out。
-                request = request
-                    .header("x-amz-target", "KiroRuntimeService.GenerateAssistantResponse")
-                    .header("x-amzn-codewhisperer-optout", "true");
+                //
+                // KiroCli 模式全量对齐真实 AmazonQ-For-CLI 抓包：runtime 端点上 CLI 用的是
+                // `AmazonCodeWhispererStreamingService`（非 KiroRuntimeService）、optout=false，
+                // 且额外发 accept / accept-encoding（与 codewhispererstreaming UA 配套）。
+                if mode.is_cli() {
+                    request = request
+                        .header(
+                            "x-amz-target",
+                            "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+                        )
+                        .header("x-amzn-codewhisperer-optout", "false")
+                        .header("accept", "*/*")
+                        .header("accept-encoding", "gzip");
+                } else {
+                    request = request
+                        .header("x-amz-target", "KiroRuntimeService.GenerateAssistantResponse")
+                        .header("x-amzn-codewhisperer-optout", "true");
+                }
             } else {
                 // 老 CodeWhisperer REST 端点：agentMode 走请求头。
                 request = request.header("x-amzn-kiro-agent-mode", "vibe");

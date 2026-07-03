@@ -202,15 +202,18 @@ pub fn get_context_window_size(model: &str) -> i32 {
 /// 拼入后喂给模型的，因此会计入 `contextUsage` 反推出的 input_tokens。agentMode 改任何值无效，
 /// agentTaskType 只接受 "vibe"（换值直接上游 400），即注入无法在请求侧关闭。每请求全价、无缓存。
 ///
-/// **地板因模型而异**（2026-06-30 裸请求实测、与 ide/cli 模式无关）：opus-4.8≈6485、
-/// opus-4.7≈5975、sonnet-4.6≈4109、opus-4.6≈4170、opus-4.5/sonnet-4.5/haiku-4.5≈4.1K。
-/// 但 [`strip_injected_prompt`] 有 `.max(local_estimate)` 兜底——只要基线 ≥ 模型真实地板，
-/// 结果就 floor 回真实内容，故**单一基线取所有模型地板的最大值**即可覆盖全部，无需 per-model 表
-/// （基线 < 地板才会漏差额进账单）。默认 6500 = max≈6485 + 余量。
+/// **地板因模型而异**，精确值由 [`injected_floor_hardcoded`] 的 per-model 表持有（裸请求实测）。
+/// 用精确地板时 `context_total - floor` 直接等于上游口径的真实内容，比退回本地估算更准
+/// （本地估算在图片 / 非拉丁文本 / 工具 schema 场景会偏）。
 ///
-/// 计费上报时从上游反推总量里扣除该基线，使终端用户只按**真实内容**计费。由 main 启动时用配置值
+/// 本全局量此时降级为两个作用：① **未实测过的新模型的回退基线**（[`effective_injected_floor`]
+/// 查表 miss 时用它，取所有已知地板的最大值 + 余量，保证 ≥ 未知模型真实地板不漏计）；
+/// ② **主开关**——为 0 时整体关闭注入扣除（[`strip_injected_prompt`] 原样返回）。
+///
+/// 计费上报时从上游反推总量里扣除生效地板，使终端用户只按**真实内容**计费。由 main 启动时用配置值
 /// 经 [`set_injected_prompt_tokens`] 设入；0 表示不扣除。Kiro 更新提示词时需重新实测
-/// （曾观察到 opus-4.8 由 6393 漂移至 6485）。
+/// （曾观察到 opus-4.8 由 6393 漂移至 6485）；per-model 表用精确值、无余量，故上游上调注入时
+/// 表里该模型会临时偏低（每请求多计几 token），重测更新即可。
 static INJECTED_PROMPT_TOKENS: AtomicI32 = AtomicI32::new(0);
 
 /// 设置 Kiro 注入提示词的扣除基线（启动时由配置注入）。负值按 0 处理。
@@ -268,14 +271,49 @@ pub fn apply_output_token_multiplier(true_output: i32) -> i32 {
     scaled.max(1) as i32
 }
 
-/// 从上游反推总量里扣掉 Kiro 注入基线，得到计费用的「内容总量」。
+/// 各模型的 Kiro 注入提示词地板（裸请求实测，token）。`None` = 尚未实测过的模型，
+/// 由 [`effective_injected_floor`] 回退到全局配置基线。
 ///
+/// 用 `map_model` 归一化后匹配，与 [`get_context_window_size`] 同套 id。实测来源：
+/// opus-4.8 / sonnet-5 = 6485（sonnet-5 于 2026-07-03 裸请求实测：空内容 contextUsage
+/// 0.648% × 1M）、opus-4.7 = 5975、opus-4.6 = 4170、sonnet-4.6 = 4109、
+/// opus-4.5 / sonnet-4.5 / haiku-4.5 ≈ 4100（均 2026-06-30 实测）。表用精确值不留余量，
+/// 追求 `context_total - floor` 精确等于上游真实内容。
+fn injected_floor_hardcoded(model: &str) -> Option<i32> {
+    match map_model(model).as_deref() {
+        Some("claude-opus-4.8") | Some("claude-sonnet-5") => Some(6485),
+        Some("claude-opus-4.7") => Some(5975),
+        Some("claude-opus-4.6") => Some(4170),
+        Some("claude-sonnet-4.6") => Some(4109),
+        Some("claude-opus-4.5") | Some("claude-sonnet-4.5") | Some("claude-haiku-4.5") => {
+            Some(4100)
+        }
+        _ => None,
+    }
+}
+
+/// 本次请求实际生效的注入扣除地板（token）。
+///
+/// 全局配置基线（[`injected_prompt_tokens`]）为 0 时整体关闭扣除（返回 0，保持原行为）；
+/// 否则优先用 [`injected_floor_hardcoded`] 的 per-model 实测精确地板，未实测过的模型回退
+/// 全局配置基线（默认 6500 = 已知地板最大值 + 余量，保证不低于未知模型真实地板）。
+pub fn effective_injected_floor(model: &str) -> i32 {
+    let global = injected_prompt_tokens();
+    if global <= 0 {
+        return 0;
+    }
+    injected_floor_hardcoded(model).unwrap_or(global)
+}
+
+/// 从上游反推总量里扣掉 Kiro 注入地板，得到计费用的「内容总量」。
+///
+/// - `model`：本次请求模型（决定 per-model 精确地板，见 [`effective_injected_floor`]）。
 /// - `context_total`：上游 `contextUsage` 反推的 input_tokens（含注入）。
-/// - `local_estimate`：本地对**客户端内容**的 token 估算，作为下限——基线偏大时
+/// - `local_estimate`：本地对**客户端内容**的 token 估算，作为下限——地板偏大时
 ///   floor 到它，避免反向少计内容；并保底 1。
-/// 基线为 0（未配置）时原样返回，保持原行为。
-pub fn strip_injected_prompt(context_total: i32, local_estimate: i32) -> i32 {
-    let baseline = injected_prompt_tokens();
+/// 生效地板为 0（未配置 / 主开关关）时原样返回，保持原行为。
+pub fn strip_injected_prompt(model: &str, context_total: i32, local_estimate: i32) -> i32 {
+    let baseline = effective_injected_floor(model);
     if baseline <= 0 {
         return context_total;
     }
@@ -2092,16 +2130,42 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         set_injected_prompt_tokens(6384);
 
+        // 未实测过的模型（查表 miss）回退全局配置基线，行为同旧版单一基线。
+        let unknown = "totally-unknown-model";
         // 正常：从上游总量里扣掉基线，得到 Claude 口径的内容量。
-        assert_eq!(strip_injected_prompt(7101, 223), 717);
+        assert_eq!(strip_injected_prompt(unknown, 7101, 223), 717);
         // 基线偏大导致差值低于本地估算时 floor 到本地估算（不反向少计）。
-        assert_eq!(strip_injected_prompt(6393, 10), 10);
+        assert_eq!(strip_injected_prompt(unknown, 6393, 10), 10);
         // 极端：差值与本地估算都很小，仍至少保 1。
-        assert_eq!(strip_injected_prompt(6384, 0), 1);
+        assert_eq!(strip_injected_prompt(unknown, 6384, 0), 1);
 
-        // 基线为 0 时原样返回（关闭扣除，保持原始上游口径）。
+        // 主开关：基线为 0 时原样返回（关闭扣除，保持原始上游口径），与模型无关。
         set_injected_prompt_tokens(0);
-        assert_eq!(strip_injected_prompt(7101, 223), 7101);
+        assert_eq!(strip_injected_prompt(unknown, 7101, 223), 7101);
+        assert_eq!(strip_injected_prompt("claude-sonnet-5", 7101, 223), 7101);
+    }
+
+    #[test]
+    fn strip_injected_prompt_uses_per_model_floor() {
+        let _guard = super::INJECTED_BASELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // 全局基线非 0（仅作未知模型回退 + 主开关）；已实测模型用 per-model 精确地板。
+        set_injected_prompt_tokens(6500);
+
+        // sonnet-5 / opus-4.8 精确地板 6485（非全局 6500）：扣 6485 得真实内容。
+        assert_eq!(effective_injected_floor("claude-sonnet-5"), 6485);
+        assert_eq!(effective_injected_floor("claude-opus-4-8"), 6485);
+        assert_eq!(strip_injected_prompt("claude-sonnet-5", 6485 + 1000, 900), 1000);
+        // 归一化：带日期后缀的 id 也命中同一地板。
+        assert_eq!(effective_injected_floor("claude-sonnet-5-20260701"), 6485);
+        // 低地板模型用各自实测值，不受 6500 全局基线影响。
+        assert_eq!(effective_injected_floor("claude-sonnet-4.6"), 4109);
+        assert_eq!(strip_injected_prompt("claude-sonnet-4.6", 4109 + 500, 480), 500);
+        // 未实测模型回退全局基线 6500。
+        assert_eq!(effective_injected_floor("brand-new-model"), 6500);
+
+        set_injected_prompt_tokens(0);
     }
 
     #[test]

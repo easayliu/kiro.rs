@@ -334,7 +334,8 @@ fn default_max_request_body_size() -> usize {
 }
 
 fn default_kiro_cli_version() -> String {
-    "1.29.3".to_string()
+    // 对齐真实 AmazonQ-For-CLI 抓包的 md/appVersion（2026-06-29 样本为 2.10.0）。
+    "2.10.0".to_string()
 }
 
 impl Default for Config {
@@ -415,7 +416,7 @@ impl Config {
     pub fn streaming_user_agent(&self, machine_id: &str, mode: ClientMode) -> String {
         match mode {
             ClientMode::KiroCli => format!(
-                "aws-sdk-rust/1.3.14 ua/2.1 api/codewhispererstreaming/0.1.14474 os/linux lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
+                "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17593 os/macos lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
                 self.kiro_cli_version
             ),
             ClientMode::KiroIde => format!(
@@ -428,7 +429,7 @@ impl Config {
     /// 生成 API 请求的 x-amz-user-agent（streaming API）
     pub fn streaming_x_amz_user_agent(&self, machine_id: &str, mode: ClientMode) -> String {
         match mode {
-            ClientMode::KiroCli => "aws-sdk-rust/1.3.14 ua/2.1 api/codewhispererstreaming/0.1.14474 os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI".to_string(),
+            ClientMode::KiroCli => "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17593 os/macos lang/rust/1.92.0 m/F app/AmazonQ-For-CLI".to_string(),
             ClientMode::KiroIde => format!("aws-sdk-js/1.0.39 KiroIDE-{}-{}", self.kiro_version, machine_id),
         }
     }
@@ -437,7 +438,7 @@ impl Config {
     pub fn runtime_user_agent(&self, machine_id: &str, mode: ClientMode) -> String {
         match mode {
             ClientMode::KiroCli => format!(
-                "aws-sdk-rust/1.3.14 ua/2.1 api/codewhispererruntime/0.1.14474 os/linux lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
+                "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.17593 os/macos lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
                 self.kiro_cli_version
             ),
             ClientMode::KiroIde => format!(
@@ -450,7 +451,7 @@ impl Config {
     /// 生成 runtime API 的 x-amz-user-agent（非 streaming）
     pub fn runtime_x_amz_user_agent(&self, machine_id: &str, mode: ClientMode) -> String {
         match mode {
-            ClientMode::KiroCli => "aws-sdk-rust/1.3.14 ua/2.1 api/codewhispererruntime/0.1.14474 os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI".to_string(),
+            ClientMode::KiroCli => "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererruntime/0.1.17593 os/macos lang/rust/1.92.0 m/F app/AmazonQ-For-CLI".to_string(),
             ClientMode::KiroIde => format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", self.kiro_version, machine_id),
         }
     }
@@ -462,8 +463,11 @@ impl Config {
     /// `kiro_version` 配置（抓包样本为 1.0.0，可经 config 校正）。
     pub fn kiro_runtime_user_agent(&self, machine_id: &str, mode: ClientMode) -> String {
         match mode {
+            // 对齐真实 AmazonQ-For-CLI 抓包（2026-06-29，runtime.us-east-1.kiro.dev）：
+            // CLI 即便打 runtime 端点，UA 的 api 段仍是 `codewhispererstreaming`（非 kiroruntime），
+            // 与 x-amz-target=AmazonCodeWhispererStreamingService 配套。版本随抓包更新。
             ClientMode::KiroCli => format!(
-                "aws-sdk-rust/1.3.14 ua/2.1 api/kiroruntime/0.1.14474 os/linux lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
+                "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17593 os/macos lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
                 self.kiro_cli_version
             ),
             ClientMode::KiroIde => format!(
@@ -476,7 +480,8 @@ impl Config {
     /// 生成 Kiro runtime（`runtime.{region}.kiro.dev`）端点的 x-amz-user-agent
     pub fn kiro_runtime_x_amz_user_agent(&self, machine_id: &str, mode: ClientMode) -> String {
         match mode {
-            ClientMode::KiroCli => "aws-sdk-rust/1.3.14 ua/2.1 api/kiroruntime/0.1.14474 os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI".to_string(),
+            // 对齐真实 AmazonQ-For-CLI 抓包（见 kiro_runtime_user_agent 注释）。
+            ClientMode::KiroCli => "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17593 os/macos lang/rust/1.92.0 m/F app/AmazonQ-For-CLI".to_string(),
             ClientMode::KiroIde => format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", self.kiro_version, machine_id),
         }
     }

@@ -139,7 +139,8 @@ pub fn build_client_with_resolve(
     relay: Option<&str>,
 ) -> anyhow::Result<Client> {
     // 固定 HTTP/1.1：
-    // 1. 与真实 Kiro IDE（aws-sdk-js / node）一致——抓包显示其用 HTTP/1.1 + Connection: close；
+    // 1. 与真实 Kiro 客户端一致——抓包实证 IDE（aws-sdk-js/node）与 CLI（aws-sdk-rust，
+    //    `cap/kiro-cli/`）均走 HTTP/1.1（CLI 侧为 keep-alive、无 Connection: close）；
     // 2. 规避上游 HTTP/2 在传 body 中途发 RST_STREAM(INTERNAL_ERROR) 导致的
     //    "stream error received" 502（不固定时 reqwest 会经 ALPN 协商成 h2）。
     // TCP keepalive：对齐真实 Kiro IDE（aws-sdk-js/Node 的 socket 默认开 keepAlive）。
@@ -157,10 +158,26 @@ pub fn build_client_with_resolve(
     // （在 timeout_secs 内没有任何新字节）时才超时，健康的长流不论总时长都不受限。
     // connect_timeout 单独给连接/TLS 握手兜底（原先这一段也靠总 timeout 兜，拆掉后需补），
     // 顺带让连不通的端点更快故障转移。
+    // TCP keepalive 配全（原先只设 idle=30s，interval/retries 走 OS 默认 75s×9，导致
+    // 死连接要 ~11min 才判定，期间被复用会挂到 read_timeout）：
+    // - idle 30s：空闲 30s 起发探针。远小于 AWS NLB 350s 空闲超时（NLB 到点**静默丢弃**、
+    //   不发 RST/FIN），探针流量持续重置 NLB / 路径 NAT 的空闲计时器，从源头避免连接被丢。
+    // - interval 5s + retries 3：连接真死时 ~30+5×3≈45s 内 socket 报错，交由上层重试开新连，
+    //   而非挂到 read_timeout（chat 达 720s）。
+    // 连接池（本服务是代理：上游连接是所有下游 × 所有凭证共享的热池，HTTP/1.1 一连接一请求
+    // 且 LLM 流长期占用，故池要充裕才有复用）：
+    // - pool_idle_timeout 60s：< NLB 350s，避免复用「对端已关、本地未察」的连接（reqwest
+    //   默认 90s 偏长）。持续流量下连接一直被复用、根本不会 idle 到此。
+    // - pool_max_idle_per_host 128：有界防 fd 泄漏（reqwest 默认无上限），取值需 ≥ 代理峰值
+    //   并发（Σ 各凭证并发上限）；超过则多出的连接不进 idle 池、下轮重握手，按实际并发调大。
     let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(Duration::from_secs(timeout_secs))
         .tcp_keepalive(Duration::from_secs(30))
+        .tcp_keepalive_interval(Duration::from_secs(5))
+        .tcp_keepalive_retries(3)
+        .pool_idle_timeout(Duration::from_secs(60))
+        .pool_max_idle_per_host(128)
         .http1_only();
 
     if tls_backend == TlsBackend::Rustls {

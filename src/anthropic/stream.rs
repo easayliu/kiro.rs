@@ -1390,7 +1390,11 @@ impl StreamContext {
                 let content_total = if self.cache_disabled {
                     context_total
                 } else {
-                    super::converter::strip_injected_prompt(context_total, self.input_tokens)
+                    super::converter::strip_injected_prompt(
+                        &self.model,
+                        context_total,
+                        self.input_tokens,
+                    )
                 };
                 self.cache_usage
                     .billed_split(self.input_tokens, content_total, self.cache_read_billed)

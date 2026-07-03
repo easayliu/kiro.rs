@@ -26,7 +26,9 @@ use uuid::Uuid;
 use std::sync::Arc;
 
 use super::cache_tracker::{CacheProfile, CacheScope, CacheTracker};
-use super::converter::{ConversionError, convert_request, injected_prompt_tokens, max_request_body_size};
+use super::converter::{
+    ConversionError, convert_request, effective_injected_floor, max_request_body_size,
+};
 use super::injection_scan;
 use super::middleware::{AppState, RequestId};
 use super::stream::{BufferedStreamContext, CacheUsage, SseEvent, StreamContext};
@@ -546,7 +548,7 @@ pub async fn post_messages(
     // 中转只加了这些（系统提示词基线 + cli 模式 env_state + origin），未参与可疑指令。
     tracing::info!(
         request_id = %request_id,
-        injected_system_tokens = injected_prompt_tokens(),
+        injected_system_tokens = effective_injected_floor(&payload.model),
         inject_env_state = provider.is_cli_mode(),
         origin = %provider.origin(),
         "中转注入溯源（仅固定内容）"
@@ -1312,7 +1314,7 @@ async fn handle_non_stream_request(
             let content_total = if matches!(cache_tracker.cache_scope(), CacheScope::Off) {
                 context_total
             } else {
-                super::converter::strip_injected_prompt(context_total, estimated_input_tokens)
+                super::converter::strip_injected_prompt(model, context_total, estimated_input_tokens)
             };
             let billed = estimated_usage.billed_split(
                 estimated_input_tokens,
@@ -1549,7 +1551,7 @@ pub async fn post_messages_cc(
     // 中转只加了这些（系统提示词基线 + cli 模式 env_state + origin），未参与可疑指令。
     tracing::info!(
         request_id = %request_id,
-        injected_system_tokens = injected_prompt_tokens(),
+        injected_system_tokens = effective_injected_floor(&payload.model),
         inject_env_state = provider.is_cli_mode(),
         origin = %provider.origin(),
         "中转注入溯源（仅固定内容）"
