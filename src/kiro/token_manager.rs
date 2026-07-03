@@ -1637,8 +1637,16 @@ impl MultiTokenManager {
                 // 第一轮优先尝试粘性绑定凭据（只试一次，后续轮次 fallback）
                 // 仍要校验 throttled_until：被上游限流的凭据若被粘性命中，
                 // 会绕过冷却继续发送请求并累积 throttle_count，永远逃不出冷却。
+                let concurrency_active =
+                    self.concurrency_feature_enabled.load(Ordering::Relaxed);
                 let preferred_hit = preferred_pending.take().and_then(|pid| {
                     let entries = self.entries.lock();
+                    // 锁序与 select_next_credential 一致：entries → default_concurrency_limit
+                    let default_concurrency = if concurrency_active {
+                        *self.default_concurrency_limit.lock()
+                    } else {
+                        None
+                    };
                     entries
                         .iter()
                         .find(|e| {
@@ -1647,6 +1655,20 @@ impl MultiTokenManager {
                                 && e.throttled_until.is_none_or(|until| until <= now)
                         })
                         .filter(|e| !is_opus || e.credentials.supports_opus())
+                        // 并发泄压阀：preferred 已达并发上限时不强钉，返回 None 回落普通
+                        // 选号，让高并发 session 的溢出请求 spill 到闲置凭据（代价：被 spill
+                        // 的请求在新凭据上吃一次冷 prefill）。仅溢出请求受影响，绑定不变，
+                        // 下一个不撞并发的请求仍会优先命中 preferred。语义与 select_next
+                        // 一致：limit=N 即最多 N 个在途（inflight 不含本次）。
+                        .filter(|e| {
+                            if !concurrency_active {
+                                return true;
+                            }
+                            match effective_concurrency_limit(&e.credentials, default_concurrency) {
+                                Some(limit) => e.inflight.load(Ordering::Relaxed) < limit as usize,
+                                None => true,
+                            }
+                        })
                         .map(|e| {
                             // 锁内 +1 占位（与 select_next_credential 一致）
                             let guard = InflightGuard::acquire(e.inflight.clone());
@@ -4902,5 +4924,64 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    // ---- 粘性绑定的并发泄压阀：preferred 达并发上限时 spill 到其它凭据 ----
+
+    /// api_key 凭据：token 直接用 kiro_api_key，无需网络刷新，可端到端测 acquire_context。
+    fn mk_api_cred(key: &str) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.priority = 0;
+        c.auth_method = Some("api_key".to_string());
+        c.kiro_api_key = Some(key.to_string());
+        c
+    }
+
+    #[tokio::test]
+    async fn sticky_preferred_honored_when_below_concurrency_limit() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.default_concurrency_limit = Some(2);
+        let manager = MultiTokenManager::new(
+            config,
+            vec![mk_api_cred("k1"), mk_api_cred("k2")],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // id=1 在途 0 < 2：preferred 应被命中（正常粘性）。
+        let ctx = manager.acquire_context(None, Some(1)).await.unwrap();
+        assert_eq!(ctx.id, 1, "preferred 未达并发上限 → 命中绑定凭据 id=1");
+    }
+
+    #[tokio::test]
+    async fn sticky_preferred_spills_when_at_concurrency_limit() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.default_concurrency_limit = Some(2);
+        let manager = MultiTokenManager::new(
+            config,
+            vec![mk_api_cred("k1"), mk_api_cred("k2")],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // 把 id=1 的在途占满到并发上限（2）。
+        let _saturate = {
+            let entries = manager.entries.lock();
+            let e1 = entries.iter().find(|e| e.id == 1).unwrap();
+            (
+                InflightGuard::acquire(e1.inflight.clone()),
+                InflightGuard::acquire(e1.inflight.clone()),
+            )
+        };
+
+        // preferred=1 已达并发上限 → 泄压阀回落普通选号，spill 到闲置的 id=2。
+        let ctx = manager.acquire_context(None, Some(1)).await.unwrap();
+        assert_eq!(ctx.id, 2, "preferred 达并发上限 → spill 到 id=2");
     }
 }
