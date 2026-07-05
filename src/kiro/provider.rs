@@ -240,7 +240,8 @@ impl KiroProvider {
     }
 
     /// 按凭据重写请求体：注入 `profileArn`、覆盖 `userInputMessage.origin`、
-    /// 按模式增/删 `userInputMessageContext.envState`。一次 JSON 解析完成所有改写。
+    /// 按模式增/删 `userInputMessageContext.envState`，并按模式对齐顶层字段。
+    /// 一次 JSON 解析完成所有改写。
     ///
     /// `origin` 与 `envState` 的最终来源是凭据级 `effective_client_mode`，
     /// 用以修正 handlers 阶段以全局 `client_mode` 拼出的 body 与凭据级 headers 不一致的问题。
@@ -261,6 +262,17 @@ impl KiroProvider {
                 if let Some(obj) = json.as_object_mut() {
                     obj.remove("profileArn");
                 }
+            }
+        }
+
+        // CLI 模式对齐真实 kiro-cli 抓包：runtime 端点上 CLI 请求体不带顶层 agentMode
+        // —— "vibe" 由 conversationState.agentTaskType 表达（handlers 阶段恒拼的顶层 agentMode
+        // 是冗余）。additionalModelRequestFields 不剥：它仅在客户端显式请求 thinking/effort 时
+        // 才存在（默认请求无此字段，天然与真实 CLI 一致），而 CLI 端点实测接受该字段且 effort
+        // 生效（high≈默认、low 明显压低思考量），保留它即 CLI 模式下的 effort 控制通道。
+        if mode.is_cli() {
+            if let Some(obj) = json.as_object_mut() {
+                obj.remove("agentMode");
             }
         }
 
@@ -1477,6 +1489,27 @@ mod tests {
         assert!(user_input["userInputMessageContext"]
             .get("envState")
             .is_none());
+    }
+
+    #[test]
+    fn test_apply_credential_overrides_cli_strips_agent_mode_keeps_effort() {
+        // 顶层带 agentMode + additionalModelRequestFields 的 body（handlers 阶段恒拼）。
+        let body = r#"{"agentMode":"vibe","additionalModelRequestFields":{"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}},"conversationState":{"conversationId":"c1","agentTaskType":"vibe","currentMessage":{"userInputMessage":{"content":"hi","modelId":"m","origin":"KIRO_CLI","userInputMessageContext":{}}}}}"#.to_string();
+        // CLI：剥掉冗余的顶层 agentMode；agentTaskType 保留；
+        // additionalModelRequestFields 保留（effort 控制通道，仅客户端显式请求时才存在）
+        let cli = KiroProvider::apply_credential_overrides(&body, &None, ClientMode::KiroCli);
+        let cli_json: serde_json::Value = serde_json::from_str(&cli).unwrap();
+        assert!(cli_json.get("agentMode").is_none());
+        assert_eq!(cli_json["conversationState"]["agentTaskType"], "vibe");
+        assert_eq!(
+            cli_json["additionalModelRequestFields"]["output_config"]["effort"],
+            "high"
+        );
+        // IDE：agentMode 与 additionalModelRequestFields 都保留（对齐 KiroIDE 抓包）
+        let ide = KiroProvider::apply_credential_overrides(&body, &None, ClientMode::KiroIde);
+        let ide_json: serde_json::Value = serde_json::from_str(&ide).unwrap();
+        assert_eq!(ide_json["agentMode"], "vibe");
+        assert!(ide_json.get("additionalModelRequestFields").is_some());
     }
 
     #[test]

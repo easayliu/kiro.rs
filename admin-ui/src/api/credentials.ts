@@ -220,6 +220,18 @@ export async function setInjectionScan(enabled: boolean): Promise<{ enabled: boo
   return data
 }
 
+// 获取表层人设开关（在 history 前预置 Claude Code 身份）
+export async function getSurfacePersona(): Promise<{ enabled: boolean }> {
+  const { data } = await api.get<{ enabled: boolean }>('/config/surface-persona')
+  return data
+}
+
+// 设置表层人设开关
+export async function setSurfacePersona(enabled: boolean): Promise<{ enabled: boolean }> {
+  const { data } = await api.put<{ enabled: boolean }>('/config/surface-persona', { enabled })
+  return data
+}
+
 // 缓存分桶策略（两种都按用户身份 metadata.user_id 分桶，PerCredential 在此之上再按凭据切分）
 export type CacheScope = 'global' | 'per_credential' | 'off'
 

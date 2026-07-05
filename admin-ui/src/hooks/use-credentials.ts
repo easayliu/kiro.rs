@@ -23,6 +23,8 @@ import {
   setGlobalCache,
   getInjectionScan,
   setInjectionScan,
+  getSurfacePersona,
+  setSurfacePersona,
   getCacheScope,
   setCacheScope,
   getCacheSkipRate,
@@ -287,6 +289,25 @@ export function useSetInjectionScan() {
     mutationFn: setInjectionScan,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['injectionScan'] })
+    },
+  })
+}
+
+// 获取表层人设开关
+export function useSurfacePersona() {
+  return useQuery({
+    queryKey: ['surfacePersona'],
+    queryFn: getSurfacePersona,
+  })
+}
+
+// 设置表层人设开关
+export function useSetSurfacePersona() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setSurfacePersona,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['surfacePersona'] })
     },
   })
 }

@@ -220,6 +220,9 @@ async fn main() {
     // 分块写入引导注入开关（检测写文件工具时向 system 注入分块引导；前端可实时切换）。
     anthropic::set_chunked_write_guidance(config.chunked_write_guidance);
 
+    // 表层人设开关（在 history 前预置 Claude Code 强预设，让常规回复以 Claude Code 身份作答）。
+    anthropic::set_surface_persona(config.surface_persona);
+
     // 出站请求体字节上限（超过上游 ~12.5 MiB 阈值前提前拦截，返回可读 413）。
     anthropic::set_max_request_body_size(config.max_request_body_size);
 

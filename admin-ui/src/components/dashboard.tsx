@@ -56,6 +56,8 @@ import {
   useSetCacheScope,
   useInjectionScan,
   useSetInjectionScan,
+  useSurfacePersona,
+  useSetSurfacePersona,
   useCacheSkipRate,
   useSetCacheSkipRate,
   useOutputMultiplier,
@@ -286,6 +288,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: setCacheScopeMutation, isPending: isSettingCacheScope } = useSetCacheScope()
   const { data: injectionScanData, isLoading: isLoadingInjectionScan } = useInjectionScan()
   const { mutate: setInjectionScanMutation, isPending: isSettingInjectionScan } = useSetInjectionScan()
+  const { data: surfacePersonaData, isLoading: isLoadingSurfacePersona } = useSurfacePersona()
+  const { mutate: setSurfacePersonaMutation, isPending: isSettingSurfacePersona } = useSetSurfacePersona()
   const { data: cacheSkipRateData, isLoading: isLoadingCacheSkipRate } = useCacheSkipRate()
   const { mutate: setCacheSkipRateMutation, isPending: isSettingCacheSkipRate } = useSetCacheSkipRate()
   const [cacheSkipRateDialogOpen, setCacheSkipRateDialogOpen] = useState(false)
@@ -966,6 +970,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
     const next = !(injectionScanData?.enabled ?? true)
     setInjectionScanMutation(next, {
       onSuccess: () => toast.success(next ? '已开启注入扫描' : '已关闭注入扫描'),
+      onError: err => toast.error(`切换失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
+  const handleToggleSurfacePersona = () => {
+    const next = !(surfacePersonaData?.enabled ?? false)
+    setSurfacePersonaMutation(next, {
+      onSuccess: () => toast.success(next ? '已开启 Claude Code 表层人设' : '已关闭表层人设'),
       onError: err => toast.error(`切换失败: ${extractErrorMessage(err)}`),
     })
   }
@@ -1672,6 +1684,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
               loading={isLoadingInjectionScan}
               disabled={isLoadingInjectionScan || isSettingInjectionScan}
               onClick={handleToggleInjectionScan}
+            />
+            <PolicyRow
+              label="表层人设"
+              sub={surfacePersonaData?.enabled ?? false ? '回复以 Claude Code 自称（仅表层）' : '已关闭，按上游默认身份'}
+              value={isLoadingSurfacePersona ? '—' : (surfacePersonaData?.enabled ?? false) ? '开启' : '关闭'}
+              loading={isLoadingSurfacePersona}
+              disabled={isLoadingSurfacePersona || isSettingSurfacePersona}
+              onClick={handleToggleSurfacePersona}
             />
             <PolicyRow
               label="缓存跳过率"

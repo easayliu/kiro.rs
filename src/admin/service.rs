@@ -547,6 +547,39 @@ impl AdminService {
         })
     }
 
+    /// 获取表层人设开关
+    pub fn get_surface_persona(&self) -> crate::admin::types::SurfacePersonaResponse {
+        crate::admin::types::SurfacePersonaResponse {
+            enabled: crate::anthropic::surface_persona_enabled(),
+        }
+    }
+
+    /// 设置表层人设开关（同时持久化到 config.json）
+    pub fn set_surface_persona(
+        &self,
+        req: crate::admin::types::SetSurfacePersonaRequest,
+    ) -> Result<crate::admin::types::SurfacePersonaResponse, AdminServiceError> {
+        crate::anthropic::set_surface_persona(req.enabled);
+
+        if let Some(config_path) = self.token_manager.config().config_path() {
+            match crate::model::config::Config::load(config_path) {
+                Ok(mut config) => {
+                    config.surface_persona = req.enabled;
+                    if let Err(e) = config.save() {
+                        tracing::warn!("保存表层人设开关失败: {}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("加载配置文件失败: {}", e);
+                }
+            }
+        }
+
+        Ok(crate::admin::types::SurfacePersonaResponse {
+            enabled: req.enabled,
+        })
+    }
+
     /// 获取缓存分桶策略
     pub fn get_cache_scope(&self) -> crate::admin::types::CacheScopeResponse {
         use crate::anthropic::CacheScope;

@@ -16,7 +16,7 @@ use super::{
         SetCacheSkipRateRequest, SetConcurrencyLimitRequest, SetOutputMultiplierRequest,
         SetCredentialGroupRequest, SetDefaultConcurrencyLimitRequest, SetDefaultRpmLimitRequest,
         SetDisabledRequest,
-        SetChunkedWriteGuidanceRequest,
+        SetChunkedWriteGuidanceRequest, SetSurfacePersonaRequest,
         SetGlobalCacheRequest, SetInjectionScanRequest, SetLoadBalancingModeRequest,
         SetOverageRequest, SetPriorityRequest,
         SetRelayHostRequest, SetRpmLimitRequest, SuccessResponse, UpsertProxyGroupRequest,
@@ -389,6 +389,25 @@ pub async fn set_chunked_write_guidance(
     Json(payload): Json<SetChunkedWriteGuidanceRequest>,
 ) -> impl IntoResponse {
     match state.service.set_chunked_write_guidance(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/surface-persona
+/// 获取表层人设开关
+pub async fn get_surface_persona(State(state): State<AdminState>) -> impl IntoResponse {
+    let response = state.service.get_surface_persona();
+    Json(response)
+}
+
+/// PUT /api/admin/config/surface-persona
+/// 设置表层人设开关
+pub async fn set_surface_persona(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetSurfacePersonaRequest>,
+) -> impl IntoResponse {
+    match state.service.set_surface_persona(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

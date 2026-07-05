@@ -209,6 +209,12 @@ pub struct Config {
     #[serde(default = "default_chunked_write_guidance")]
     pub chunked_write_guidance: bool,
 
+    /// 表层人设：在 history 最前面预置「你叫 Claude Code」强预设，让常规回复以
+    /// Claude Code 身份作答。默认关。仅覆盖表层称呼——服务端强制注入的 Kiro 身份
+    /// 仍在，被诚实盘问时会翻回 Kiro，无法根除。
+    #[serde(default = "default_surface_persona")]
+    pub surface_persona: bool,
+
     /// 出站请求体字节上限（默认 12 MiB；0 表示关闭该预检）。上游 Kiro runtime 对整个
     /// 请求体有 ~12.5 MiB 硬阈值，超过会以 400 `Input content length exceeds threshold`
     /// 拒绝（整体 body 字节，非 token 窗口 / 单图 / 单文档）。中转层提前拦截给出可读错误。
@@ -329,6 +335,10 @@ fn default_chunked_write_guidance() -> bool {
     true
 }
 
+fn default_surface_persona() -> bool {
+    false
+}
+
 fn default_max_request_body_size() -> usize {
     crate::anthropic::KIRO_MAX_REQUEST_BODY_SIZE_DEFAULT
 }
@@ -369,6 +379,7 @@ impl Default for Config {
             cache_scope: None,
             injection_scan: default_injection_scan(),
             chunked_write_guidance: default_chunked_write_guidance(),
+            surface_persona: default_surface_persona(),
             max_request_body_size: default_max_request_body_size(),
             cache_skip_rate: None,
             output_token_multiplier: None,

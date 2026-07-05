@@ -372,6 +372,22 @@ pub struct SetChunkedWriteGuidanceRequest {
     pub enabled: bool,
 }
 
+/// 表层人设开关响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SurfacePersonaResponse {
+    /// 是否在 history 前预置 Claude Code 表层人设
+    pub enabled: bool,
+}
+
+/// 设置表层人设开关请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSurfacePersonaRequest {
+    /// 是否在 history 前预置 Claude Code 表层人设
+    pub enabled: bool,
+}
+
 /// 缓存分桶策略响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
