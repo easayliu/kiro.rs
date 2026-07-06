@@ -657,9 +657,10 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
     } else {
         // 末尾消息无任何有效内容（空 user 或空 assistant prefill）：若原样发出空 content，
         // 上游直接判 "Improperly formed request." / REQUEST_BODY_INVALID（实测）。history 仍作为
-        // 上下文，这里补一个非空占位（Smithy @length(min:1)）让上游正常应答，避免 400。
-        tracing::warn!("当前消息内容为空（末尾空消息/prefill），使用占位空格避免上游 400");
-        " ".to_string()
+        // 上下文，这里补一个非空占位让上游正常应答，避免 400。注意：无 toolResults 时纯空白
+        // （如单个空格）也会被上游 trim 后判为空 → 照样 400（实测），必须用非空白字符占位。
+        tracing::warn!("当前消息内容为空（末尾空消息/prefill），使用占位 \".\" 避免上游 400");
+        ".".to_string()
     };
 
     let mut user_input = UserInputMessage::new(content, &model_id)
