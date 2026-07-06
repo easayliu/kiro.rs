@@ -72,6 +72,34 @@ impl ConversationState {
         self.history = history;
         self
     }
+
+    /// 统计整个会话（currentMessage + history user 轮）图片 base64 的总字节数。
+    ///
+    /// 上游 ~12.5MiB 内容长度阈值只统计文本、不含图片（实测 27.6MB 纯图片 body 放行），
+    /// 出站体积预检需用 body 长度扣除该值后再比较阈值。
+    pub fn total_image_b64_len(&self) -> usize {
+        let current: usize = self
+            .current_message
+            .user_input_message
+            .images
+            .iter()
+            .map(|i| i.source.bytes.len())
+            .sum();
+        let history: usize = self
+            .history
+            .iter()
+            .map(|m| match m {
+                Message::User(u) => u
+                    .user_input_message
+                    .images
+                    .iter()
+                    .map(|i| i.source.bytes.len())
+                    .sum(),
+                Message::Assistant(_) => 0,
+            })
+            .sum();
+        current + history
+    }
 }
 
 /// 当前消息容器

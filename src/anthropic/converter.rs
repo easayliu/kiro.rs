@@ -415,6 +415,11 @@ pub enum ConversionError {
         height: u32,
         max_side: u32,
     },
+    /// 当前消息单图 base64 字节超出上游限制
+    ImageBytesTooLarge {
+        size: usize,
+        max_size: usize,
+    },
     /// 当前消息文档解码大小超出上游限制
     DocumentTooLarge {
         name: String,
@@ -436,6 +441,12 @@ impl std::fmt::Display for ConversionError {
                 f,
                 "图片 {}×{} 像素超过上游限制（长边 ≤ {}），请缩放（推荐长边 ≤ 1568）",
                 width, height, max_side
+            ),
+            ConversionError::ImageBytesTooLarge { size, max_size } => write!(
+                f,
+                "图片 {:.2}MB（base64）超过上游单图限制（≤ {:.1}MB），请压缩后重试",
+                *size as f64 / 1_000_000.0,
+                *max_size as f64 / 1_000_000.0
             ),
             ConversionError::DocumentTooLarge {
                 name,
@@ -560,9 +571,16 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
     let (text_content, images, documents, tool_results) =
         process_message_content(&last_message.content)?;
 
-    // 5.5. 当前消息图片维度预校验：上游对单图长边有硬上限（8000），超过会以
-    // "Improperly formed request" 拒绝。提前拦截给出可读错误。
+    // 5.5. 当前消息图片预校验：上游对单图长边有硬上限（8000，超过 "Improperly formed
+    // request"），对单图 base64 字节有硬上限（5MiB，超过 IMAGE_SIZE_EXCEEDED）。
+    // 提前拦截给出可读错误。
     for img in &images {
+        if img.source.bytes.len() > KIRO_MAX_IMAGE_B64_SIZE {
+            return Err(ConversionError::ImageBytesTooLarge {
+                size: img.source.bytes.len(),
+                max_size: KIRO_MAX_IMAGE_B64_SIZE,
+            });
+        }
         if let Some((w, h)) = image_dimensions(&img.source.bytes, &img.format) {
             if w > KIRO_MAX_IMAGE_SIDE || h > KIRO_MAX_IMAGE_SIDE {
                 return Err(ConversionError::ImageTooLarge {
@@ -1118,18 +1136,25 @@ const TOOL_USE_ID_MAX_LEN: usize = 64;
 /// 这里只在硬上限处拦截，把"推荐值"放在错误提示里告知用户。
 pub const KIRO_MAX_IMAGE_SIDE: u32 = 8000;
 
+/// 单图 base64 字节上限。上游 Mantle 层实测硬限 5MiB（报错原文 "image exceeds 5 MB
+/// maximum: N bytes > 5242880 bytes"，按 **base64 编码后**长度计），超过以 400
+/// `IMAGE_SIZE_EXCEEDED` 拒绝。总图片体量无独立上限（实测 6×4.6MB=27.6MB 放行），
+/// 约束只在单图。
+pub const KIRO_MAX_IMAGE_B64_SIZE: usize = 5_242_880;
+
 /// 单文档解码后字节上限。上游对单个 document 的硬上限为 4.5MB，超过会以
 /// 400 `DOCUMENT_SIZE_EXCEEDED`（"Document 'document' exceeds maximum size of 4.5MB"）拒绝。
 /// 实测边界为十进制 4,500,000 字节（非 4.5 MiB）：4_500_000 通过大小校验、4_550_000 被拒。
 /// 提前在转换阶段拦截，避免触发上游错误。
 pub const KIRO_MAX_DOCUMENT_SIZE: usize = 4_500_000; // 4.5 MB（十进制，实测上游边界）
 
-/// 出站请求体字节上限的默认值（12 MiB）。上游 Kiro runtime 对整个请求体有 ~12.5 MiB
-/// 的硬阈值，超过会以 400 `Input content length exceeds threshold`（reason
-/// REQUEST_BODY_INVALID）拒绝——这不是 token 窗口、也不是单图/单文档限制，而是**整体
-/// body 字节**（实测：出站 body ≤12.49 MiB 放行、≥12.74 MiB 被拒，边界≈12.5 MiB）。
-/// 默认取 12 MiB 留 ~0.5 MiB 余量，提前在中转层拦截给出可读错误、省一次上游往返。
-/// 可由 config `maxRequestBodySize` 覆盖。
+/// 出站**文本内容**字节上限的默认值（12 MiB）。上游 Kiro runtime 对文本内容总量有
+/// ~12.5 MiB 的硬阈值，超过会以 400 `Input content length exceeds threshold`（reason
+/// CONTENT_LENGTH_EXCEEDS_THRESHOLD）拒绝。实测（2026-07-06）：该阈值**只统计文本**
+/// （跨 history 多轮求和，13.77MB 文本拆两轮照样拒），**图片 base64 不计入**
+/// （6×4.6MB=27.6MB 纯图片 body 放行）；整体 body 字节无独立上限。因此预检口径为
+/// 「序列化 body 长度 − 图片 base64 总长度」。默认取 12 MiB 留 ~0.5 MiB 余量，
+/// 提前在中转层拦截给出可读错误、省一次上游往返。可由 config `maxRequestBodySize` 覆盖。
 pub const KIRO_MAX_REQUEST_BODY_SIZE_DEFAULT: usize = 12 * 1024 * 1024;
 
 /// 估算 base64 解码后的字节数（标准带填充编码，`data` 字段无空白）。
@@ -1587,16 +1612,17 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     Ok(history)
 }
 
-/// 历史图片总量预算（base64 字符数）。上游单请求体 ~4MB Smithy 上限，
-/// 给历史图留一半，其余让给 currentMessage 图片 / 工具定义 / 文本。
-const HISTORY_IMAGE_BASE64_BUDGET: usize = 2 * 1024 * 1024;
+/// 历史图片总量预算（base64 字符数）。上游对图片体量**没有**总量上限（实测 27.6MB
+/// 纯图片 body 放行，~12.5MiB 内容阈值只统计文本），约束只在单图 5MiB。此预算仅为
+/// 控制本地内存与上传延迟的工程上限，非上游硬限，按"新图优先"裁剪。
+const HISTORY_IMAGE_BASE64_BUDGET: usize = 20 * 1024 * 1024;
 
 /// 按"新图优先"裁剪历史图片到预算内。
 ///
 /// 从最新的 user 轮往旧遍历累计图片体量；某轮图片放不进剩余预算时整轮退回
-/// 占位文本（与旧全丢行为相同的提示格式）。超过上游 8000px 长边硬限的图
-/// 一律剔除（currentMessage 路径对等校验是直接报错，历史图报错会卡死整个
-/// 请求，只能静默降级）。
+/// 占位文本（与旧全丢行为相同的提示格式）。超过上游 8000px 长边硬限或单图
+/// 5MiB base64 硬限的图一律剔除（currentMessage 路径对等校验是直接报错，
+/// 历史图报错会卡死整个请求，只能静默降级）。
 fn enforce_history_image_budget(history: &mut [Message]) {
     let mut remaining = HISTORY_IMAGE_BASE64_BUDGET;
     for msg in history.iter_mut().rev() {
@@ -1608,10 +1634,11 @@ fn enforce_history_image_budget(history: &mut [Message]) {
 
         let mut omitted = 0usize;
         um.images.retain(|img| {
-            let fits = match image_dimensions(&img.source.bytes, &img.format) {
-                Some((w, h)) => w <= KIRO_MAX_IMAGE_SIDE && h <= KIRO_MAX_IMAGE_SIDE,
-                None => true,
-            };
+            let fits = img.source.bytes.len() <= KIRO_MAX_IMAGE_B64_SIZE
+                && match image_dimensions(&img.source.bytes, &img.format) {
+                    Some((w, h)) => w <= KIRO_MAX_IMAGE_SIDE && h <= KIRO_MAX_IMAGE_SIDE,
+                    None => true,
+                };
             if !fits {
                 omitted += 1;
             }
@@ -1640,8 +1667,8 @@ fn enforce_history_image_budget(history: &mut [Message]) {
 /// 合并多个 user 消息
 ///
 /// 历史图片透传到上游（history userInputMessage.images 通道实测模型可见），
-/// 总量由 enforce_history_image_budget 按"新图优先"预算裁剪，防止多轮带图
-/// 撑爆上游 ~4MB 请求体上限（超过会以 "Improperly formed request" 形式 400）。
+/// 总量由 enforce_history_image_budget 按"新图优先"预算裁剪（上游图片无总量
+/// 硬限、单图 5MiB，预算只是控内存/延迟的工程上限）。
 /// 文档仍不透传，只留占位文本（单文档上限 4.5MB，透传极易超体量）。
 fn merge_user_messages(
     messages: &[&super::types::Message],
@@ -3168,9 +3195,9 @@ mod tests {
     fn test_history_images_over_budget_dropped_newest_first() {
         use super::super::types::Message as AnthropicMessage;
 
-        // 旧轮 1 张大图（1.5MB base64）+ 新轮 1 张大图（1.5MB）：预算 2MB，
-        // 新图优先保留，旧轮整轮退回占位符
-        let big_b64 = "A".repeat(1_500_000);
+        // 旧轮 1 张大图（4.8MB base64）+ 新轮 4 张大图（共 19.2MB）：预算 20MiB
+        // （单图均低于 5MiB 硬限），新图优先保留吃掉预算，旧轮放不下整轮退回占位符
+        let big_b64 = "A".repeat(4_800_000);
         let img = |b64: &str| {
             serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}})
         };
@@ -3188,7 +3215,10 @@ mod tests {
                 },
                 AnthropicMessage {
                     role: "user".to_string(),
-                    content: serde_json::json!([{"type": "text", "text": "new image"}, img(&big_b64)]),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "new image"},
+                        img(&big_b64), img(&big_b64), img(&big_b64), img(&big_b64)
+                    ]),
                 },
                 AnthropicMessage {
                     role: "assistant".to_string(),
@@ -3226,7 +3256,7 @@ mod tests {
             users[0].content
         );
         assert!(users[0].content.contains("old image"));
-        assert_eq!(users[1].images.len(), 1, "新图应保留");
+        assert_eq!(users[1].images.len(), 4, "新图应保留");
         assert!(!users[1].content.contains("omitted from history"));
     }
 
