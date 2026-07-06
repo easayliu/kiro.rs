@@ -757,7 +757,23 @@ fn process_message_content(
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
                                 let mapped_id = map_tool_use_id(&tool_use_id);
-                                let result_content = extract_tool_result_content(&block.content);
+                                let (mut result_content, result_images) =
+                                    extract_tool_result_content(&block.content);
+                                // tool_result 里的图片上提为消息级 images（Read 读图等场景），
+                                // 文本里留说明让模型知道图在消息附件里
+                                if !result_images.is_empty() {
+                                    let note = format!(
+                                        "[{} image(s) from this tool result attached to this message]",
+                                        result_images.len()
+                                    );
+                                    if result_content.is_empty() {
+                                        result_content = note;
+                                    } else {
+                                        result_content.push('\n');
+                                        result_content.push_str(&note);
+                                    }
+                                    images.extend(result_images);
+                                }
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -857,20 +873,35 @@ fn get_image_format(media_type: &str) -> Option<String> {
 }
 
 /// 提取工具结果内容
-fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
+/// 提取 tool_result 内容中的文本与图片。
+///
+/// 图片走不了 toolResult 通道：上游 schema 接受 image 块但会静默剥离，
+/// 模型看不到（实测）。故图片单独返回，由调用方上提为消息级 images
+/// （该通道实测模型可见）。
+fn extract_tool_result_content(content: &Option<serde_json::Value>) -> (String, Vec<KiroImage>) {
     match content {
-        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::String(s)) => (s.clone(), Vec::new()),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
+            let mut images = Vec::new();
             for item in arr {
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     parts.push(text.to_string());
+                } else if item.get("type").and_then(|v| v.as_str()) == Some("image") {
+                    let media_type = item
+                        .pointer("/source/media_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let data = item.pointer("/source/data").and_then(|v| v.as_str());
+                    if let (Some(format), Some(data)) = (get_image_format(media_type), data) {
+                        images.push(KiroImage::from_base64(format, data.to_string()));
+                    }
                 }
             }
-            parts.join("\n")
+            (parts.join("\n"), images)
         }
-        Some(v) => v.to_string(),
-        None => String::new(),
+        Some(v) => (v.to_string(), Vec::new()),
+        None => (String::new(), Vec::new()),
     }
 }
 
@@ -1550,21 +1581,73 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
         history.push(Message::User(merged_user));
     }
 
+    enforce_history_image_budget(&mut history);
+
     Ok(history)
+}
+
+/// 历史图片总量预算（base64 字符数）。上游单请求体 ~4MB Smithy 上限，
+/// 给历史图留一半，其余让给 currentMessage 图片 / 工具定义 / 文本。
+const HISTORY_IMAGE_BASE64_BUDGET: usize = 2 * 1024 * 1024;
+
+/// 按"新图优先"裁剪历史图片到预算内。
+///
+/// 从最新的 user 轮往旧遍历累计图片体量；某轮图片放不进剩余预算时整轮退回
+/// 占位文本（与旧全丢行为相同的提示格式）。超过上游 8000px 长边硬限的图
+/// 一律剔除（currentMessage 路径对等校验是直接报错，历史图报错会卡死整个
+/// 请求，只能静默降级）。
+fn enforce_history_image_budget(history: &mut [Message]) {
+    let mut remaining = HISTORY_IMAGE_BASE64_BUDGET;
+    for msg in history.iter_mut().rev() {
+        let Message::User(hum) = msg else { continue };
+        let um = &mut hum.user_input_message;
+        if um.images.is_empty() {
+            continue;
+        }
+
+        let mut omitted = 0usize;
+        um.images.retain(|img| {
+            let fits = match image_dimensions(&img.source.bytes, &img.format) {
+                Some((w, h)) => w <= KIRO_MAX_IMAGE_SIDE && h <= KIRO_MAX_IMAGE_SIDE,
+                None => true,
+            };
+            if !fits {
+                omitted += 1;
+            }
+            fits
+        });
+
+        let total: usize = um.images.iter().map(|i| i.source.bytes.len()).sum();
+        if total <= remaining {
+            remaining -= total;
+        } else {
+            omitted += um.images.len();
+            um.images.clear();
+        }
+
+        if omitted > 0 {
+            let placeholder = format!("[{} image(s) omitted from history]", omitted);
+            if um.content.trim().is_empty() || um.content == "." {
+                um.content = placeholder;
+            } else {
+                um.content = format!("{}\n{}", placeholder, um.content);
+            }
+        }
+    }
 }
 
 /// 合并多个 user 消息
 ///
-/// 历史轮次的图片不再透传到上游：上游对单次请求体有体量上限
-/// （AWS CodeWhisperer ~4MB Smithy 校验，超过会以 "Improperly formed
-/// request" 形式 400），多轮带图很容易撑爆。模型对历史图的注意力本来就低，
-/// 这里只保留一句占位文本告知图片存在，节省 payload。
+/// 历史图片透传到上游（history userInputMessage.images 通道实测模型可见），
+/// 总量由 enforce_history_image_budget 按"新图优先"预算裁剪，防止多轮带图
+/// 撑爆上游 ~4MB 请求体上限（超过会以 "Improperly formed request" 形式 400）。
+/// 文档仍不透传，只留占位文本（单文档上限 4.5MB，透传极易超体量）。
 fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
-    let mut omitted_images = 0usize;
+    let mut all_images = Vec::new();
     let mut omitted_documents = 0usize;
     let mut all_tool_results = Vec::new();
 
@@ -1573,7 +1656,7 @@ fn merge_user_messages(
         if !text.is_empty() {
             content_parts.push(text);
         }
-        omitted_images += images.len();
+        all_images.extend(images);
         omitted_documents += documents.len();
         all_tool_results.extend(tool_results);
     }
@@ -1584,22 +1667,20 @@ fn merge_user_messages(
             format!("[{} document(s) omitted from history]", omitted_documents),
         );
     }
-    if omitted_images > 0 {
-        content_parts.insert(
-            0,
-            format!("[{} image(s) omitted from history]", omitted_images),
-        );
-    }
 
     let content = content_parts.join("\n");
     // 保留文本内容，即使有工具结果也不丢弃用户文本
-    // kiro API 不接受空 content（Smithy @length(min:1)），仅有 tool_results 时用占位符兜底
-    let content = if content.is_empty() && !all_tool_results.is_empty() {
+    // kiro API 不接受空 content（Smithy @length(min:1)），仅有 tool_results 时用占位符兜底；
+    // 带图时 Bedrock 要求必须有非空白 text block（同 currentMessage 路径，实测 "." 可通过）
+    let content = if content.is_empty() && !all_images.is_empty() {
+        ".".to_string()
+    } else if content.is_empty() && !all_tool_results.is_empty() {
         " ".to_string()
     } else {
         content
     };
-    let user_msg = UserMessage::new(&content, model_id);
+    let mut user_msg = UserMessage::new(&content, model_id);
+    user_msg.images = all_images;
 
     let user_msg = if !all_tool_results.is_empty() {
         let mut ctx = UserInputMessageContext::new();
@@ -3030,7 +3111,7 @@ mod tests {
     }
 
     #[test]
-    fn test_history_images_dropped_with_placeholder() {
+    fn test_history_images_kept_within_budget() {
         use super::super::types::Message as AnthropicMessage;
 
         // 历史里一条 user 消息带 2 张图 + 一行文字；当前消息是纯文本
@@ -3067,23 +3148,141 @@ mod tests {
 
         let result = convert_request(&req, "AI_EDITOR", false).unwrap();
 
-        // 历史里第一条 user 应该不含图，但 content 头部应有占位符
+        // 预算内的历史图片应原样保留，文本不加占位符
         let history = &result.conversation_state.history;
         let first = match &history[0] {
             Message::User(h) => h,
             _ => panic!("expected User"),
         };
-        assert!(first.user_input_message.images.is_empty(), "历史图片应被丢弃");
+        assert_eq!(first.user_input_message.images.len(), 2, "预算内历史图片应保留");
         assert!(
-            first
-                .user_input_message
-                .content
-                .contains("[2 image(s) omitted from history]"),
-            "应在历史文本里追加占位符，实际: {:?}",
+            !first.user_input_message.content.contains("omitted from history"),
+            "未丢图不应有占位符，实际: {:?}",
             first.user_input_message.content
         );
-        // 原始文字也得保留
         assert!(first.user_input_message.content.contains("look at these"));
+    }
+
+    #[test]
+    fn test_history_images_over_budget_dropped_newest_first() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 旧轮 1 张大图（1.5MB base64）+ 新轮 1 张大图（1.5MB）：预算 2MB，
+        // 新图优先保留，旧轮整轮退回占位符
+        let big_b64 = "A".repeat(1_500_000);
+        let img = |b64: &str| {
+            serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}})
+        };
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 64,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{"type": "text", "text": "old image"}, img(&big_b64)]),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("seen"),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([{"type": "text", "text": "new image"}, img(&big_b64)]),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("seen again"),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("follow up"),
+                },
+            ],
+            system: None,
+            stream: false,
+            tools: None,
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req, "AI_EDITOR", false).unwrap();
+        let history = &result.conversation_state.history;
+        let users: Vec<_> = history
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(h) => Some(&h.user_input_message),
+                _ => None,
+            })
+            .collect();
+
+        // 旧轮（第一条 user）图被裁，带占位符；新轮保留
+        assert!(users[0].images.is_empty(), "旧图应被预算裁掉");
+        assert!(
+            users[0].content.contains("[1 image(s) omitted from history]"),
+            "旧轮应有占位符，实际: {:?}",
+            users[0].content
+        );
+        assert!(users[0].content.contains("old image"));
+        assert_eq!(users[1].images.len(), 1, "新图应保留");
+        assert!(!users[1].content.contains("omitted from history"));
+    }
+
+    #[test]
+    fn test_tool_result_image_hoisted_to_message_images() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // Read 工具读图场景：tool_result 里带 image 块，应上提到当前消息 images，
+        // toolResult 文本里留说明
+        let tiny_b64 = "iVBORw0KGgo=";
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 64,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("read 1.png"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "toolu_img_01", "name": "read_image", "input": {"path": "1.png"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "toolu_img_01", "content": [
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": tiny_b64}}
+                        ]}
+                    ]),
+                },
+            ],
+            system: None,
+            stream: false,
+            tools: None,
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req, "AI_EDITOR", false).unwrap();
+        let uim = &result.conversation_state.current_message.user_input_message;
+
+        assert_eq!(uim.images.len(), 1, "tool_result 图片应上提到消息级 images");
+        let tool_results = &uim.user_input_message_context.tool_results;
+        assert_eq!(tool_results.len(), 1);
+        let tr_text = tool_results[0].content[0]
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            tr_text.contains("image(s) from this tool result attached"),
+            "toolResult 文本应有附图说明，实际: {:?}",
+            tr_text
+        );
     }
 
     #[test]
