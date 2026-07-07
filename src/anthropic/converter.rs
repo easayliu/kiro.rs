@@ -426,6 +426,11 @@ pub enum ConversionError {
         size: usize,
         max_size: usize,
     },
+    /// 工具 input_schema 顶层 properties 的属性名不符合上游模式
+    InvalidToolPropertyKeys {
+        tool: String,
+        keys: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for ConversionError {
@@ -458,6 +463,12 @@ impl std::fmt::Display for ConversionError {
                 name,
                 *size as f64 / 1_000_000.0,
                 *max_size as f64 / 1_000_000.0
+            ),
+            ConversionError::InvalidToolPropertyKeys { tool, keys } => write!(
+                f,
+                "工具 '{}' 的 input_schema.properties 属性名不被上游接受（须匹配 ^[a-zA-Z0-9_.-]{{1,64}}$）: {}",
+                tool,
+                keys.join(", ")
             ),
         }
     }
@@ -606,6 +617,8 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
     }
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射）
+    // 先预检顶层属性名，违规直接给下游清晰 400，避免浪费一次上游调用
+    validate_tool_property_keys(&req.tools)?;
     let mut tool_name_map = HashMap::new();
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
 
@@ -1299,6 +1312,48 @@ pub fn normalize_tool_use_id_for_client(id: &str) -> String {
     } else {
         format!("toolu_{}", id)
     }
+}
+
+/// 校验工具 input_schema 顶层 properties 的属性名
+///
+/// 上游（Anthropic 模型侧，Mantle 与 Bedrock 路径均校验）要求顶层属性名匹配
+/// `^[a-zA-Z0-9_.-]{1,64}$`，违规会以 400 TOOL_SCHEMA_INVALID 拒绝整条请求，
+/// 且错误信息不含具体工具名。这里提前拦截，报错带上工具名与违规属性名。
+/// 实测仅顶层 properties 受校验，嵌套层不校验，故只检查第一层。
+fn validate_tool_property_keys(tools: &Option<Vec<super::types::Tool>>) -> Result<(), ConversionError> {
+    let Some(tools) = tools else {
+        return Ok(());
+    };
+    let key_valid = |k: &str| {
+        !k.is_empty()
+            && k.chars().count() <= 64
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    };
+    for t in tools {
+        // 空名工具会在 convert_tools 中被过滤，不发往上游，跳过校验
+        if t.name.trim().is_empty() {
+            continue;
+        }
+        if let Some(serde_json::Value::Object(props)) = t.input_schema.get("properties") {
+            let bad: Vec<String> = props
+                .keys()
+                .filter(|k| !key_valid(k))
+                .cloned()
+                .collect();
+            if !bad.is_empty() {
+                tracing::warn!(
+                    tool = %t.name,
+                    keys = %bad.join(", "),
+                    "工具 input_schema.properties 属性名不符合上游模式，拒绝请求"
+                );
+                return Err(ConversionError::InvalidToolPropertyKeys {
+                    tool: t.name.clone(),
+                    keys: bad,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 转换工具定义
@@ -3136,6 +3191,57 @@ mod tests {
 
         assert_eq!(kiro_tools.len(), 1, "只保留 1 个 name 非空的工具");
         assert_eq!(kiro_tools[0].tool_specification.name, "valid_tool");
+    }
+
+    #[test]
+    fn test_validate_tool_property_keys() {
+        use super::super::types::Tool as AnthropicTool;
+
+        let make_tool = |name: &str, props: serde_json::Value| {
+            let mut schema = std::collections::HashMap::new();
+            schema.insert("type".to_string(), serde_json::json!("object"));
+            schema.insert("properties".to_string(), props);
+            AnthropicTool {
+                name: name.to_string(),
+                description: "t".to_string(),
+                input_schema: schema,
+                tool_type: None,
+                max_uses: None,
+                cache_control: None,
+            }
+        };
+
+        // 合法 key（含 . - _ 与 64 字符边界）通过
+        let long64 = "k".repeat(64);
+        let ok = make_tool("t1", serde_json::json!({"a_b.c-d": {"type": "string"}, long64: {"type": "string"}}));
+        assert!(validate_tool_property_keys(&Some(vec![ok])).is_ok());
+
+        // 中文 / 空格 / $ / 超长 65 字符均拒绝
+        for bad_key in ["文件路径", "file path", "$ref_key", &"k".repeat(65)] {
+            let bad = make_tool("t_bad", serde_json::json!({bad_key: {"type": "string"}}));
+            let err = validate_tool_property_keys(&Some(vec![bad])).unwrap_err();
+            match err {
+                ConversionError::InvalidToolPropertyKeys { tool, keys } => {
+                    assert_eq!(tool, "t_bad");
+                    assert_eq!(keys, vec![bad_key.to_string()]);
+                }
+                other => panic!("期望 InvalidToolPropertyKeys，实际 {:?}", other),
+            }
+        }
+
+        // 嵌套层非法 key 不校验（上游实测仅校验顶层）
+        let nested = make_tool(
+            "t_nested",
+            serde_json::json!({"config": {"type": "object", "properties": {"嵌套中文": {"type": "string"}}}}),
+        );
+        assert!(validate_tool_property_keys(&Some(vec![nested])).is_ok());
+
+        // 空名工具（将被 convert_tools 过滤）跳过校验
+        let empty_name = make_tool("  ", serde_json::json!({"非法key": {"type": "string"}}));
+        assert!(validate_tool_property_keys(&Some(vec![empty_name])).is_ok());
+
+        // 无 tools / 无 properties 均通过
+        assert!(validate_tool_property_keys(&None).is_ok());
     }
 
     #[test]

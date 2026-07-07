@@ -583,6 +583,11 @@ pub async fn post_messages(
                     "request_too_large",
                     e.to_string(),
                 ),
+                ConversionError::InvalidToolPropertyKeys { .. } => (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    e.to_string(),
+                ),
             };
             tracing::warn!("请求转换失败: {}", e);
             return (status, Json(ErrorResponse::new(error_type, message))).into_response();
@@ -1609,6 +1614,11 @@ pub async fn post_messages_cc(
                 ConversionError::DocumentTooLarge { .. } => (
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "request_too_large",
+                    e.to_string(),
+                ),
+                ConversionError::InvalidToolPropertyKeys { .. } => (
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
                     e.to_string(),
                 ),
             };
