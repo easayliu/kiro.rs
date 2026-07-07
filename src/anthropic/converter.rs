@@ -400,9 +400,15 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// 工具属性名映射（上游工具名 → {净化名 → 原始名}），仅当存在违规属性名时非空。
+    /// 出口用它把模型产出的 tool_use 入参顶层 key 还原为客户端原始参数名。
+    pub tool_key_map: ToolPropertyKeyMap,
     /// 顶层 `additionalModelRequestFields`（thinking 配置），未开启 thinking 时为 None
     pub additional_model_request_fields: Option<serde_json::Value>,
 }
+
+/// 工具属性名映射：上游（已映射）工具名 → {净化后属性名 → 原始属性名}
+pub type ToolPropertyKeyMap = HashMap<String, HashMap<String, String>>;
 
 /// 转换错误
 #[derive(Debug)]
@@ -425,11 +431,6 @@ pub enum ConversionError {
         name: String,
         size: usize,
         max_size: usize,
-    },
-    /// 工具 input_schema 顶层 properties 的属性名不符合上游模式
-    InvalidToolPropertyKeys {
-        tool: String,
-        keys: Vec<String>,
     },
 }
 
@@ -463,12 +464,6 @@ impl std::fmt::Display for ConversionError {
                 name,
                 *size as f64 / 1_000_000.0,
                 *max_size as f64 / 1_000_000.0
-            ),
-            ConversionError::InvalidToolPropertyKeys { tool, keys } => write!(
-                f,
-                "工具 '{}' 的 input_schema.properties 属性名不被上游接受（须匹配 ^[a-zA-Z0-9_.-]{{1,64}}$）: {}",
-                tool,
-                keys.join(", ")
             ),
         }
     }
@@ -616,11 +611,10 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
         }
     }
 
-    // 6. 转换工具定义（超长名称自动缩短并记录映射）
-    // 先预检顶层属性名，违规直接给下游清晰 400，避免浪费一次上游调用
-    validate_tool_property_keys(&req.tools)?;
+    // 6. 转换工具定义（超长名称自动缩短并记录映射；违规属性名净化并记录映射供出口还原）
     let mut tool_name_map = HashMap::new();
-    let mut tools = convert_tools(&req.tools, &mut tool_name_map);
+    let mut tool_key_map = ToolPropertyKeyMap::new();
+    let mut tools = convert_tools(&req.tools, &mut tool_name_map, &mut tool_key_map);
 
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
@@ -726,6 +720,7 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
+        tool_key_map,
         additional_model_request_fields: build_additional_model_request_fields(req),
     })
 }
@@ -1314,50 +1309,108 @@ pub fn normalize_tool_use_id_for_client(id: &str) -> String {
     }
 }
 
-/// 校验工具 input_schema 顶层 properties 的属性名
+/// 属性名是否符合上游模式 `^[a-zA-Z0-9_.-]{1,64}$`
 ///
-/// 上游（Anthropic 模型侧，Mantle 与 Bedrock 路径均校验）要求顶层属性名匹配
-/// `^[a-zA-Z0-9_.-]{1,64}$`，违规会以 400 TOOL_SCHEMA_INVALID 拒绝整条请求，
-/// 且错误信息不含具体工具名。这里提前拦截，报错带上工具名与违规属性名。
-/// 实测仅顶层 properties 受校验，嵌套层不校验，故只检查第一层。
-fn validate_tool_property_keys(tools: &Option<Vec<super::types::Tool>>) -> Result<(), ConversionError> {
-    let Some(tools) = tools else {
-        return Ok(());
+/// 上游（Anthropic 模型侧，Mantle 与 Bedrock 路径均校验）对工具 input_schema
+/// 顶层 properties 的属性名做此校验，违规会以 400 TOOL_SCHEMA_INVALID 拒绝整条请求。
+/// 实测仅顶层 properties 受校验，嵌套层不校验。
+fn property_key_valid(k: &str) -> bool {
+    !k.is_empty()
+        && k.chars().count() <= 64
+        && k.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// 净化违规属性名：非法字符替换为 `_`，并追加原始名 SHA256 前 8 位 hex 防撞名
+/// （「账号」「密码」净化后都是 `__`，仅靠替换会互相覆盖）。结果恒 ≤64 字符且合法。
+fn sanitize_property_key(key: &str) -> String {
+    let sanitized: String = key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') { c } else { '_' })
+        .collect();
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    let hash_hex = format!("{:x}", hasher.finalize());
+    // 55 prefix + 1 underscore + 8 hash = 64（净化串为纯 ASCII，按字节截断安全）
+    let prefix: &str = &sanitized[..sanitized.len().min(55)];
+    format!("{}_{}", prefix, &hash_hex[..8])
+}
+
+/// 净化 schema 顶层 properties 中的违规属性名，返回反向映射（净化名 → 原始名）。
+///
+/// 同步处理：
+/// - `required` 数组中引用被改名属性的条目一并改名（否则上游按新名找不到必填项）；
+/// - 在该属性 description 里附注原始参数名，减少模型面对 `___a1b2c3d4` 式名字的语义损失。
+///
+/// 全部属性名合法时不改动 schema，返回空映射。
+fn sanitize_schema_property_keys(schema: &mut serde_json::Value) -> HashMap<String, String> {
+    let mut key_map = HashMap::new();
+    let Some(serde_json::Value::Object(props)) = schema.get_mut("properties") else {
+        return key_map;
     };
-    let key_valid = |k: &str| {
-        !k.is_empty()
-            && k.chars().count() <= 64
-            && k.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
-    };
-    for t in tools {
-        // 空名工具会在 convert_tools 中被过滤，不发往上游，跳过校验
-        if t.name.trim().is_empty() {
+    if props.keys().all(|k| property_key_valid(k)) {
+        return key_map;
+    }
+
+    let mut new_props = serde_json::Map::new();
+    for (k, mut v) in std::mem::take(props) {
+        if property_key_valid(&k) {
+            new_props.insert(k, v);
             continue;
         }
-        if let Some(serde_json::Value::Object(props)) = t.input_schema.get("properties") {
-            let bad: Vec<String> = props
-                .keys()
-                .filter(|k| !key_valid(k))
-                .cloned()
-                .collect();
-            if !bad.is_empty() {
-                tracing::warn!(
-                    tool = %t.name,
-                    keys = %bad.join(", "),
-                    "工具 input_schema.properties 属性名不符合上游模式，拒绝请求"
-                );
-                return Err(ConversionError::InvalidToolPropertyKeys {
-                    tool: t.name.clone(),
-                    keys: bad,
-                });
+        let mapped = sanitize_property_key(&k);
+        if let serde_json::Value::Object(prop) = &mut v {
+            let hint = match prop.get("description").and_then(|d| d.as_str()) {
+                Some(desc) if !desc.is_empty() => format!("原始参数名: {}。{}", k, desc),
+                _ => format!("原始参数名: {}", k),
+            };
+            prop.insert("description".to_string(), serde_json::Value::String(hint));
+        }
+        key_map.insert(mapped.clone(), k);
+        new_props.insert(mapped, v);
+    }
+    *props = new_props;
+
+    // required 同步改名（原始名 → 净化名）
+    if let Some(serde_json::Value::Array(required)) = schema.get_mut("required") {
+        for r in required.iter_mut() {
+            if let Some(orig) = r.as_str() {
+                if let Some((mapped, _)) = key_map.iter().find(|(_, o)| o.as_str() == orig) {
+                    *r = serde_json::Value::String(mapped.clone());
+                }
             }
         }
     }
-    Ok(())
+    key_map
+}
+
+/// 把模型产出的 tool_use 入参顶层 key 按映射（净化名 → 原始名）还原。
+///
+/// 仅处理顶层（与上游校验范围一致）；映射中不存在的 key 原样保留——模型偶尔
+/// 照历史或 description 附注直接发原始参数名时，透传对客户端恰好正确。
+pub fn restore_tool_input_keys(
+    input: &mut serde_json::Value,
+    key_map: &HashMap<String, String>,
+) {
+    let serde_json::Value::Object(obj) = input else {
+        return;
+    };
+    if !obj.keys().any(|k| key_map.contains_key(k)) {
+        return;
+    }
+    let mut restored = serde_json::Map::new();
+    for (k, v) in std::mem::take(obj) {
+        let key = key_map.get(&k).cloned().unwrap_or(k);
+        restored.insert(key, v);
+    }
+    *obj = restored;
 }
 
 /// 转换工具定义
-fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut HashMap<String, String>) -> Vec<Tool> {
+fn convert_tools(
+    tools: &Option<Vec<super::types::Tool>>,
+    tool_name_map: &mut HashMap<String, String>,
+    tool_key_map: &mut ToolPropertyKeyMap,
+) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
@@ -1395,11 +1448,25 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
                 None => description,
             };
 
+            let mapped_name = map_tool_name(&t.name, tool_name_map);
+
+            // 净化顶层违规属性名（上游 400 TOOL_SCHEMA_INVALID），记录映射供出口还原
+            let mut schema = normalize_json_schema(serde_json::json!(t.input_schema));
+            let key_map = sanitize_schema_property_keys(&mut schema);
+            if !key_map.is_empty() {
+                tracing::warn!(
+                    tool = %t.name,
+                    keys = %key_map.values().cloned().collect::<Vec<_>>().join(", "),
+                    "工具 schema 顶层属性名不符合上游模式，已净化，出口将还原"
+                );
+                tool_key_map.insert(mapped_name.clone(), key_map);
+            }
+
             Tool {
                 tool_specification: ToolSpecification {
-                    name: map_tool_name(&t.name, tool_name_map),
+                    name: mapped_name,
                     description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
+                    input_schema: InputSchema::from_json(schema),
                 },
             }
         })
@@ -3194,54 +3261,145 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_tool_property_keys() {
-        use super::super::types::Tool as AnthropicTool;
+    fn test_sanitize_schema_property_keys() {
+        // 全合法（含 . - _ 与 64 字符边界）：schema 不动，映射为空
+        let long64 = "k".repeat(64);
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {"a_b.c-d": {"type": "string"}, long64.clone(): {"type": "string"}},
+            "required": ["a_b.c-d"]
+        });
+        let before = schema.clone();
+        assert!(sanitize_schema_property_keys(&mut schema).is_empty());
+        assert_eq!(schema, before);
 
-        let make_tool = |name: &str, props: serde_json::Value| {
-            let mut schema = std::collections::HashMap::new();
-            schema.insert("type".to_string(), serde_json::json!("object"));
-            schema.insert("properties".to_string(), props);
-            AnthropicTool {
-                name: name.to_string(),
-                description: "t".to_string(),
+        // 中文 / 空格 / $ / 超长均被净化；合法 key 保留原样
+        let long65 = "k".repeat(65);
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "账号": {"type": "string", "description": "登录账号"},
+                "密码": {"type": "string"},
+                "file path": {"type": "string"},
+                "$ref_key": {"type": "string"},
+                long65.clone(): {"type": "string"},
+                "ok_key": {"type": "string"}
+            },
+            "required": ["账号", "ok_key"]
+        });
+        let key_map = sanitize_schema_property_keys(&mut schema);
+        assert_eq!(key_map.len(), 5);
+
+        let props = schema["properties"].as_object().unwrap();
+        // 所有净化后的 key 合法，且反向映射能还原
+        for (mapped, orig) in &key_map {
+            assert!(property_key_valid(mapped), "净化名应合法: {}", mapped);
+            assert!(props.contains_key(mapped));
+            assert_ne!(mapped, orig);
+        }
+        // 「账号」「密码」净化前缀同为 __，hash 后缀保证不撞名
+        let mapped_zh: Vec<&String> = key_map
+            .iter()
+            .filter(|(_, o)| *o == "账号" || *o == "密码")
+            .map(|(m, _)| m)
+            .collect();
+        assert_eq!(mapped_zh.len(), 2);
+        assert_ne!(mapped_zh[0], mapped_zh[1]);
+        // 合法 key 原样保留
+        assert!(props.contains_key("ok_key"));
+        // description 附注原始参数名，原描述保留
+        let account_mapped = key_map.iter().find(|(_, o)| *o == "账号").unwrap().0;
+        let desc = props[account_mapped]["description"].as_str().unwrap();
+        assert!(desc.contains("账号") && desc.contains("登录账号"));
+        // required 同步改名：账号 → 净化名，ok_key 不动
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(required.contains(&account_mapped.as_str()));
+        assert!(required.contains(&"ok_key"));
+        assert!(!required.contains(&"账号"));
+    }
+
+    #[test]
+    fn test_restore_tool_input_keys() {
+        let mut key_map = HashMap::new();
+        key_map.insert("___abc12345".to_string(), "账号".to_string());
+
+        // 净化名还原为原始名，其余 key 不动
+        let mut input = serde_json::json!({"___abc12345": "user1", "other": 2});
+        restore_tool_input_keys(&mut input, &key_map);
+        assert_eq!(input, serde_json::json!({"账号": "user1", "other": 2}));
+
+        // 模型直接发原始名：透传不动
+        let mut input = serde_json::json!({"账号": "user1"});
+        restore_tool_input_keys(&mut input, &key_map);
+        assert_eq!(input, serde_json::json!({"账号": "user1"}));
+
+        // 非 object 入参不动
+        let mut input = serde_json::json!("raw");
+        restore_tool_input_keys(&mut input, &key_map);
+        assert_eq!(input, serde_json::json!("raw"));
+    }
+
+    #[test]
+    fn test_convert_request_sanitizes_tool_property_keys() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let mut schema = std::collections::HashMap::new();
+        schema.insert("type".to_string(), serde_json::json!("object"));
+        schema.insert(
+            "properties".to_string(),
+            serde_json::json!({"账号": {"type": "string"}}),
+        );
+        schema.insert("required".to_string(), serde_json::json!(["账号"]));
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            max_tokens: 64,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("hi"),
+            }],
+            system: None,
+            stream: false,
+            tools: Some(vec![AnthropicTool {
+                name: "StructuredOutput".to_string(),
+                description: "structured".to_string(),
                 input_schema: schema,
                 tool_type: None,
                 max_uses: None,
                 cache_control: None,
-            }
+            }]),
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
         };
 
-        // 合法 key（含 . - _ 与 64 字符边界）通过
-        let long64 = "k".repeat(64);
-        let ok = make_tool("t1", serde_json::json!({"a_b.c-d": {"type": "string"}, long64: {"type": "string"}}));
-        assert!(validate_tool_property_keys(&Some(vec![ok])).is_ok());
+        let result = convert_request(&req, "AI_EDITOR", false).unwrap();
 
-        // 中文 / 空格 / $ / 超长 65 字符均拒绝
-        for bad_key in ["文件路径", "file path", "$ref_key", &"k".repeat(65)] {
-            let bad = make_tool("t_bad", serde_json::json!({bad_key: {"type": "string"}}));
-            let err = validate_tool_property_keys(&Some(vec![bad])).unwrap_err();
-            match err {
-                ConversionError::InvalidToolPropertyKeys { tool, keys } => {
-                    assert_eq!(tool, "t_bad");
-                    assert_eq!(keys, vec![bad_key.to_string()]);
-                }
-                other => panic!("期望 InvalidToolPropertyKeys，实际 {:?}", other),
-            }
-        }
+        // 映射按上游工具名登记
+        let key_map = result.tool_key_map.get("StructuredOutput").expect("应有属性名映射");
+        assert_eq!(key_map.len(), 1);
+        let (mapped, orig) = key_map.iter().next().unwrap();
+        assert_eq!(orig, "账号");
+        assert!(property_key_valid(mapped));
 
-        // 嵌套层非法 key 不校验（上游实测仅校验顶层）
-        let nested = make_tool(
-            "t_nested",
-            serde_json::json!({"config": {"type": "object", "properties": {"嵌套中文": {"type": "string"}}}}),
-        );
-        assert!(validate_tool_property_keys(&Some(vec![nested])).is_ok());
-
-        // 空名工具（将被 convert_tools 过滤）跳过校验
-        let empty_name = make_tool("  ", serde_json::json!({"非法key": {"type": "string"}}));
-        assert!(validate_tool_property_keys(&Some(vec![empty_name])).is_ok());
-
-        // 无 tools / 无 properties 均通过
-        assert!(validate_tool_property_keys(&None).is_ok());
+        // 下发上游的 schema 中不再含违规 key，required 已同步
+        let kiro_tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+        let schema_json = serde_json::to_value(&kiro_tools[0].tool_specification.input_schema).unwrap();
+        let sent = schema_json["json"].clone();
+        assert!(sent["properties"].as_object().unwrap().contains_key(mapped));
+        assert!(!sent["properties"].as_object().unwrap().contains_key("账号"));
+        assert_eq!(sent["required"], serde_json::json!([mapped]));
     }
 
     #[test]

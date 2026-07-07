@@ -702,6 +702,13 @@ pub struct StreamContext {
     /// 传输层丢帧），按官方契约置 stop_reason=max_tokens，使客户端不去执行残缺调用
     /// （避免 Write Failed / 工具参数缺失）。
     tool_input_acc: HashMap<i32, String>,
+    /// 工具属性名映射（上游工具名 → {净化名 → 原始名}），由 handler 注入。
+    /// 属性名曾被净化的工具，其入参顶层 key 需在出口还原为客户端原始参数名。
+    tool_key_map: super::converter::ToolPropertyKeyMap,
+    /// 属性名曾被净化的工具的入参缓冲（block_index → (累积入参, 上游工具名)）。
+    /// key 可能被切分在多个分片里，无法逐分片改名，须攒齐到 stop 再整体解析还原、
+    /// 一次性下发。无映射的工具不缓冲，仍逐分片流式。
+    deferred_tool_inputs: HashMap<i32, (String, String)>,
 }
 
 impl StreamContext {
@@ -742,7 +749,14 @@ impl StreamContext {
             binding_src: "none",
             cache_disabled: false,
             tool_input_acc: HashMap::new(),
+            tool_key_map: super::converter::ToolPropertyKeyMap::new(),
+            deferred_tool_inputs: HashMap::new(),
         }
+    }
+
+    /// 注入工具属性名映射（属性名曾被净化的工具，出口还原入参顶层 key）
+    pub fn set_tool_key_map(&mut self, map: super::converter::ToolPropertyKeyMap) {
+        self.tool_key_map = map;
     }
 
     /// 是否存在「非空但非法 JSON」的 tool 入参 —— 即被截断的工具调用。
@@ -1361,7 +1375,14 @@ impl StreamContext {
                 .or_default()
                 .push_str(&tool_use.input);
 
-            if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+            if self.tool_key_map.contains_key(&tool_use.name) {
+                // 属性名曾被净化的工具：分片攒入缓冲，stop 时整体还原后一次性下发
+                self.deferred_tool_inputs
+                    .entry(block_index)
+                    .or_insert_with(|| (String::new(), tool_use.name.clone()))
+                    .0
+                    .push_str(&tool_use.input);
+            } else if let Some(delta_event) = self.state_manager.handle_content_block_delta(
                 block_index,
                 json!({
                     "type": "content_block_delta",
@@ -1378,12 +1399,47 @@ impl StreamContext {
 
         // 如果是完整的工具调用（stop=true），发送 content_block_stop
         if tool_use.stop {
+            events.extend(self.flush_deferred_tool_input(block_index));
             if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
                 events.push(stop_event);
             }
         }
 
         events
+    }
+
+    /// 下发被缓冲的工具入参：整体解析、顶层 key 还原为原始参数名，一次性发出。
+    ///
+    /// 入参非法 JSON（被截断）时原样透传——与逐分片流式的行为一致，收尾的
+    /// `has_incomplete_tool_input` 会置 stop_reason=max_tokens 阻止客户端执行。
+    fn flush_deferred_tool_input(&mut self, block_index: i32) -> Vec<SseEvent> {
+        let Some((acc, name)) = self.deferred_tool_inputs.remove(&block_index) else {
+            return Vec::new();
+        };
+        let restored = match (
+            serde_json::from_str::<serde_json::Value>(&acc),
+            self.tool_key_map.get(&name),
+        ) {
+            (Ok(mut v), Some(key_map)) => {
+                super::converter::restore_tool_input_keys(&mut v, key_map);
+                v.to_string()
+            }
+            _ => acc,
+        };
+        match self.state_manager.handle_content_block_delta(
+            block_index,
+            json!({
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": restored
+                }
+            }),
+        ) {
+            Some(e) => vec![e],
+            None => Vec::new(),
+        }
     }
 
     /// 生成最终事件序列
@@ -1417,6 +1473,16 @@ impl StreamContext {
 
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        // 兜底：属性名净化工具的入参缓冲若因流异常中断未随 stop 下发，收口前 flush。
+        // 此时入参通常已截断，原样透传，由下方 has_incomplete_tool_input 置 max_tokens。
+        if !self.deferred_tool_inputs.is_empty() {
+            let mut pending: Vec<i32> = self.deferred_tool_inputs.keys().copied().collect();
+            pending.sort_unstable();
+            for idx in pending {
+                events.extend(self.flush_deferred_tool_input(idx));
+            }
+        }
 
         // 新端点：若 reasoningContentEvent 开的 thinking 块仍未收尾（无后续正文/工具），
         // 在收口前补一个 content_block_stop。
@@ -1674,6 +1740,11 @@ impl BufferedStreamContext {
         }
     }
 
+    /// 注入工具属性名映射（透传到内部 StreamContext）
+    pub fn set_tool_key_map(&mut self, map: super::converter::ToolPropertyKeyMap) {
+        self.inner.set_tool_key_map(map);
+    }
+
     /// 注入 prompt caching 结果（透传到内部 StreamContext）
     pub fn set_cache_usage(&mut self, ctx: CacheUsageContext) {
         self.inner.set_cache_usage(ctx);
@@ -1910,6 +1981,99 @@ mod tests {
             start_event.data["content_block"]["name"],
             "mcp__very_long_original_tool_name",
             "应还原为原始工具名称"
+        );
+    }
+
+    #[test]
+    fn test_tool_input_key_restore_in_stream() {
+        use crate::kiro::model::events::ToolUseEvent;
+
+        let mut key_map = HashMap::new();
+        let mut inner = HashMap::new();
+        inner.insert("___abc12345".to_string(), "账号".to_string());
+        key_map.insert("StructuredOutput".to_string(), inner);
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        ctx.set_tool_key_map(key_map);
+        let _ = ctx.generate_initial_events();
+
+        // 入参 key 被切分在两个分片里：缓冲期间不应下发任何 input_json_delta
+        let frag1 = ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            name: "StructuredOutput".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            input: r#"{"___ab"#.to_string(),
+            stop: false,
+        }));
+        assert!(
+            !frag1.iter().any(|e| e.data["delta"]["type"] == "input_json_delta"),
+            "缓冲期间不应下发入参分片"
+        );
+
+        // stop 分片：整体还原后一次性下发
+        let frag2 = ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            name: "StructuredOutput".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            input: r#"c12345":"user1"}"#.to_string(),
+            stop: true,
+        }));
+        let deltas: Vec<&SseEvent> = frag2
+            .iter()
+            .filter(|e| e.data["delta"]["type"] == "input_json_delta")
+            .collect();
+        assert_eq!(deltas.len(), 1, "应一次性下发完整入参");
+        let restored: serde_json::Value =
+            serde_json::from_str(deltas[0].data["delta"]["partial_json"].as_str().unwrap()).unwrap();
+        assert_eq!(restored, serde_json::json!({"账号": "user1"}));
+        // 且块已正常关闭
+        assert!(frag2.iter().any(|e| e.event == "content_block_stop"));
+
+        // 无映射的工具不受影响：分片照常流式下发
+        let other = ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            name: "plain_tool".to_string(),
+            tool_use_id: "toolu_02".to_string(),
+            input: r#"{"k":"v"}"#.to_string(),
+            stop: true,
+        }));
+        assert!(
+            other.iter().any(|e| e.data["delta"]["type"] == "input_json_delta"
+                && e.data["delta"]["partial_json"] == r#"{"k":"v"}"#),
+            "无映射工具应逐分片原样流式"
+        );
+    }
+
+    #[test]
+    fn test_tool_input_key_restore_flush_on_abnormal_end() {
+        use crate::kiro::model::events::ToolUseEvent;
+
+        let mut key_map = HashMap::new();
+        let mut inner = HashMap::new();
+        inner.insert("___abc12345".to_string(), "账号".to_string());
+        key_map.insert("StructuredOutput".to_string(), inner);
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        ctx.set_tool_key_map(key_map);
+        let _ = ctx.generate_initial_events();
+
+        // 只有半截入参、stop 一直没来（流异常中断）
+        let _ = ctx.process_kiro_event(&Event::ToolUse(ToolUseEvent {
+            name: "StructuredOutput".to_string(),
+            tool_use_id: "toolu_01".to_string(),
+            input: r#"{"___abc12345":"us"#.to_string(),
+            stop: false,
+        }));
+
+        let final_events = ctx.generate_final_events();
+        // 兜底 flush：截断入参原样透传
+        assert!(
+            final_events.iter().any(|e| e.data["delta"]["type"] == "input_json_delta"
+                && e.data["delta"]["partial_json"] == r#"{"___abc12345":"us"#),
+            "收口时应把缓冲的截断入参原样下发"
+        );
+        // 截断兜底：stop_reason 置 max_tokens
+        assert!(
+            final_events.iter().any(|e| e.event == "message_delta"
+                && e.data["delta"]["stop_reason"] == "max_tokens"),
+            "截断的工具调用应置 stop_reason=max_tokens"
         );
     }
 

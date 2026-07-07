@@ -583,11 +583,6 @@ pub async fn post_messages(
                     "request_too_large",
                     e.to_string(),
                 ),
-                ConversionError::InvalidToolPropertyKeys { .. } => (
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    e.to_string(),
-                ),
             };
             tracing::warn!("请求转换失败: {}", e);
             return (status, Json(ErrorResponse::new(error_type, message))).into_response();
@@ -671,6 +666,7 @@ pub async fn post_messages(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    let tool_key_map = conversion_result.tool_key_map;
 
     if payload.stream {
         // 流式响应
@@ -681,6 +677,7 @@ pub async fn post_messages(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            tool_key_map,
             cache_tracker,
             cache_profile,
             binding_table,
@@ -699,6 +696,7 @@ pub async fn post_messages(
             input_tokens,
             extract_thinking,
             tool_name_map,
+            tool_key_map,
             cache_tracker,
             cache_profile,
             binding_table,
@@ -766,6 +764,7 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    tool_key_map: super::converter::ToolPropertyKeyMap,
     cache_tracker: Arc<CacheTracker>,
     cache_profile: CacheProfile,
     binding_table: Arc<BindingTable>,
@@ -812,6 +811,7 @@ async fn handle_stream_request(
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    ctx.set_tool_key_map(tool_key_map);
     // TTFT 原点钉在「向上游发出请求」时刻，覆盖上游等首 token 的等待（见 ApiCallResult）。
     ctx.set_ttft_origin(api_result.upstream_request_at);
     ctx.set_cache_usage(cache_context);
@@ -1138,6 +1138,7 @@ async fn handle_non_stream_request(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    tool_key_map: super::converter::ToolPropertyKeyMap,
     cache_tracker: Arc<CacheTracker>,
     cache_profile: CacheProfile,
     binding_table: Arc<BindingTable>,
@@ -1234,7 +1235,7 @@ async fn handle_non_stream_request(
 
                             // 如果是完整的工具调用，添加到列表
                             if tool_use.stop {
-                                let input: serde_json::Value = if buffer.is_empty() {
+                                let mut input: serde_json::Value = if buffer.is_empty() {
                                     serde_json::json!({})
                                 } else {
                                     serde_json::from_str(buffer)
@@ -1246,6 +1247,11 @@ async fn handle_non_stream_request(
                                             serde_json::json!({})
                                         })
                                 };
+
+                                // 属性名曾被净化的工具：入参顶层 key 还原为客户端原始参数名
+                                if let Some(key_map) = tool_key_map.get(&tool_use.name) {
+                                    super::converter::restore_tool_input_keys(&mut input, key_map);
+                                }
 
                                 let original_name = tool_name_map
                                     .get(&tool_use.name)
@@ -1616,11 +1622,6 @@ pub async fn post_messages_cc(
                     "request_too_large",
                     e.to_string(),
                 ),
-                ConversionError::InvalidToolPropertyKeys { .. } => (
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    e.to_string(),
-                ),
             };
             tracing::warn!("请求转换失败: {}", e);
             return (status, Json(ErrorResponse::new(error_type, message))).into_response();
@@ -1704,6 +1705,7 @@ pub async fn post_messages_cc(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    let tool_key_map = conversion_result.tool_key_map;
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -1714,6 +1716,7 @@ pub async fn post_messages_cc(
             input_tokens,
             thinking_enabled,
             tool_name_map,
+            tool_key_map,
             cache_tracker,
             cache_profile,
             binding_table,
@@ -1732,6 +1735,7 @@ pub async fn post_messages_cc(
             input_tokens,
             extract_thinking,
             tool_name_map,
+            tool_key_map,
             cache_tracker,
             cache_profile,
             binding_table,
@@ -1754,6 +1758,7 @@ async fn handle_stream_request_buffered(
     estimated_input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
+    tool_key_map: super::converter::ToolPropertyKeyMap,
     cache_tracker: Arc<CacheTracker>,
     cache_profile: CacheProfile,
     binding_table: Arc<BindingTable>,
@@ -1800,6 +1805,7 @@ async fn handle_stream_request_buffered(
 
     // 创建缓冲流处理上下文
     let mut ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
+    ctx.set_tool_key_map(tool_key_map);
     // TTFT 原点钉在「向上游发出请求」时刻，覆盖上游等首 token 的等待（见 ApiCallResult）。
     ctx.set_ttft_origin(api_result.upstream_request_at);
     ctx.set_cache_usage(cache_context);
