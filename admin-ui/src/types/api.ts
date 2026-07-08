@@ -249,7 +249,7 @@ export interface BillingStatsResponse {
 // ━━━━━━━━━━ 时序统计（曲线 / 分析） ━━━━━━━━━━
 
 /** 曲线分桶粒度 */
-export type StatsBucket = 'hour' | 'day'
+export type StatsBucket = 'minute' | '5min' | '15min' | 'hour' | 'day'
 /** 曲线分组维度 */
 export type StatsGroupBy = 'none' | 'model' | 'credential'
 

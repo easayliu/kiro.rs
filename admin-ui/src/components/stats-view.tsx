@@ -13,27 +13,36 @@ import {
   YAxis,
 } from 'recharts'
 import { useQueryClient } from '@tanstack/react-query'
-import { Activity, AlertTriangle, Check, ChevronDown, CircleDollarSign, Clock, RefreshCw, Search } from 'lucide-react'
+import { toast } from 'sonner'
+import { Activity, AlertTriangle, Check, ChevronDown, CircleDollarSign, Clock, Pencil, RefreshCw, Search } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { useCredentials, useStatsSummary, useStatsTimeseries } from '@/hooks/use-credentials'
+import { useCredentials, useSetPriority, useStatsSummary, useStatsTimeseries } from '@/hooks/use-credentials'
 import type { StatGroup, StatsBucket } from '@/types/api'
 
 // ━━━━━━━━━━ 时间范围 ━━━━━━━━━━
-type HoursPreset = '24h' | '7d' | '30d'
+type HoursPreset = '1h' | '6h' | '12h' | '24h' | '7d' | '30d' | '90d'
 type RangeKey = HoursPreset | 'today' | 'yesterday' | 'custom'
-// 滚动窗口预设（hours）
+// 滚动窗口预设（hours）：窗口越短分桶越细，保持每条曲线 24~96 个点
 const RANGES: Record<HoursPreset, { hours: number; bucket: StatsBucket }> = {
+  '1h': { hours: 1, bucket: 'minute' },
+  '6h': { hours: 6, bucket: '5min' },
+  '12h': { hours: 12, bucket: '15min' },
   '24h': { hours: 24, bucket: 'hour' },
   '7d': { hours: 168, bucket: 'hour' },
   '30d': { hours: 720, bucket: 'day' },
+  '90d': { hours: 2160, bucket: 'day' },
 }
 // SegBar 顺序与标签
 const RANGE_OPTIONS: { key: RangeKey; label: string }[] = [
+  { key: '1h', label: '1 小时' },
+  { key: '6h', label: '6 小时' },
+  { key: '12h', label: '12 小时' },
   { key: '24h', label: '24 小时' },
   { key: 'today', label: '今天' },
   { key: 'yesterday', label: '昨天' },
   { key: '7d', label: '7 天' },
   { key: '30d', label: '30 天' },
+  { key: '90d', label: '90 天' },
   { key: 'custom', label: '自定义' },
 ]
 /** 本地当日 0 点的 Unix 秒 */
@@ -79,7 +88,10 @@ function fmtTime(ts: number, bucket: StatsBucket): string {
   const dd = String(d.getDate()).padStart(2, '0')
   if (bucket === 'day') return `${mm}-${dd}`
   const hh = String(d.getHours()).padStart(2, '0')
-  return `${mm}-${dd} ${hh}:00`
+  if (bucket === 'hour') return `${mm}-${dd} ${hh}:00`
+  // 分钟级桶：短窗口内日期冗余，只保留时分
+  const mi = String(d.getMinutes()).padStart(2, '0')
+  return `${hh}:${mi}`
 }
 
 const AXIS = 'hsl(var(--muted-foreground))'
@@ -120,7 +132,10 @@ export function StatsView() {
       const t = customTo ? Math.floor(new Date(customTo).getTime() / 1000) : 0
       if (f && t && t > f) {
         const span = t - f
-        return { tsRange: { from: f, to: t }, bucket: span > 3 * 86400 ? 'day' : 'hour' }
+        // 跨度自适应分桶：≤3h 分钟级、≤12h 一刻钟、≤3d 小时、更长按天
+        const b: StatsBucket =
+          span <= 3 * 3600 ? 'minute' : span <= 12 * 3600 ? '15min' : span <= 3 * 86400 ? 'hour' : 'day'
+        return { tsRange: { from: f, to: t }, bucket: b }
       }
       return { tsRange: { hours: 24 }, bucket: 'hour' } // 未填全 → 回退默认
     }
@@ -152,6 +167,23 @@ export function StatsView() {
     creds?.credentials?.forEach(c => m.set(String(c.id), c.email || `#${c.id}`))
     return (key: string) => m.get(key) || `#${key}`
   }, [creds])
+
+  // credential id → 当前优先级（用于按凭据表的行内编辑）
+  const credPriority = useMemo(() => {
+    const m = new Map<string, number>()
+    creds?.credentials?.forEach(c => m.set(String(c.id), c.priority))
+    return m
+  }, [creds])
+  const setPriority = useSetPriority()
+  const handleSetPriority = (key: string, priority: number) => {
+    setPriority.mutate(
+      { id: Number(key), priority },
+      {
+        onSuccess: res => toast.success(res.message),
+        onError: err => toast.error('操作失败: ' + (err as Error).message),
+      },
+    )
+  }
 
   // 筛选器选项（来自未过滤 facet）：模型名 / 凭据 id
   const modelOptions = useMemo(() => (facets?.by_model ?? []).map(g => g.key), [facets])
@@ -372,7 +404,12 @@ export function StatsView() {
         <BreakdownTable title="按模型" rows={summary.by_model} labelOf={k => k} />
       )}
       {!isLoading && summary && summary.by_credential.length > 0 && (
-        <BreakdownTable title="按凭据" rows={summary.by_credential} labelOf={credLabel} />
+        <BreakdownTable
+          title="按凭据"
+          rows={summary.by_credential}
+          labelOf={credLabel}
+          priority={{ get: k => credPriority.get(k), set: handleSetPriority }}
+        />
       )}
     </div>
   )
@@ -495,6 +532,13 @@ type TableSortKey =
   | 'output_tokens'
   | 'err'
   | 'avg_ttft_ms'
+  | 'priority'
+
+// 可选的优先级列（按凭据表用）：读当前值 + 提交修改
+interface PriorityCol {
+  get: (key: string) => number | undefined
+  set: (key: string, priority: number) => void
+}
 const TABLE_PAGE_SIZE = 10
 
 const errRateOf = (r: StatGroup) =>
@@ -567,10 +611,12 @@ function BreakdownTable({
   title,
   rows,
   labelOf,
+  priority,
 }: {
   title: string
   rows: StatGroup[]
   labelOf: (key: string) => string
+  priority?: PriorityCol
 }) {
   const [sortKey, setSortKey] = useState<TableSortKey>('official_usd')
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
@@ -582,7 +628,9 @@ function BreakdownTable({
         ? labelOf(r.key)
         : sortKey === 'err'
           ? errRateOf(r)
-          : (r[sortKey] as number)
+          : sortKey === 'priority'
+            ? (priority?.get(r.key) ?? Number.MAX_SAFE_INTEGER)
+            : (r[sortKey] as number)
     return [...rows].sort((a, b) => {
       const va = val(a)
       const vb = val(b)
@@ -592,7 +640,7 @@ function BreakdownTable({
           : va - vb
       return sortDir === 'asc' ? c : -c
     })
-  }, [rows, sortKey, sortDir, labelOf])
+  }, [rows, sortKey, sortDir, labelOf, priority])
 
   const totalPages = Math.max(1, Math.ceil(sorted.length / TABLE_PAGE_SIZE))
   const safePage = Math.min(page, totalPages)
@@ -611,6 +659,7 @@ function BreakdownTable({
 
   const cols: { key: TableSortKey; label: string; right?: boolean }[] = [
     { key: 'name', label: '名称' },
+    ...(priority ? [{ key: 'priority' as TableSortKey, label: '优先级', right: true }] : []),
     { key: 'requests', label: '请求', right: true },
     { key: 'actual_usd', label: '实际成本', right: true },
     { key: 'official_usd', label: '官方价', right: true },
@@ -649,6 +698,11 @@ function BreakdownTable({
             {pageRows.map(r => (
               <tr key={r.key} className="border-b border-border/50 last:border-0">
                 <td className="px-2 py-2 font-medium">{labelOf(r.key)}</td>
+                {priority && (
+                  <td className="px-2 py-2 text-right">
+                    <PriorityCell value={priority.get(r.key)} onSave={v => priority.set(r.key, v)} />
+                  </td>
+                )}
                 <td className="tnum px-2 py-2 text-right">{fmtNum(r.requests)}</td>
                 <td className="tnum px-2 py-2 text-right">{fmtUsd(r.actual_usd)}</td>
                 <td className="tnum px-2 py-2 text-right">{fmtUsd(r.official_usd)}</td>
@@ -667,6 +721,56 @@ function BreakdownTable({
       </div>
       {totalPages > 1 && <TablePager page={safePage} totalPages={totalPages} onChange={setPage} />}
     </ChartCard>
+  )
+}
+
+// 优先级单元格：点击进入行内编辑，Enter 保存 / Esc 或失焦取消
+function PriorityCell({ value, onSave }: { value: number | undefined; onSave: (v: number) => void }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+
+  // 凭据已删除等取不到当前值的行不可编辑
+  if (value === undefined) return <span className="text-muted-foreground/50">—</span>
+
+  const commit = () => {
+    const n = parseInt(draft, 10)
+    setEditing(false)
+    if (isNaN(n) || n < 0) {
+      toast.error('优先级必须是非负整数')
+      return
+    }
+    if (n !== value) onSave(n)
+  }
+
+  if (editing) {
+    return (
+      <input
+        autoFocus
+        type="number"
+        min={0}
+        value={draft}
+        onChange={e => setDraft(e.target.value)}
+        onKeyDown={e => {
+          if (e.key === 'Enter') commit()
+          if (e.key === 'Escape') setEditing(false)
+        }}
+        onBlur={() => setEditing(false)}
+        className="tnum w-14 rounded-md border border-primary bg-transparent px-1.5 py-0.5 text-right text-sm outline-none"
+      />
+    )
+  }
+  return (
+    <button
+      onClick={() => {
+        setDraft(String(value))
+        setEditing(true)
+      }}
+      title="点击修改优先级"
+      className="group inline-flex cursor-pointer items-center gap-1 rounded-md px-1.5 py-0.5 hover:bg-muted"
+    >
+      <span className="tnum">{value}</span>
+      <Pencil className="h-3 w-3 text-muted-foreground/0 transition-colors group-hover:text-muted-foreground" />
+    </button>
   )
 }
 

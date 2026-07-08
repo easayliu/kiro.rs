@@ -47,7 +47,7 @@ pub struct StatsQuery {
     /// 自定义结束时间（Unix 秒）。
     #[serde(default)]
     to: Option<i64>,
-    /// 分桶粒度："hour"（默认）或 "day"。
+    /// 分桶粒度："minute" / "5min" / "15min" / "hour"（默认）/ "day"。
     #[serde(default)]
     bucket: Option<String>,
     /// 分组维度："none"（默认）/ "model" / "credential"。
@@ -95,6 +95,9 @@ fn resolve_range(q: &StatsQuery) -> (i64, i64) {
 pub async fn get_stats_timeseries(Query(q): Query<StatsQuery>) -> impl IntoResponse {
     let (from_ts, to_ts) = resolve_range(&q);
     let bucket_secs = match q.bucket.as_deref() {
+        Some("minute") => 60,
+        Some("5min") => 300,
+        Some("15min") => 900,
         Some("day") => 86_400,
         _ => 3_600,
     };

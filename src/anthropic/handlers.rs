@@ -85,7 +85,10 @@ fn resolve_sticky_preference(
         return None;
     }
     let identity = binding_key?;
-    let available = provider.available_credential_ids(Some(model));
+    // 候选池收窄到最高优先级档：绑在低优先级档的身份下次请求会因"凭据不在
+    // 候选池"静默改绑迁回顶档，使调整优先级能触发粘性再均衡。错误改绑
+    // （update_binding_after_call）仍用全量列表，保留顶档全挂时的降级退路。
+    let available = provider.top_priority_credential_ids(Some(model));
     binding_table.resolve(identity, &available)
 }
 

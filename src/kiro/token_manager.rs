@@ -1415,6 +1415,38 @@ impl MultiTokenManager {
             .collect()
     }
 
+    /// 列出最高优先级档（priority 最小）的可用凭据 id，过滤条件在
+    /// [`Self::available_credential_ids`] 基础上额外排除 429 冷却中的凭据。
+    ///
+    /// 供粘性绑定的 `resolve` 作候选池：收窄到顶档后，绑在低优先级档的身份
+    /// 会因"凭据不在候选池"走静默改绑迁回顶档——调整优先级即触发再均衡。
+    /// 排除冷却中凭据是为了堵"顶档单凭据持续报错"的回摆：错误改绑把身份迁
+    /// 到低档后，若报错凭据仍留在顶档池，下一次 resolve 会把绑定拉回去；
+    /// 让它随冷却退出候选池，绑定就能安稳落在低档，冷却结束后自然迁回。
+    /// 全员冷却时返回空，resolve 得 None，回落默认选号（那里有自己的退路）。
+    /// 错误触发的 `rebind` 不要用本方法，应传全量列表，保留降级空间。
+    pub fn top_priority_credential_ids(&self, model: Option<&str>) -> Vec<u64> {
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+        let now = Utc::now();
+        let entries = self.entries.lock();
+        let eligible: Vec<_> = entries
+            .iter()
+            .filter(|e| !e.disabled)
+            .filter(|e| !is_opus || e.credentials.supports_opus())
+            .filter(|e| e.throttled_until.is_none_or(|until| until <= now))
+            .collect();
+        let Some(top) = eligible.iter().map(|e| e.credentials.priority).min() else {
+            return Vec::new();
+        };
+        eligible
+            .into_iter()
+            .filter(|e| e.credentials.priority == top)
+            .map(|e| e.id)
+            .collect()
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
@@ -4983,5 +5015,104 @@ mod tests {
         // preferred=1 已达并发上限 → 泄压阀回落普通选号，spill 到闲置的 id=2。
         let ctx = manager.acquire_context(None, Some(1)).await.unwrap();
         assert_eq!(ctx.id, 2, "preferred 达并发上限 → spill 到 id=2");
+    }
+
+    // ---- 粘性绑定候选池收窄到最高优先级档 ----
+
+    fn mk_api_cred_with_priority(key: &str, priority: u32) -> KiroCredentials {
+        let mut c = mk_api_cred(key);
+        c.priority = priority;
+        c
+    }
+
+    #[test]
+    fn top_priority_ids_keeps_only_top_tier() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                mk_api_cred_with_priority("k1", 1),
+                mk_api_cred_with_priority("k2", 0),
+                mk_api_cred_with_priority("k3", 0),
+            ],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // 全量池含三个；顶档池只含 priority=0 的 id=2、3。
+        assert_eq!(manager.available_credential_ids(None), vec![1, 2, 3]);
+        assert_eq!(manager.top_priority_credential_ids(None), vec![2, 3]);
+    }
+
+    #[test]
+    fn top_priority_ids_degrades_when_top_tier_disabled() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                mk_api_cred_with_priority("k1", 0),
+                mk_api_cred_with_priority("k2", 5),
+            ],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(manager.top_priority_credential_ids(None), vec![1]);
+
+        // 顶档凭据被禁用 → 顶档自动落到下一档；全禁 → 空。
+        manager.entries.lock()[0].disabled = true;
+        assert_eq!(manager.top_priority_credential_ids(None), vec![2]);
+        manager.entries.lock()[1].disabled = true;
+        assert!(manager.top_priority_credential_ids(None).is_empty());
+    }
+
+    #[test]
+    fn top_priority_ids_excludes_throttled() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                mk_api_cred_with_priority("k1", 0),
+                mk_api_cred_with_priority("k2", 5),
+            ],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // 顶档 id=1 进入 429 冷却 → 退出候选池，顶档落到 id=2。
+        manager.entries.lock()[0].throttled_until = Some(Utc::now() + Duration::seconds(60));
+        assert_eq!(manager.top_priority_credential_ids(None), vec![2]);
+
+        // 全员冷却 → 空池（resolve 得 None，回落默认选号）。
+        manager.entries.lock()[1].throttled_until = Some(Utc::now() + Duration::seconds(60));
+        assert!(manager.top_priority_credential_ids(None).is_empty());
+
+        // 冷却过期 → 自动回归顶档。
+        manager.entries.lock()[0].throttled_until = Some(Utc::now() - Duration::seconds(1));
+        assert_eq!(manager.top_priority_credential_ids(None), vec![1]);
+    }
+
+    #[test]
+    fn top_priority_ids_reflects_priority_change() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                mk_api_cred_with_priority("k1", 0),
+                mk_api_cred_with_priority("k2", 1),
+            ],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(manager.top_priority_credential_ids(None), vec![1]);
+
+        // 调整优先级：id=2 升为更高优先级（更小值）→ 顶档池随之切换，
+        // 绑在 id=1 上的身份下次 resolve 会静默改绑到 id=2。
+        manager.entries.lock()[1].credentials.priority = 0;
+        manager.entries.lock()[0].credentials.priority = 1;
+        assert_eq!(manager.top_priority_credential_ids(None), vec![2]);
     }
 }

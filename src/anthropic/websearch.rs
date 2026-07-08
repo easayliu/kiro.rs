@@ -630,9 +630,10 @@ pub async fn handle_websearch_request(
     // 2. 创建 MCP 请求
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
-    // 3. 粘性绑定：解析 preferred 凭证（MCP 不按模型过滤，传 None）
+    // 3. 粘性绑定：解析 preferred 凭证（MCP 不按模型过滤，传 None）。
+    //    候选池收窄到最高优先级档，与 handlers::resolve_sticky_preference 同语义。
     let preferred = binding_key
-        .map(|id| (id, provider.available_credential_ids(None)))
+        .map(|id| (id, provider.top_priority_credential_ids(None)))
         .and_then(|(id, available)| binding_table.resolve(id, &available));
 
     // 4. 调用 Kiro MCP API

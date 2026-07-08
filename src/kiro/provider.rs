@@ -398,9 +398,14 @@ impl KiroProvider {
         }))
     }
 
-    /// 列出当前可用的凭据 id（供粘性绑定表作为候选池）
+    /// 列出当前可用的凭据 id（供粘性绑定表错误改绑时作为候选池）
     pub fn available_credential_ids(&self, model: Option<&str>) -> Vec<u64> {
         self.token_manager.available_credential_ids(model)
+    }
+
+    /// 列出最高优先级档的可用凭据 id（供粘性绑定 resolve 作为候选池）
+    pub fn top_priority_credential_ids(&self, model: Option<&str>) -> Vec<u64> {
+        self.token_manager.top_priority_credential_ids(model)
     }
 
     /// 发送流式 API 请求
