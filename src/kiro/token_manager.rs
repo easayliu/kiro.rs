@@ -1788,11 +1788,10 @@ impl MultiTokenManager {
             };
 
             // 尝试获取/刷新 Token
+            // 注意：RPM 记账不在这里做——由 provider 在 HTTP 请求成功发出后调用
+            // record_request_for_rpm，连接失败（请求未到达上游）的轮次不占 RPM 槽位。
             match self.try_ensure_token(id, &credentials, inflight).await {
-                Ok(ctx) => {
-                    self.record_request_for_rpm(ctx.id);
-                    return Ok(ctx);
-                }
+                Ok(ctx) => return Ok(ctx),
                 Err(e) => {
                     // 失败路径：inflight guard 已随 try_ensure_token 的入参 move 进去，
                     // 错误返回时在该函数内 Drop（-1），不会泄漏到下一轮重试。
@@ -2274,11 +2273,13 @@ impl MultiTokenManager {
         }
     }
 
-    /// 记录一次本地请求计入 RPM 滑动窗口（仅当该凭据生效 RPM 上限非空时）
+    /// 记录一次上游请求计入 RPM 滑动窗口（仅当该凭据生效 RPM 上限非空时）
     ///
-    /// 在 `acquire_context` 成功获取上下文后调用，统计实际派发到该凭据的请求数。
-    /// 即使本次请求最终失败（401/429/网络等），也已计入——与上游对话单元一致。
-    fn record_request_for_rpm(&self, id: u64) {
+    /// 由 provider 在 HTTP 请求**成功发出**（send 返回响应头）后调用，口径对齐
+    /// "上游实际收到的请求数"：429/5xx 等失败响应已到达上游、照常计入；
+    /// 连接失败（超时/拒绝/中继降级）请求未到达上游，不计入。
+    /// 重试的每一轮发出即各计一次——限流保护的是凭据在上游的请求频率。
+    pub fn record_request_for_rpm(&self, id: u64) {
         // 热路径短路：从未启用过 RPM 时直接返回，避免无谓的锁与线性查找
         if !self.rpm_feature_enabled.load(Ordering::Relaxed) {
             return;

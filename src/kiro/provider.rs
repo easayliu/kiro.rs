@@ -468,6 +468,8 @@ impl KiroProvider {
             .header("Connection", "close")
             .send()
             .await?;
+        // RPM 记账口径与 call_api_with_retry 一致：发出即计，连接失败（上面 ? 短路）不计。
+        self.token_manager.record_request_for_rpm(ctx.id);
 
         let status = response.status();
         let body = response.text().await?;
@@ -597,7 +599,11 @@ impl KiroProvider {
                 .send()
                 .await
             {
-                Ok(resp) => resp,
+                Ok(resp) => {
+                    // RPM 记账口径与 call_api_with_retry 一致：发出即计，连接失败不计。
+                    self.token_manager.record_request_for_rpm(ctx.id);
+                    resp
+                }
                 Err(e) => {
                     tracing::warn!(
                         "MCP 请求发送失败（尝试 {}/{}）: {}",
@@ -867,7 +873,12 @@ impl KiroProvider {
                 .send()
                 .await
             {
-                Ok(resp) => resp,
+                Ok(resp) => {
+                    // RPM 记账：请求已到达上游（拿到响应头），无论状态码成败都计入；
+                    // 连接失败走 Err 分支不计，口径对齐上游实际收到的请求数。
+                    self.token_manager.record_request_for_rpm(ctx.id);
+                    resp
+                }
                 Err(e) => {
                     // 走中继时连接失败 → 立即降级"跳过中继"重试（不计退避、不切凭据）。
                     // 注意：跳过中继≠强制公网直连——HTTP 代理是独立维度，若配了代理，
