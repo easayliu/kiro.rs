@@ -20,7 +20,7 @@ use crate::kiro::credential_store::CredentialStore;
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
-use crate::kiro::errors::NoAvailableCredentialsError;
+use crate::kiro::errors::{LocalRateLimitedError, NoAvailableCredentialsError};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -1006,6 +1006,12 @@ pub struct MultiTokenManager {
     /// 只会让 `record_request_for_rpm` 多走一次 effective_rpm_limit 检查，
     /// 不影响正确性；漏报（实际开启但仍为 false）才会导致漏记，所以保守置 true。
     rpm_feature_enabled: AtomicBool,
+    /// RPM 硬闸门开关（运行时可变；初始化自 config，Admin API 可热改）。
+    ///
+    /// `true`：同档凭据 RPM 全满时不再 fallback 照发上游，改为限时等窗口槽释放
+    /// （封顶 [`RPM_GATE_MAX_WAIT`]），仍满则本地回 429 + Retry-After，保护上游。
+    /// `false`：旧行为——RPM 仅作选号软信号，全满时 fallback LRU 最早者照发。
+    rpm_hard_limit: AtomicBool,
     /// 全局默认并发上限（运行时可变；初始化自 config，Admin API 修改后实时生效并持久化）
     default_concurrency_limit: Mutex<Option<u32>>,
     /// 是否有任何并发上限配置启用（凭据级 or 全局），用于热路径短路
@@ -1033,6 +1039,12 @@ const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 /// RPM 滑动窗口长度（秒）
 const RPM_WINDOW_SECS: i64 = 60;
+/// RPM 硬闸门单次请求的最长等位时间（超过则本地回 429）。
+const RPM_GATE_MAX_WAIT: StdDuration = StdDuration::from_secs(3);
+/// RPM 硬闸门等位时的轮询上限（每次最多睡这么久就重查一次，以便及时感知并发/RPM 释放）。
+const RPM_GATE_POLL: StdDuration = StdDuration::from_millis(250);
+/// RPM 硬闸门等位时的最小睡眠（避免槽位释放时刻已过/临界抖动导致的紧忙轮询）。
+const RPM_GATE_MIN_NAP: StdDuration = StdDuration::from_millis(20);
 
 /// 根据凭据级与全局默认计算生效的 RPM 上限
 ///
@@ -1318,6 +1330,7 @@ impl MultiTokenManager {
             .iter()
             .any(|e| e.credentials.rpm_limit.unwrap_or(0) > 0);
         let any_default_rpm = default_rpm_limit.unwrap_or(0) > 0;
+        let rpm_hard_limit = config.rpm_hard_limit;
         let default_concurrency_limit = config.default_concurrency_limit;
         let any_cred_concurrency = entries
             .iter()
@@ -1334,6 +1347,7 @@ impl MultiTokenManager {
             load_balancing_mode: Mutex::new(load_balancing_mode),
             default_rpm_limit: Mutex::new(default_rpm_limit),
             rpm_feature_enabled: AtomicBool::new(any_cred_rpm || any_default_rpm),
+            rpm_hard_limit: AtomicBool::new(rpm_hard_limit),
             default_concurrency_limit: Mutex::new(default_concurrency_limit),
             concurrency_feature_enabled: AtomicBool::new(
                 any_cred_concurrency || any_default_concurrency,
@@ -1653,6 +1667,74 @@ impl MultiTokenManager {
         entries.iter().any(|entry| fctx.is_fresh(entry))
     }
 
+    /// RPM 硬闸门开关（运行时）。
+    pub fn rpm_hard_limit_enabled(&self) -> bool {
+        self.rpm_hard_limit.load(Ordering::Relaxed)
+    }
+
+    /// 设置 RPM 硬闸门开关（运行时热改）。
+    pub fn set_rpm_hard_limit(&self, enabled: bool) {
+        self.rpm_hard_limit.store(enabled, Ordering::Relaxed);
+    }
+
+    /// RPM 硬闸门的等位判定：仅当**无任何鲜活凭据、但存在"未冷却、并发未满、只是
+    /// RPM 窗口已满"的合格凭据**时，返回距最早一个凭据 RPM 槽位释放的时长（供限时等位）。
+    /// 其余情况返回 `None`——表示无需闸门（有鲜活号可选，正常选号会命中）或不宜等位
+    /// （全员 429 冷却/禁用时，等 RPM 无意义，交回旧 fallback 逻辑处理）。
+    ///
+    /// 硬闸门关闭、或未启用 RPM 限流时恒返回 `None`（等价旧行为）。
+    fn rpm_gate_wait(&self, model: Option<&str>) -> Option<StdDuration> {
+        if !self.rpm_hard_limit.load(Ordering::Relaxed) {
+            return None;
+        }
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+        let now = Utc::now();
+        let entries = self.entries.lock();
+        let fctx = self.capture_freshness(is_opus, now);
+        if !fctx.rpm_active {
+            return None;
+        }
+        // 有鲜活号 → 不闸门，让正常选号命中它。
+        if entries.iter().any(|e| fctx.is_fresh(e)) {
+            return None;
+        }
+        // 找"合格 + 未冷却 + 并发未满 + 仅 RPM 满"的号，取其中最早 RPM 释放时刻。
+        let mut earliest: Option<DateTime<Utc>> = None;
+        for e in entries.iter() {
+            if !fctx.is_eligible(e) || self.now_is_throttled(e, now) || !fctx.concurrency_ok(e) {
+                continue;
+            }
+            let Some(limit) = effective_rpm_limit(&e.credentials, fctx.default_rpm) else {
+                continue;
+            };
+            let limit = limit as usize;
+            // 窗口内 > cutoff 的有效戳（deque 按 push 时间升序，有效者为其后缀，已有序）。
+            let valid: Vec<DateTime<Utc>> = e
+                .rpm_window
+                .iter()
+                .copied()
+                .filter(|t| *t > fctx.rpm_cutoff)
+                .collect();
+            if valid.len() < limit {
+                continue; // 未满：不该到这（无鲜活号已排除），保险跳过
+            }
+            // 需要 (count - limit + 1) 个最老戳过期；决定性的那个是 valid[count - limit]，
+            // 它在 push 后 RPM_WINDOW_SECS 秒离开窗口，届时窗口计数降到 limit-1 < limit。
+            let boundary = valid[valid.len() - limit];
+            let free_at = boundary + Duration::seconds(RPM_WINDOW_SECS);
+            earliest = Some(earliest.map_or(free_at, |cur| cur.min(free_at)));
+        }
+        let free_at = earliest?;
+        Some((free_at - now).to_std().unwrap_or(StdDuration::ZERO))
+    }
+
+    /// `is_throttled` 的独立时间版（rpm_gate_wait 已自持 `now`，不复用 fctx 以省一次借用）。
+    fn now_is_throttled(&self, e: &CredentialEntry, now: DateTime<Utc>) -> bool {
+        e.throttled_until.is_some_and(|until| until > now)
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -1680,6 +1762,8 @@ impl MultiTokenManager {
         // 落在哪个凭据都不应记为 preferred 错误。传给上层 update_binding_after_call
         // 抑制误改绑（否则持续高频身份每分钟触发 rebind 抖动，见回归测试）。
         let mut spilled_preferred = false;
+        // RPM 硬闸门累计等位预算（跨重试轮次），超 RPM_GATE_MAX_WAIT 即本地 429。
+        let mut gate_waited = StdDuration::ZERO;
 
         let is_opus = model
             .map(|m| m.to_lowercase().contains("opus"))
@@ -1692,6 +1776,32 @@ impl MultiTokenManager {
                     self.available_count(),
                     total
                 );
+            }
+
+            // RPM 硬闸门：无鲜活号、但存在"未冷却只是 RPM 满"的合格号时，限时等窗口槽
+            // 释放（不向上游发超频请求）。期间任一号变鲜活 → rpm_gate_wait 返回 None →
+            // 跳出等位走正常选号；累计等位超上限仍全满 → 本地 429 + Retry-After。
+            if let Some(free_in) = self.rpm_gate_wait(model) {
+                if gate_waited >= RPM_GATE_MAX_WAIT {
+                    let secs = free_in.as_secs_f64().ceil().max(1.0) as u64;
+                    tracing::warn!(
+                        waited_ms = gate_waited.as_millis() as u64,
+                        retry_after_secs = secs,
+                        "RPM 硬闸门：等位超 {}s 所有凭据仍达 RPM 上限，本地回 429",
+                        RPM_GATE_MAX_WAIT.as_secs()
+                    );
+                    anyhow::bail!(LocalRateLimitedError {
+                        retry_after_secs: secs
+                    });
+                }
+                let remaining = RPM_GATE_MAX_WAIT - gate_waited;
+                let nap = free_in
+                    .min(RPM_GATE_POLL)
+                    .min(remaining)
+                    .max(RPM_GATE_MIN_NAP);
+                tokio::time::sleep(nap).await;
+                gate_waited += nap;
+                continue;
             }
 
             let (id, credentials, inflight, spilled) = {
@@ -5183,7 +5293,10 @@ mod tests {
     async fn sticky_preferred_honored_when_no_fresh_alternative() {
         // 联动（Part B）：preferred RPM 满、但**无其它鲜活凭据**（id=2 也满）时，
         // 泄压只会落到同样饱和的冷凭据——不如仍钉 preferred 保住暖缓存，且不标 spilled。
+        // 该行为属**软限模式**（rpm_hard_limit=false）；硬闸门开启时全满会改走等位/429
+        // （见 rpm_hard_gate_* 用例），故此处显式关闭硬闸门以测软限泄压逻辑。
         let mut config = Config::default();
+        config.rpm_hard_limit = false;
         config.load_balancing_mode = "balanced".to_string();
         config.default_rpm_limit = Some(2);
         let manager = MultiTokenManager::new(
@@ -5210,6 +5323,109 @@ mod tests {
             !ctx.preferred_spilled,
             "未泄压（钉回 preferred）→ 不得标记 spilled"
         );
+    }
+
+    // ---- RPM 硬闸门：全满时等位/429，而非 fallback 照发上游 ----
+
+    #[tokio::test]
+    async fn rpm_hard_gate_429_when_all_full() {
+        // 硬闸门开启（默认），同档所有凭据 RPM 窗口都满且未冷却 → 限时等位后仍满，
+        // acquire_context 返回 LocalRateLimitedError（本地 429），不 fallback 照发上游。
+        let mut config = Config::default(); // rpm_hard_limit 默认 true
+        config.load_balancing_mode = "balanced".to_string();
+        config.default_rpm_limit = Some(2);
+        let manager = MultiTokenManager::new(
+            config,
+            vec![mk_api_cred("k1"), mk_api_cred("k2")],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // 两个号窗口都用 now 填满（60s 内不会滑出，等位封顶后仍满）。
+        {
+            let mut entries = manager.entries.lock();
+            let now = Utc::now();
+            for e in entries.iter_mut() {
+                e.rpm_window.push_back(now);
+                e.rpm_window.push_back(now);
+            }
+        }
+
+        let err = match manager.acquire_context(None, Some(1)).await {
+            Ok(_) => panic!("全员 RPM 满 + 硬闸门 → 应本地 429，却拿到了凭据"),
+            Err(e) => e,
+        };
+        let rl = err
+            .downcast_ref::<LocalRateLimitedError>()
+            .expect("应为 LocalRateLimitedError");
+        assert!(rl.retry_after_secs >= 1, "Retry-After 应为正数秒");
+    }
+
+    #[tokio::test]
+    async fn rpm_hard_gate_waits_then_succeeds_when_window_slides() {
+        // 硬闸门开启，全满但窗口戳将在 ~1s 内滑出（< 3s 等位上限）→ 等位期间槽位释放，
+        // 正常选号命中，返回 Ok 而非 429。验证「限时等位再发」的成功路径。
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.default_rpm_limit = Some(2);
+        let manager = MultiTokenManager::new(
+            config,
+            vec![mk_api_cred("k1"), mk_api_cred("k2")],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // 戳设在 now-(窗口-1)s：约 1s 后离开 60s 窗口，落在 3s 等位上限内。
+        {
+            let mut entries = manager.entries.lock();
+            let soon = Utc::now() - Duration::seconds(RPM_WINDOW_SECS - 1);
+            for e in entries.iter_mut() {
+                e.rpm_window.push_back(soon);
+                e.rpm_window.push_back(soon);
+            }
+        }
+
+        let ctx = manager
+            .acquire_context(None, Some(1))
+            .await
+            .expect("窗口 1s 内滑出 → 等位后应成功获取凭据");
+        assert!(ctx.id == 1 || ctx.id == 2, "应命中任一号");
+    }
+
+    #[tokio::test]
+    async fn rpm_hard_gate_off_falls_back_and_sends() {
+        // 硬闸门关闭 → 旧行为：全满时仍 fallback 照发（钉 preferred），返回 Ok，不 429。
+        let mut config = Config::default();
+        config.rpm_hard_limit = false;
+        config.load_balancing_mode = "balanced".to_string();
+        config.default_rpm_limit = Some(2);
+        let manager = MultiTokenManager::new(
+            config,
+            vec![mk_api_cred("k1"), mk_api_cred("k2")],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        {
+            let mut entries = manager.entries.lock();
+            let now = Utc::now();
+            for e in entries.iter_mut() {
+                e.rpm_window.push_back(now);
+                e.rpm_window.push_back(now);
+            }
+        }
+
+        let ctx = manager
+            .acquire_context(None, Some(1))
+            .await
+            .expect("硬闸门关闭 → 全满仍 fallback 照发");
+        assert_eq!(ctx.id, 1, "软限模式全满 → 钉 preferred 照发");
     }
 
     // ---- 粘性绑定候选池收窄到最高优先级档 ----

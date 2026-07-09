@@ -223,6 +223,22 @@ pub struct Config {
     #[serde(default = "default_early_first_token")]
     pub early_first_token: bool,
 
+    /// 早响应模式的模拟首字延迟（毫秒）。早响应模式默认瞬时 flush 首字（TTFT≈0）显得
+    /// 不真实；这几项在发出初始事件前注入一段延迟以模拟真实 TTFT，按输入 token 缩放并
+    /// 叠加随机抖动，再 clamp 到 [min, max]：
+    ///     delay = base + per1k*(input_tokens/1000) + rand(±jitter)，clamp 到 [min, max]
+    /// `max == 0` 表示关闭延迟（回到瞬时 flush）。前端可实时编辑、Admin API 热改并持久化。
+    #[serde(default = "default_early_first_token_delay_base_ms")]
+    pub early_first_token_delay_base_ms: u64,
+    #[serde(default = "default_early_first_token_delay_per_1k_ms")]
+    pub early_first_token_delay_per_1k_ms: u64,
+    #[serde(default = "default_early_first_token_delay_jitter_ms")]
+    pub early_first_token_delay_jitter_ms: u64,
+    #[serde(default = "default_early_first_token_delay_min_ms")]
+    pub early_first_token_delay_min_ms: u64,
+    #[serde(default = "default_early_first_token_delay_max_ms")]
+    pub early_first_token_delay_max_ms: u64,
+
     /// 出站请求体字节上限（默认 12 MiB；0 表示关闭该预检）。上游 Kiro runtime 对整个
     /// 请求体有 ~12.5 MiB 硬阈值，超过会以 400 `Input content length exceeds threshold`
     /// 拒绝（整体 body 字节，非 token 窗口 / 单图 / 单文档）。中转层提前拦截给出可读错误。
@@ -256,6 +272,15 @@ pub struct Config {
     /// 期间自动切换到其他凭据。设置为 0 表示禁用全局默认。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_rpm_limit: Option<u32>,
+
+    /// RPM 硬闸门（默认开）。
+    ///
+    /// 开启后，同档凭据 RPM 窗口全满时**不再** fallback 把超频请求照发上游，而是限时
+    /// 等最早窗口槽释放（封顶 3s）；期间有号空出即正常发出，超时仍全满则本地回
+    /// 429 + Retry-After。关闭则回到旧行为——RPM 仅作选号软信号，全满时仍会照发上游
+    /// （上游按自身阈值 429，易攒可疑活动风控）。前端可实时切换。
+    #[serde(default = "default_rpm_hard_limit")]
+    pub rpm_hard_limit: bool,
 
     /// 全局默认并发上限（每个凭据同时在途请求数）
     ///
@@ -351,6 +376,28 @@ fn default_early_first_token() -> bool {
     false
 }
 
+fn default_rpm_hard_limit() -> bool {
+    true
+}
+
+// 模拟首字延迟默认值：小请求落在 ~800ms 下限，随输入 token 缓慢增长，长上下文顶到
+// 2500ms 上限。例：50k tok → 700+200 ≈900ms；500k tok → clamp 到 2500ms。
+fn default_early_first_token_delay_base_ms() -> u64 {
+    700
+}
+fn default_early_first_token_delay_per_1k_ms() -> u64 {
+    4
+}
+fn default_early_first_token_delay_jitter_ms() -> u64 {
+    250
+}
+fn default_early_first_token_delay_min_ms() -> u64 {
+    800
+}
+fn default_early_first_token_delay_max_ms() -> u64 {
+    2500
+}
+
 fn default_max_request_body_size() -> usize {
     crate::anthropic::KIRO_MAX_REQUEST_BODY_SIZE_DEFAULT
 }
@@ -393,11 +440,17 @@ impl Default for Config {
             chunked_write_guidance: default_chunked_write_guidance(),
             surface_persona: default_surface_persona(),
             early_first_token: default_early_first_token(),
+            early_first_token_delay_base_ms: default_early_first_token_delay_base_ms(),
+            early_first_token_delay_per_1k_ms: default_early_first_token_delay_per_1k_ms(),
+            early_first_token_delay_jitter_ms: default_early_first_token_delay_jitter_ms(),
+            early_first_token_delay_min_ms: default_early_first_token_delay_min_ms(),
+            early_first_token_delay_max_ms: default_early_first_token_delay_max_ms(),
             max_request_body_size: default_max_request_body_size(),
             cache_skip_rate: None,
             output_token_multiplier: None,
             client_mode: ClientMode::default(),
             default_rpm_limit: None,
+            rpm_hard_limit: default_rpm_hard_limit(),
             default_concurrency_limit: None,
             kiro_cli_version: default_kiro_cli_version(),
             relay_host: None,

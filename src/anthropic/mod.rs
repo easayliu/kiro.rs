@@ -41,7 +41,10 @@ pub use converter::{
     set_max_request_body_size, set_output_token_multiplier, set_surface_persona,
     surface_persona_enabled, KIRO_MAX_REQUEST_BODY_SIZE_DEFAULT,
 };
-pub use handlers::set_early_first_token;
+pub use handlers::{
+    early_first_token_delay_params, early_first_token_enabled, set_early_first_token,
+    set_early_first_token_delay,
+};
 pub use injection_scan::{
     is_enabled as injection_scan_enabled, set_enabled as set_injection_scan_enabled,
 };

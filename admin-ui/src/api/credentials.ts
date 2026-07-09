@@ -196,6 +196,28 @@ export async function setRelayHost(relayHost: string | null): Promise<{ relayHos
   return data
 }
 
+// 早响应模式（含模拟首字延迟）配置
+export interface EarlyFirstTokenConfig {
+  enabled: boolean
+  baseMs: number
+  per1kMs: number
+  jitterMs: number
+  minMs: number
+  maxMs: number
+}
+
+// 获取早响应模式配置
+export async function getEarlyFirstToken(): Promise<EarlyFirstTokenConfig> {
+  const { data } = await api.get<EarlyFirstTokenConfig>('/config/early-first-token')
+  return data
+}
+
+// 设置早响应模式配置（立即生效并持久化）
+export async function setEarlyFirstToken(cfg: EarlyFirstTokenConfig): Promise<EarlyFirstTokenConfig> {
+  const { data } = await api.put<EarlyFirstTokenConfig>('/config/early-first-token', cfg)
+  return data
+}
+
 // 获取全局缓存模式
 export async function getGlobalCache(): Promise<{ enabled: boolean }> {
   const { data } = await api.get<{ enabled: boolean }>('/config/global-cache')
@@ -205,6 +227,18 @@ export async function getGlobalCache(): Promise<{ enabled: boolean }> {
 // 设置全局缓存模式
 export async function setGlobalCache(enabled: boolean): Promise<{ enabled: boolean }> {
   const { data } = await api.put<{ enabled: boolean }>('/config/global-cache', { enabled })
+  return data
+}
+
+// 获取 RPM 硬闸门开关
+export async function getRpmHardLimit(): Promise<{ enabled: boolean }> {
+  const { data } = await api.get<{ enabled: boolean }>('/config/rpm-hard-limit')
+  return data
+}
+
+// 设置 RPM 硬闸门开关
+export async function setRpmHardLimit(enabled: boolean): Promise<{ enabled: boolean }> {
+  const { data } = await api.put<{ enabled: boolean }>('/config/rpm-hard-limit', { enabled })
   return data
 }
 

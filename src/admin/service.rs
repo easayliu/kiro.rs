@@ -580,6 +580,108 @@ impl AdminService {
         })
     }
 
+    /// 获取 RPM 硬闸门开关
+    pub fn get_rpm_hard_limit(&self) -> crate::admin::types::RpmHardLimitResponse {
+        crate::admin::types::RpmHardLimitResponse {
+            enabled: self.token_manager.rpm_hard_limit_enabled(),
+        }
+    }
+
+    /// 设置 RPM 硬闸门开关（同时持久化到 config.json）
+    pub fn set_rpm_hard_limit(
+        &self,
+        req: crate::admin::types::SetRpmHardLimitRequest,
+    ) -> Result<crate::admin::types::RpmHardLimitResponse, AdminServiceError> {
+        self.token_manager.set_rpm_hard_limit(req.enabled);
+
+        if let Some(config_path) = self.token_manager.config().config_path() {
+            match crate::model::config::Config::load(config_path) {
+                Ok(mut config) => {
+                    config.rpm_hard_limit = req.enabled;
+                    if let Err(e) = config.save() {
+                        tracing::warn!("保存 RPM 硬闸门开关失败: {}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("加载配置文件失败: {}", e);
+                }
+            }
+        }
+
+        Ok(crate::admin::types::RpmHardLimitResponse {
+            enabled: req.enabled,
+        })
+    }
+
+    /// 获取早响应模式（含模拟首字延迟）配置
+    pub fn get_early_first_token(&self) -> crate::admin::types::EarlyFirstTokenResponse {
+        let (base_ms, per_1k_ms, jitter_ms, min_ms, max_ms) =
+            crate::anthropic::early_first_token_delay_params();
+        crate::admin::types::EarlyFirstTokenResponse {
+            enabled: crate::anthropic::early_first_token_enabled(),
+            base_ms,
+            per_1k_ms,
+            jitter_ms,
+            min_ms,
+            max_ms,
+        }
+    }
+
+    /// 设置早响应模式（含模拟首字延迟）配置（同时持久化到 config.json）
+    pub fn set_early_first_token(
+        &self,
+        req: crate::admin::types::SetEarlyFirstTokenRequest,
+    ) -> Result<crate::admin::types::EarlyFirstTokenResponse, AdminServiceError> {
+        // 校验：延迟上限有意义时（>0），min 不得大于 max；整体不超过 60s 上限。
+        const MAX_DELAY_MS: u64 = 60_000;
+        if req.max_ms > MAX_DELAY_MS
+            || req.min_ms > MAX_DELAY_MS
+            || req.base_ms > MAX_DELAY_MS
+            || req.jitter_ms > MAX_DELAY_MS
+        {
+            return Err(AdminServiceError::InvalidParameter(format!(
+                "模拟首字延迟各项不得超过 {} ms",
+                MAX_DELAY_MS
+            )));
+        }
+        if req.max_ms > 0 && req.min_ms > req.max_ms {
+            return Err(AdminServiceError::InvalidParameter(format!(
+                "延迟下限 minMs({}) 不得大于上限 maxMs({})",
+                req.min_ms, req.max_ms
+            )));
+        }
+
+        crate::anthropic::set_early_first_token(req.enabled);
+        crate::anthropic::set_early_first_token_delay(
+            req.base_ms,
+            req.per_1k_ms,
+            req.jitter_ms,
+            req.min_ms,
+            req.max_ms,
+        );
+
+        if let Some(config_path) = self.token_manager.config().config_path() {
+            match crate::model::config::Config::load(config_path) {
+                Ok(mut config) => {
+                    config.early_first_token = req.enabled;
+                    config.early_first_token_delay_base_ms = req.base_ms;
+                    config.early_first_token_delay_per_1k_ms = req.per_1k_ms;
+                    config.early_first_token_delay_jitter_ms = req.jitter_ms;
+                    config.early_first_token_delay_min_ms = req.min_ms;
+                    config.early_first_token_delay_max_ms = req.max_ms;
+                    if let Err(e) = config.save() {
+                        tracing::warn!("保存早响应模式配置失败: {}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("加载配置文件失败: {}", e);
+                }
+            }
+        }
+
+        Ok(self.get_early_first_token())
+    }
+
     /// 获取缓存分桶策略
     pub fn get_cache_scope(&self) -> crate::admin::types::CacheScopeResponse {
         use crate::anthropic::CacheScope;

@@ -388,6 +388,51 @@ pub struct SetSurfacePersonaRequest {
     pub enabled: bool,
 }
 
+/// RPM 硬闸门开关响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpmHardLimitResponse {
+    /// 是否启用 RPM 硬闸门（满时等位/429 而非 fallback 照发上游）
+    pub enabled: bool,
+}
+
+/// 设置 RPM 硬闸门开关请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetRpmHardLimitRequest {
+    pub enabled: bool,
+}
+
+/// 早响应模式（含模拟首字延迟）配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EarlyFirstTokenResponse {
+    /// 是否启用早响应模式
+    pub enabled: bool,
+    /// 基础延迟（毫秒）
+    pub base_ms: u64,
+    /// 每 1k 输入 token 增加的延迟（毫秒）
+    pub per_1k_ms: u64,
+    /// 随机抖动幅度 ±（毫秒）
+    pub jitter_ms: u64,
+    /// 延迟下限（毫秒）
+    pub min_ms: u64,
+    /// 延迟上限（毫秒）；`0` 表示关闭模拟延迟（瞬时 flush 首字）
+    pub max_ms: u64,
+}
+
+/// 设置早响应模式（含模拟首字延迟）配置请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetEarlyFirstTokenRequest {
+    pub enabled: bool,
+    pub base_ms: u64,
+    pub per_1k_ms: u64,
+    pub jitter_ms: u64,
+    pub min_ms: u64,
+    pub max_ms: u64,
+}
+
 /// 缓存分桶策略响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

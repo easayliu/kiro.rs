@@ -23,6 +23,10 @@ import {
   setGlobalCache,
   getInjectionScan,
   setInjectionScan,
+  getRpmHardLimit,
+  setRpmHardLimit,
+  getEarlyFirstToken,
+  setEarlyFirstToken,
   getSurfacePersona,
   setSurfacePersona,
   getCacheScope,
@@ -289,6 +293,44 @@ export function useSetInjectionScan() {
     mutationFn: setInjectionScan,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['injectionScan'] })
+    },
+  })
+}
+
+// 获取 RPM 硬闸门开关
+export function useRpmHardLimit() {
+  return useQuery({
+    queryKey: ['rpmHardLimit'],
+    queryFn: getRpmHardLimit,
+  })
+}
+
+// 设置 RPM 硬闸门开关
+export function useSetRpmHardLimit() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setRpmHardLimit,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['rpmHardLimit'] })
+    },
+  })
+}
+
+// 获取早响应模式（含模拟首字延迟）配置
+export function useEarlyFirstToken() {
+  return useQuery({
+    queryKey: ['earlyFirstToken'],
+    queryFn: getEarlyFirstToken,
+  })
+}
+
+// 设置早响应模式配置
+export function useSetEarlyFirstToken() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setEarlyFirstToken,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['earlyFirstToken'] })
     },
   })
 }

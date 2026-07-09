@@ -16,7 +16,8 @@ use super::{
         SetCacheSkipRateRequest, SetConcurrencyLimitRequest, SetOutputMultiplierRequest,
         SetCredentialGroupRequest, SetDefaultConcurrencyLimitRequest, SetDefaultRpmLimitRequest,
         SetDisabledRequest,
-        SetChunkedWriteGuidanceRequest, SetSurfacePersonaRequest,
+        SetChunkedWriteGuidanceRequest, SetEarlyFirstTokenRequest, SetRpmHardLimitRequest,
+        SetSurfacePersonaRequest,
         SetGlobalCacheRequest, SetInjectionScanRequest, SetLoadBalancingModeRequest,
         SetOverageRequest, SetPriorityRequest,
         SetRelayHostRequest, SetRpmLimitRequest, SuccessResponse, UpsertProxyGroupRequest,
@@ -373,6 +374,42 @@ pub async fn set_injection_scan(
     Json(payload): Json<SetInjectionScanRequest>,
 ) -> impl IntoResponse {
     match state.service.set_injection_scan(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/rpm-hard-limit
+/// 获取 RPM 硬闸门开关
+pub async fn get_rpm_hard_limit(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_rpm_hard_limit())
+}
+
+/// PUT /api/admin/config/rpm-hard-limit
+/// 设置 RPM 硬闸门开关
+pub async fn set_rpm_hard_limit(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetRpmHardLimitRequest>,
+) -> impl IntoResponse {
+    match state.service.set_rpm_hard_limit(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/early-first-token
+/// 获取早响应模式（含模拟首字延迟）配置
+pub async fn get_early_first_token(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_early_first_token())
+}
+
+/// PUT /api/admin/config/early-first-token
+/// 设置早响应模式（含模拟首字延迟）配置
+pub async fn set_early_first_token(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetEarlyFirstTokenRequest>,
+) -> impl IntoResponse {
+    match state.service.set_early_first_token(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

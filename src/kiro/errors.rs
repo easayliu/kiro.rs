@@ -55,6 +55,27 @@ impl fmt::Display for NoAvailableCredentialsError {
 
 impl std::error::Error for NoAvailableCredentialsError {}
 
+/// 本地 RPM 硬闸门限流：同档所有凭据 RPM 窗口都满（且未 429 冷却），限时等位后仍满，
+/// 请求未发到上游。映射给下游为 429 `rate_limit_error` + `Retry-After`，让客户端退避——
+/// 而非把超频请求继续转发上游、攒 429/可疑活动风控。
+#[derive(Debug)]
+pub struct LocalRateLimitedError {
+    /// 建议客户端退避的秒数（= 最早一个凭据 RPM 槽位释放的时长，向上取整，至少 1）
+    pub retry_after_secs: u64,
+}
+
+impl fmt::Display for LocalRateLimitedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "本地 RPM 限流：所有凭据当前均已达 RPM 上限，请 {}s 后重试",
+            self.retry_after_secs
+        )
+    }
+}
+
+impl std::error::Error for LocalRateLimitedError {}
+
 /// 上游响应体读取失败（已收到 200 响应头，但读取 body 时连接中断/超时/提前 EOF）
 ///
 /// 区别于 UpstreamHttpError（上游返回 4xx/5xx 状态）：这里上游已回 200，是 body

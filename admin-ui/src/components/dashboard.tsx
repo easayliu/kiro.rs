@@ -56,6 +56,10 @@ import {
   useSetCacheScope,
   useInjectionScan,
   useSetInjectionScan,
+  useRpmHardLimit,
+  useSetRpmHardLimit,
+  useEarlyFirstToken,
+  useSetEarlyFirstToken,
   useSurfacePersona,
   useSetSurfacePersona,
   useCacheSkipRate,
@@ -154,6 +158,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [defaultRpmDialogOpen, setDefaultRpmDialogOpen] = useState(false)
   const [defaultRpmValue, setDefaultRpmValue] = useState('')
   const [relayHostDialogOpen, setRelayHostDialogOpen] = useState(false)
+  const [eftDialogOpen, setEftDialogOpen] = useState(false)
+  const [eftForm, setEftForm] = useState({
+    enabled: true,
+    baseMs: '',
+    per1kMs: '',
+    jitterMs: '',
+    minMs: '',
+    maxMs: '',
+  })
   const [relayHostValue, setRelayHostValue] = useState('')
   const [batchConcurrencyDialogOpen, setBatchConcurrencyDialogOpen] = useState(false)
   const [batchConcurrencyValue, setBatchConcurrencyValue] = useState('')
@@ -253,6 +266,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const setDefaultRpmMutation = useSetDefaultRpmLimit()
   const { data: relayHostData } = useRelayHost()
   const setRelayHostMutation = useSetRelayHost()
+  const { data: earlyFirstTokenData, isLoading: isLoadingEft } = useEarlyFirstToken()
+  const setEftMutation = useSetEarlyFirstToken()
+  const { data: rpmHardLimitData, isLoading: isLoadingRpmHard } = useRpmHardLimit()
+  const { mutate: setRpmHardLimitMutation, isPending: isSettingRpmHard } = useSetRpmHardLimit()
   const { data: defaultConcurrencyData } = useDefaultConcurrencyLimit()
   const setDefaultConcurrencyMutation = useSetDefaultConcurrencyLimit()
   // 近 7 天每凭据用量（请求/成本/TTFT），按 id 映射给卡片
@@ -820,6 +837,47 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
   }
 
+  const openEftDialog = () => {
+    setEftForm({
+      enabled: earlyFirstTokenData?.enabled ?? true,
+      baseMs: String(earlyFirstTokenData?.baseMs ?? 700),
+      per1kMs: String(earlyFirstTokenData?.per1kMs ?? 4),
+      jitterMs: String(earlyFirstTokenData?.jitterMs ?? 250),
+      minMs: String(earlyFirstTokenData?.minMs ?? 800),
+      maxMs: String(earlyFirstTokenData?.maxMs ?? 2500),
+    })
+    setEftDialogOpen(true)
+  }
+
+  const handleEftSubmit = () => {
+    const toInt = (s: string) => Math.max(0, Math.floor(Number(s) || 0))
+    const payload = {
+      enabled: eftForm.enabled,
+      baseMs: toInt(eftForm.baseMs),
+      per1kMs: toInt(eftForm.per1kMs),
+      jitterMs: toInt(eftForm.jitterMs),
+      minMs: toInt(eftForm.minMs),
+      maxMs: toInt(eftForm.maxMs),
+    }
+    if (payload.maxMs > 0 && payload.minMs > payload.maxMs) {
+      toast.error('延迟下限不得大于上限')
+      return
+    }
+    setEftMutation.mutate(payload, {
+      onSuccess: () => {
+        toast.success(
+          !payload.enabled
+            ? '已关闭早响应模式'
+            : payload.maxMs === 0
+              ? '早响应模式已开启（瞬时首字，无模拟延迟）'
+              : `模拟首字延迟已设为 ${payload.minMs}–${payload.maxMs}ms`,
+        )
+        setEftDialogOpen(false)
+      },
+      onError: err => toast.error('保存失败: ' + (err as Error).message),
+    })
+  }
+
   const openDefaultConcurrencyDialog = () => {
     setDefaultConcurrencyValue(
       typeof defaultConcurrencyData?.concurrencyLimit === 'number' ? String(defaultConcurrencyData.concurrencyLimit) : '',
@@ -970,6 +1028,14 @@ export function Dashboard({ onLogout }: DashboardProps) {
     const next = !(injectionScanData?.enabled ?? true)
     setInjectionScanMutation(next, {
       onSuccess: () => toast.success(next ? '已开启注入扫描' : '已关闭注入扫描'),
+      onError: err => toast.error(`切换失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
+  const handleToggleRpmHardLimit = () => {
+    const next = !(rpmHardLimitData?.enabled ?? true)
+    setRpmHardLimitMutation(next, {
+      onSuccess: () => toast.success(next ? '已开启 RPM 硬闸门（满时等位/429）' : '已关闭 RPM 硬闸门（回到软限）'),
       onError: err => toast.error(`切换失败: ${extractErrorMessage(err)}`),
     })
   }
@@ -1678,6 +1744,18 @@ export function Dashboard({ onLogout }: DashboardProps) {
               onClick={handleCycleCacheScope}
             />
             <PolicyRow
+              label="RPM 硬闸门"
+              sub={
+                (rpmHardLimitData?.enabled ?? true)
+                  ? 'RPM 满时限时等位，超时回 429（不超发上游）'
+                  : '已关闭：RPM 仅作选号软信号，满时仍照发上游'
+              }
+              value={isLoadingRpmHard ? '—' : (rpmHardLimitData?.enabled ?? true) ? '开启' : '关闭'}
+              loading={isLoadingRpmHard}
+              disabled={isLoadingRpmHard || isSettingRpmHard}
+              onClick={handleToggleRpmHardLimit}
+            />
+            <PolicyRow
               label="注入扫描"
               sub={injectionScanData?.enabled ?? true ? '扫描入站工具输出并记日志' : '已关闭，不扫描不记录'}
               value={isLoadingInjectionScan ? '—' : (injectionScanData?.enabled ?? true) ? '开启' : '关闭'}
@@ -1773,6 +1851,25 @@ export function Dashboard({ onLogout }: DashboardProps) {
               value={relayHostData?.relayHost == null ? '关闭' : '已启用'}
               disabled={setRelayHostMutation.isPending}
               onClick={() => { setPoliciesOpen(false); openRelayHostDialog() }}
+            />
+            <PolicyRow
+              label="早响应首字延迟"
+              sub={
+                !(earlyFirstTokenData?.enabled ?? false)
+                  ? '早响应模式关闭'
+                  : (earlyFirstTokenData?.maxMs ?? 0) === 0
+                    ? '早响应开启，瞬时首字（无模拟延迟）'
+                    : '按 token 缩放 + 抖动模拟真实 TTFT'
+              }
+              value={
+                isLoadingEft ? '—'
+                : !(earlyFirstTokenData?.enabled ?? false) ? '关闭'
+                : (earlyFirstTokenData?.maxMs ?? 0) === 0 ? '瞬时'
+                : `${earlyFirstTokenData?.minMs}–${earlyFirstTokenData?.maxMs}ms`
+              }
+              loading={isLoadingEft}
+              disabled={isLoadingEft || setEftMutation.isPending}
+              onClick={() => { setPoliciesOpen(false); openEftDialog() }}
             />
           </div>
         </DialogContent>
@@ -2028,6 +2125,69 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Button>
             <Button onClick={handleRelayHostSubmit} disabled={setRelayHostMutation.isPending}>
               {setRelayHostMutation.isPending ? '保存中…' : '保存'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={eftDialogOpen} onOpenChange={setEftDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>早响应首字延迟</DialogTitle>
+            <DialogDescription>
+              早响应模式默认瞬时 flush 首字（TTFT≈0）显得不真实。开启延迟后，按输入 token 缩放并叠加随机抖动模拟真实 TTFT：<span className="font-mono text-2xs">delay = base + per1k×(tokens/1000) + rand(±jitter)</span>，再 clamp 到 [min, max]。立即生效并持久化到 config.json。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-2">
+            <div className="flex items-center justify-between">
+              <span className="text-sm">早响应模式</span>
+              <Button
+                size="sm"
+                variant={eftForm.enabled ? 'default' : 'outline'}
+                onClick={() => setEftForm(f => ({ ...f, enabled: !f.enabled }))}
+              >
+                {eftForm.enabled ? '开启' : '关闭'}
+              </Button>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              {([
+                ['基础延迟 base (ms)', 'baseMs'],
+                ['每 1k token (ms)', 'per1kMs'],
+                ['抖动 ±jitter (ms)', 'jitterMs'],
+                ['下限 min (ms)', 'minMs'],
+                ['上限 max (ms)', 'maxMs'],
+              ] as const).map(([label, key]) => (
+                <label key={key} className="space-y-1">
+                  <span className="text-2xs text-muted-foreground">{label}</span>
+                  <Input
+                    type="number"
+                    min={0}
+                    step={50}
+                    value={eftForm[key] as string}
+                    onChange={e => setEftForm(f => ({ ...f, [key]: e.target.value }))}
+                    className="tnum font-mono"
+                  />
+                </label>
+              ))}
+            </div>
+            <p className="text-2xs text-muted-foreground">
+              · 上限 max = 0：关闭模拟延迟，回到瞬时 flush 首字
+              <br />
+              · 例（默认值）：50k tok → ~900ms；500k tok → 顶到上限 2500ms
+              <br />
+              · 延迟只推迟首字下发，200 状态码仍即刻返回；实际内容 = 延迟 + 上游耗时
+            </p>
+          </div>
+          <DialogFooter className="gap-2 sm:gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setEftDialogOpen(false)}
+              disabled={setEftMutation.isPending}
+            >
+              取消
+            </Button>
+            <Button onClick={handleEftSubmit} disabled={setEftMutation.isPending}>
+              {setEftMutation.isPending ? '保存中…' : '保存'}
             </Button>
           </DialogFooter>
         </DialogContent>

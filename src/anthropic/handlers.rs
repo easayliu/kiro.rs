@@ -3,7 +3,9 @@
 use std::convert::Infallible;
 
 use anyhow::Error;
-use crate::kiro::errors::{NoAvailableCredentialsError, UpstreamBodyError, UpstreamHttpError};
+use crate::kiro::errors::{
+    LocalRateLimitedError, NoAvailableCredentialsError, UpstreamBodyError, UpstreamHttpError,
+};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -24,7 +26,7 @@ use tokio::time::interval;
 use uuid::Uuid;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::cache_tracker::{CacheProfile, CacheScope, CacheTracker};
 use super::converter::{
@@ -53,6 +55,61 @@ pub fn set_early_first_token(enabled: bool) {
 /// 当前早响应模式开关。
 pub fn early_first_token_enabled() -> bool {
     EARLY_FIRST_TOKEN.load(Ordering::Relaxed)
+}
+
+/// 早响应模式的模拟首字延迟参数（毫秒）。早响应模式默认瞬时 flush 首字（TTFT≈0），
+/// 显得不真实；这里在发出初始事件前注入一段延迟以模拟真实 TTFT。延迟按输入 token
+/// 缩放并叠加随机抖动，再 clamp 到 [min, max]：
+///     delay = base + per_1k*(input_tokens/1000) + rand(±jitter)，clamp 到 [min, max]
+/// `max == 0` 表示关闭延迟（回到瞬时 flush 的旧行为）。全部运行时热改。
+static EFT_DELAY_BASE_MS: AtomicU64 = AtomicU64::new(0);
+static EFT_DELAY_PER_1K_MS: AtomicU64 = AtomicU64::new(0);
+static EFT_DELAY_JITTER_MS: AtomicU64 = AtomicU64::new(0);
+static EFT_DELAY_MIN_MS: AtomicU64 = AtomicU64::new(0);
+static EFT_DELAY_MAX_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 设置模拟首字延迟参数（毫秒）。
+pub fn set_early_first_token_delay(base_ms: u64, per_1k_ms: u64, jitter_ms: u64, min_ms: u64, max_ms: u64) {
+    EFT_DELAY_BASE_MS.store(base_ms, Ordering::Relaxed);
+    EFT_DELAY_PER_1K_MS.store(per_1k_ms, Ordering::Relaxed);
+    EFT_DELAY_JITTER_MS.store(jitter_ms, Ordering::Relaxed);
+    EFT_DELAY_MIN_MS.store(min_ms, Ordering::Relaxed);
+    EFT_DELAY_MAX_MS.store(max_ms, Ordering::Relaxed);
+}
+
+/// 读取当前模拟首字延迟参数 `(base, per_1k, jitter, min, max)`（毫秒），供 Admin API 展示。
+pub fn early_first_token_delay_params() -> (u64, u64, u64, u64, u64) {
+    (
+        EFT_DELAY_BASE_MS.load(Ordering::Relaxed),
+        EFT_DELAY_PER_1K_MS.load(Ordering::Relaxed),
+        EFT_DELAY_JITTER_MS.load(Ordering::Relaxed),
+        EFT_DELAY_MIN_MS.load(Ordering::Relaxed),
+        EFT_DELAY_MAX_MS.load(Ordering::Relaxed),
+    )
+}
+
+/// 计算本次请求的模拟首字延迟；`max == 0`（关闭）时返回 `None`。
+fn early_first_token_delay(input_tokens: i32) -> Option<Duration> {
+    let max = EFT_DELAY_MAX_MS.load(Ordering::Relaxed);
+    if max == 0 {
+        return None;
+    }
+    let base = EFT_DELAY_BASE_MS.load(Ordering::Relaxed);
+    let per_1k = EFT_DELAY_PER_1K_MS.load(Ordering::Relaxed);
+    let jitter = EFT_DELAY_JITTER_MS.load(Ordering::Relaxed);
+    let min = EFT_DELAY_MIN_MS.load(Ordering::Relaxed);
+
+    let tokens = input_tokens.max(0) as u64;
+    let scaled = per_1k.saturating_mul(tokens) / 1000;
+    let mut delay = base.saturating_add(scaled);
+    if jitter > 0 {
+        // rand(±jitter)：在 [0, 2*jitter] 取样后减 jitter，保持无符号运算
+        let r = fastrand::u64(0..=jitter.saturating_mul(2));
+        delay = delay.saturating_add(r).saturating_sub(jitter);
+    }
+    // clamp 到 [min, max]（min 越界时以 max 为准，避免 min>max 触发 panic）
+    let lo = min.min(max);
+    Some(Duration::from_millis(delay.clamp(lo, max)))
 }
 
 /// 汇总 prompt caching 相关的 usage 数值
@@ -212,6 +269,9 @@ fn classify_provider_error(err: &Error, model: &str) -> ProviderErrorInfo {
     let (stat_status, stat_cred): (i64, i64) =
         if err.downcast_ref::<NoAvailableCredentialsError>().is_some() {
             (503, 0)
+        } else if err.downcast_ref::<LocalRateLimitedError>().is_some() {
+            // 本地 RPM 硬闸门限流：请求未发到上游，按 429 归类（不关联凭据）。
+            (429, 0)
         } else if let Some(upstream) = err.downcast_ref::<UpstreamHttpError>() {
             (upstream.status as i64, upstream.credential_id.unwrap_or(0) as i64)
         } else if let Some(body_err) = err.downcast_ref::<UpstreamBodyError>() {
@@ -245,6 +305,20 @@ fn classify_provider_error(err: &Error, model: &str) -> ProviderErrorInfo {
             message: format!(
                 "服务暂时不可用：所有凭据均已禁用（{}/{}）",
                 no_creds.available, no_creds.total
+            ),
+        };
+    }
+
+    // 本地 RPM 硬闸门限流：请求未发到上游，429 + rate_limit_error，让客户端退避。
+    // Retry-After 头由 map_provider_error 从错误里取 retry_after_secs 补上。
+    if let Some(rl) = err.downcast_ref::<LocalRateLimitedError>() {
+        tracing::warn!(retry_after_secs = rl.retry_after_secs, "本地 RPM 硬闸门限流，回 429");
+        return ProviderErrorInfo {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            err_type: "rate_limit_error",
+            message: format!(
+                "Rate limited by local RPM gate; all credentials are at their per-minute limit. Retry after {}s.",
+                rl.retry_after_secs
             ),
         };
     }
@@ -309,11 +383,18 @@ fn classify_provider_error(err: &Error, model: &str) -> ProviderErrorInfo {
 /// 将 KiroProvider 错误映射为 HTTP 响应（含失败请求统计）。
 fn map_provider_error(err: Error, model: &str) -> Response {
     let info = classify_provider_error(&err, model);
-    (
+    let mut resp = (
         info.status,
         Json(ErrorResponse::new(info.err_type, info.message)),
     )
-        .into_response()
+        .into_response();
+    // 本地 RPM 硬闸门限流：补 Retry-After 头，告知客户端退避秒数。
+    if let Some(rl) = err.downcast_ref::<LocalRateLimitedError>() {
+        if let Ok(v) = header::HeaderValue::from_str(&rl.retry_after_secs.to_string()) {
+            resp.headers_mut().insert(header::RETRY_AFTER, v);
+        }
+    }
+    resp
 }
 
 /// 早响应模式：200 已发出后上游失败，把 provider 错误转成流内 `error` 事件（含失败统计）。
@@ -1010,13 +1091,23 @@ async fn handle_stream_request_early(
     ctx.set_credential_id(expected_cred as i64);
     ctx.set_billing_writeback(cache_tracker.clone(), cache_writeback);
 
-    // 初始事件（message_start + 文本块 start）即刻下发——这正是本模式的全部意义
+    // 初始事件（message_start + 文本块 start）。默认瞬时下发会让 TTFT≈0 显得不真实，
+    // 故在发出前注入一段按输入 token 缩放 + 抖动的模拟延迟（配置关闭时 sim_delay=None，
+    // 回到瞬时下发）。延迟只推迟首字下发时刻，200 状态行仍即刻 flush（满足下游按状态码
+    // 调度的契约）；代价是上游调用在延迟结束后才起跑，实际内容到达 = sim_delay + 上游延迟。
     let initial_events = ctx.generate_initial_events();
-    let initial_stream = stream::iter(
-        initial_events
-            .into_iter()
-            .map(|e| Ok(Bytes::from(e.to_sse_string()))),
-    );
+    let sim_delay = early_first_token_delay(input_tokens);
+    let initial_stream = stream::once(async move {
+        if let Some(d) = sim_delay {
+            tokio::time::sleep(d).await;
+        }
+        stream::iter(
+            initial_events
+                .into_iter()
+                .map(|e| Ok(Bytes::from(e.to_sse_string()))),
+        )
+    })
+    .flatten();
 
     // 上游调用挪进流内：future 在 Waiting 相位内被轮询，等待期间 ping 保活。
     // 下游断开时整条响应流被 drop，future 随之取消，上游请求中止语义与默认路径一致。

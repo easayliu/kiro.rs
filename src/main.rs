@@ -225,6 +225,14 @@ async fn main() {
 
     // 早响应模式开关（/v1 流式立即 200 + message_start，上游调用挪进流内，对齐官方时序）。
     anthropic::set_early_first_token(config.early_first_token);
+    // 早响应模式的模拟首字延迟（按输入 token 缩放 + 抖动，clamp 到 [min,max]；max=0 关闭）。
+    anthropic::set_early_first_token_delay(
+        config.early_first_token_delay_base_ms,
+        config.early_first_token_delay_per_1k_ms,
+        config.early_first_token_delay_jitter_ms,
+        config.early_first_token_delay_min_ms,
+        config.early_first_token_delay_max_ms,
+    );
 
     // 出站请求体字节上限（超过上游 ~12.5 MiB 阈值前提前拦截，返回可读 413）。
     anthropic::set_max_request_body_size(config.max_request_body_size);
