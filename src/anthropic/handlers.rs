@@ -126,11 +126,18 @@ fn resolve_binding_key(cache_profile: &CacheProfile) -> (Option<u64>, &'static s
     }
 }
 
-/// 绑定路由结果标签：`hit`=落在 preferred；`spill`=有 preferred 但落到他号
-/// （并发上限 / 限流 / 故障让位）；`none`=无 preferred，纯负载均衡。
-fn binding_outcome_label(preferred: Option<u64>, actual: u64) -> &'static str {
+/// 绑定路由结果标签：
+/// - `hit`=落在 preferred；
+/// - `spill_valve`=RPM/并发泄压阀「健康让位」到他号（preferred 未失败，设计内溢出，
+///   绑定不变、不改绑）——单独标出便于观测泄压频率；
+/// - `spill`=其它让位（preferred 不可用 / 故障 failover），会累计错误、达阈值改绑；
+/// - `none`=无 preferred，纯负载均衡。
+///
+/// `valve_spilled` 来自 [`crate::kiro::provider::ApiCallResult::preferred_spilled`]。
+fn binding_outcome_label(preferred: Option<u64>, actual: u64, valve_spilled: bool) -> &'static str {
     match preferred {
         Some(p) if p == actual => "hit",
+        Some(_) if valve_spilled => "spill_valve",
         Some(_) => "spill",
         None => "none",
     }
@@ -894,7 +901,7 @@ async fn handle_stream_request(
     ctx.set_cache_usage(cache_context);
     ctx.set_credential_id(api_result.credential_id as i64);
     ctx.set_binding(
-        binding_outcome_label(preferred, api_result.credential_id),
+        binding_outcome_label(preferred, api_result.credential_id, api_result.preferred_spilled),
         binding_src,
     );
     // 计费完成后（流末尾 contextUsageEvent）把缩放后的 billed 累计回写缓存，供下次命中守恒。
@@ -1068,7 +1075,11 @@ async fn handle_stream_request_early(
                                 ctx.set_ttft_origin(api_result.upstream_request_at);
                                 ctx.set_credential_id(api_result.credential_id as i64);
                                 ctx.set_binding(
-                                    binding_outcome_label(post.preferred, api_result.credential_id),
+                                    binding_outcome_label(
+                                        post.preferred,
+                                        api_result.credential_id,
+                                        api_result.preferred_spilled,
+                                    ),
                                     post.binding_src,
                                 );
                                 // 初始事件已发过，传空；SseStateManager 对 message_start /
@@ -1744,9 +1755,10 @@ async fn handle_non_stream_request(
         model = %model,
         // 实际承接本次请求的凭据 id（粘性命中 / 并发 spill / 前缀回退后的最终落点）。
         credential_id = api_result.credential_id,
-        // 绑定路由结果：hit=落在 preferred / spill=让位他号 / none=无 preferred；
+        // 绑定路由结果：hit=命中 preferred / spill_valve=泄压阀健康让位 /
+        // spill=故障或不可用让位 / none=无 preferred；
         // binding_src=绑定身份来源：user_id / prefix（前缀回退）/ none。
-        binding = binding_outcome_label(preferred, api_result.credential_id),
+        binding = binding_outcome_label(preferred, api_result.credential_id, api_result.preferred_spilled),
         binding_src = binding_src,
         input_tokens = billed_input_tokens,
         cache_read = billing.cache_read_input_tokens,
@@ -2097,7 +2109,7 @@ async fn handle_stream_request_buffered(
     ctx.set_cache_usage(cache_context);
     ctx.set_credential_id(api_result.credential_id as i64);
     ctx.set_binding(
-        binding_outcome_label(preferred, api_result.credential_id),
+        binding_outcome_label(preferred, api_result.credential_id, api_result.preferred_spilled),
         binding_src,
     );
     // 计费完成后（流末尾 contextUsageEvent）把缩放后的 billed 累计回写缓存，供下次命中守恒。
@@ -2296,6 +2308,24 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod binding_label_tests {
+    use super::*;
+
+    #[test]
+    fn outcome_label_distinguishes_valve_spill_from_failure_spill() {
+        // 命中 preferred：valve_spilled 不影响，恒 hit。
+        assert_eq!(binding_outcome_label(Some(7), 7, false), "hit");
+        assert_eq!(binding_outcome_label(Some(7), 7, true), "hit");
+        // 让位他号：泄压阀健康让位单独标 spill_valve，故障/不可用让位为 spill。
+        assert_eq!(binding_outcome_label(Some(7), 9, true), "spill_valve");
+        assert_eq!(binding_outcome_label(Some(7), 9, false), "spill");
+        // 无 preferred：纯负载均衡。
+        assert_eq!(binding_outcome_label(None, 9, false), "none");
+        assert_eq!(binding_outcome_label(None, 9, true), "none");
+    }
 }
 
 #[cfg(test)]

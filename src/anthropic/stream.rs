@@ -1669,7 +1669,8 @@ impl StreamContext {
             model = %self.model,
             // 实际承接本次请求的凭据 id（粘性命中 / 并发 spill / 前缀回退后的最终落点）。
             credential_id = self.credential_id.unwrap_or(0),
-            // 绑定路由结果：hit=落在 preferred / spill=让位他号 / none=无 preferred；
+            // 绑定路由结果：hit=命中 preferred / spill_valve=泄压阀健康让位 /
+            // spill=故障或不可用让位 / none=无 preferred；
             // binding_src=绑定身份来源：user_id / prefix（前缀回退）/ none。
             binding = self.binding_label,
             binding_src = self.binding_src,
