@@ -215,6 +215,14 @@ pub struct Config {
     #[serde(default = "default_surface_persona")]
     pub surface_persona: bool,
 
+    /// 早响应模式（对齐官方流式时序，默认关）。仅作用于 `/v1/messages` 流式请求：
+    /// 校验通过后立即返回 200 并发出 message_start/content_block_start + ping，
+    /// 上游调用挪进流内，消除「上游等首 token 期间下游零字节」的首字慢感知。
+    /// 代价：200 发出后上游失败只能以流内 `error` 事件下发（官方同为此契约，SDK
+    /// 可识别重试），靠 HTTP 状态码做调度的下游中转对失败请求会看到 200。
+    #[serde(default = "default_early_first_token")]
+    pub early_first_token: bool,
+
     /// 出站请求体字节上限（默认 12 MiB；0 表示关闭该预检）。上游 Kiro runtime 对整个
     /// 请求体有 ~12.5 MiB 硬阈值，超过会以 400 `Input content length exceeds threshold`
     /// 拒绝（整体 body 字节，非 token 窗口 / 单图 / 单文档）。中转层提前拦截给出可读错误。
@@ -339,6 +347,10 @@ fn default_surface_persona() -> bool {
     false
 }
 
+fn default_early_first_token() -> bool {
+    false
+}
+
 fn default_max_request_body_size() -> usize {
     crate::anthropic::KIRO_MAX_REQUEST_BODY_SIZE_DEFAULT
 }
@@ -380,6 +392,7 @@ impl Default for Config {
             injection_scan: default_injection_scan(),
             chunked_write_guidance: default_chunked_write_guidance(),
             surface_persona: default_surface_persona(),
+            early_first_token: default_early_first_token(),
             max_request_body_size: default_max_request_body_size(),
             cache_skip_rate: None,
             output_token_multiplier: None,

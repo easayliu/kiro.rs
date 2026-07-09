@@ -223,6 +223,9 @@ async fn main() {
     // 表层人设开关（在 history 前预置 Claude Code 强预设，让常规回复以 Claude Code 身份作答）。
     anthropic::set_surface_persona(config.surface_persona);
 
+    // 早响应模式开关（/v1 流式立即 200 + message_start，上游调用挪进流内，对齐官方时序）。
+    anthropic::set_early_first_token(config.early_first_token);
+
     // 出站请求体字节上限（超过上游 ~12.5 MiB 阈值前提前拦截，返回可读 413）。
     anthropic::set_max_request_body_size(config.max_request_body_size);
 

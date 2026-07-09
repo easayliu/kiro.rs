@@ -24,6 +24,7 @@ use tokio::time::interval;
 use uuid::Uuid;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::cache_tracker::{CacheProfile, CacheScope, CacheTracker};
 use super::converter::{
@@ -36,6 +37,23 @@ use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, Messa
 use super::websearch;
 use crate::kiro::binding::BindingTable;
 use crate::kiro::provider::KiroProvider;
+
+/// 早响应模式开关（对齐官方流式时序）。默认关；由 main 启动时按 config 设入。
+///
+/// 开启后 `/v1/messages` 流式请求在校验通过后立即返回 200 + 初始事件（message_start
+/// 等），上游调用挪进流内；上游失败以流内 `error` 事件下发（与官方"200 后错误走
+/// 流内 error 事件"的契约一致）。
+static EARLY_FIRST_TOKEN: AtomicBool = AtomicBool::new(false);
+
+/// 设置早响应模式开关。
+pub fn set_early_first_token(enabled: bool) {
+    EARLY_FIRST_TOKEN.store(enabled, Ordering::Relaxed);
+}
+
+/// 当前早响应模式开关。
+pub fn early_first_token_enabled() -> bool {
+    EARLY_FIRST_TOKEN.load(Ordering::Relaxed)
+}
 
 /// 汇总 prompt caching 相关的 usage 数值
 #[derive(Debug, Clone, Copy, Default)]
@@ -151,14 +169,23 @@ fn update_binding_after_call(
     }
 }
 
-/// 将 KiroProvider 错误映射为 HTTP 响应
-/// 把 provider 错误映射为下游响应，并记一条失败请求时序统计。
+/// provider 错误的下游口径：HTTP 状态码 + Anthropic error type + 可读消息。
+///
+/// HTTP 出口（map_provider_error）与早响应模式的流内 error 事件出口
+/// （provider_error_sse）共用同一份归类，保证两条路径的错误语义与统计口径一致。
+struct ProviderErrorInfo {
+    status: StatusCode,
+    err_type: &'static str,
+    message: String,
+}
+
+/// 归类 provider 错误，并记一条失败请求时序统计。
 ///
 /// `model` 仅用于统计归类。失败统计口径只含「上游 API 错误」（call_api 返回 Err），
 /// 流中途截断不计（见 create_truncation_error_sse 分支）。status_code 取上游 HTTP
 /// 状态码；无 HTTP 响应的内部错误用映射码（无可用凭据 503、其它 502）。失败行的
 /// token/成本/延迟均为 0，只进错误率统计，不污染成功侧聚合。
-fn map_provider_error(err: Error, model: &str) -> Response {
+fn classify_provider_error(err: &Error, model: &str) -> ProviderErrorInfo {
     // 失败请求时序统计：状态码按错误类型归类（凭据全禁 503 / 上游 HTTP 透传 / 兜底 502）。
     // credential_id 取上游错误携带的实际凭据（多凭据重试时为最后一次尝试的凭据）；
     // 无关联凭据的错误（凭据全禁 503 / 请求未发到上游）记 0。
@@ -192,17 +219,14 @@ fn map_provider_error(err: Error, model: &str) -> Response {
     // 内部"无可用凭据"：请求未发到上游，503 服务不可用更准确
     if let Some(no_creds) = err.downcast_ref::<NoAvailableCredentialsError>() {
         tracing::warn!(error = %err, "服务暂时不可用：所有凭据均已禁用");
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse::new(
-                "service_unavailable",
-                format!(
-                    "服务暂时不可用：所有凭据均已禁用（{}/{}）",
-                    no_creds.available, no_creds.total
-                ),
-            )),
-        )
-            .into_response();
+        return ProviderErrorInfo {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            err_type: "service_unavailable",
+            message: format!(
+                "服务暂时不可用：所有凭据均已禁用（{}/{}）",
+                no_creds.available, no_creds.total
+            ),
+        };
     }
 
     // 上游 HTTP 错误：按 status 透传（429 → 429、5xx → 502、其他 4xx → 502）
@@ -210,25 +234,20 @@ fn map_provider_error(err: Error, model: &str) -> Response {
         // 上下文窗口满 / 输入过长：保留原 400 + invalid_request_error 映射
         if upstream.body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
             tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(
-                    "invalid_request_error",
-                    "Context window is full. Reduce conversation history, system prompt, or tools.",
-                )),
-            )
-                .into_response();
+            return ProviderErrorInfo {
+                status: StatusCode::BAD_REQUEST,
+                err_type: "invalid_request_error",
+                message: "Context window is full. Reduce conversation history, system prompt, or tools."
+                    .to_string(),
+            };
         }
         if upstream.body.contains("Input is too long") {
             tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(
-                    "invalid_request_error",
-                    "Input is too long. Reduce the size of your messages.",
-                )),
-            )
-                .into_response();
+            return ProviderErrorInfo {
+                status: StatusCode::BAD_REQUEST,
+                err_type: "invalid_request_error",
+                message: "Input is too long. Reduce the size of your messages.".to_string(),
+            };
         }
 
         // 透传上游 status，让客户端按上游真实状态分类（4xx 不重试、5xx 可重试）。
@@ -251,29 +270,48 @@ fn map_provider_error(err: Error, model: &str) -> Response {
             "Kiro API 调用失败: {}",
             err
         );
-        return (
-            mapped_status,
-            Json(ErrorResponse::new(
-                err_type,
-                format!(
-                    "上游 API {}: {}",
-                    upstream.status, upstream.body
-                ),
-            )),
-        )
-            .into_response();
+        return ProviderErrorInfo {
+            status: mapped_status,
+            err_type,
+            message: format!("上游 API {}: {}", upstream.status, upstream.body),
+        };
     }
 
     // 兜底（无类型信息的旧错误 / 未知内部错误）
     tracing::error!("Kiro API 调用失败: {}", err);
+    ProviderErrorInfo {
+        status: StatusCode::BAD_GATEWAY,
+        err_type: "api_error",
+        message: format!("上游 API 调用失败: {}", err),
+    }
+}
+
+/// 将 KiroProvider 错误映射为 HTTP 响应（含失败请求统计）。
+fn map_provider_error(err: Error, model: &str) -> Response {
+    let info = classify_provider_error(&err, model);
     (
-        StatusCode::BAD_GATEWAY,
-        Json(ErrorResponse::new(
-            "api_error",
-            format!("上游 API 调用失败: {}", err),
-        )),
+        info.status,
+        Json(ErrorResponse::new(info.err_type, info.message)),
     )
         .into_response()
+}
+
+/// 早响应模式：200 已发出后上游失败，把 provider 错误转成流内 `error` 事件（含失败统计）。
+///
+/// `service_unavailable` 不是 Anthropic 流式 error type，流内改用 `overloaded_error`
+/// （官方以此表达"过载、可稍后重试"，对应非流式 529），SDK 能识别并触发重试。
+fn provider_error_sse(err: &Error, model: &str) -> Bytes {
+    let info = classify_provider_error(err, model);
+    let err_type = if info.err_type == "service_unavailable" {
+        "overloaded_error"
+    } else {
+        info.err_type
+    };
+    let data = json!({
+        "type": "error",
+        "error": { "type": err_type, "message": info.message }
+    });
+    Bytes::from(format!("event: error\ndata: {}\n\n", data))
 }
 
 /// GET /v1/models
@@ -775,6 +813,26 @@ async fn handle_stream_request(
     preferred: Option<u64>,
     binding_src: &'static str,
 ) -> Response {
+    // 早响应模式：立即 200 + 初始事件，上游调用挪进流内（对齐官方时序）
+    if early_first_token_enabled() {
+        return handle_stream_request_early(
+            provider,
+            request_body,
+            model,
+            input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            tool_key_map,
+            cache_tracker,
+            cache_profile,
+            binding_table,
+            binding_key,
+            preferred,
+            binding_src,
+        )
+        .await;
+    }
+
     // 调用 Kiro API（支持多凭据故障转移；思考签名失效时剥离历史思考块重试一次）
     let api_result = match call_api_stream_with_signature_fallback(provider.as_ref(), request_body, preferred).await {
         Ok(resp) => resp,
@@ -839,6 +897,208 @@ async fn handle_stream_request(
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// 早响应模式上游调用 future（挪进流内轮询）
+type EarlyCallFut = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = anyhow::Result<crate::kiro::provider::ApiCallResult>>
+            + Send,
+    >,
+>;
+
+/// 早响应模式转发相位的内层 SSE 流
+type BoxedSseStream = std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>>;
+
+/// 早响应模式：上游调用返回后才能做的收尾材料（绑定维护 / ctx 补写）
+struct EarlyPostCall {
+    ctx: Option<StreamContext>,
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    binding_table: Arc<BindingTable>,
+    binding_key: Option<u64>,
+    preferred: Option<u64>,
+    binding_src: &'static str,
+    model: String,
+    expected_cred: u64,
+}
+
+/// 早响应模式流状态机：Waiting（等上游响应头，期间 ping 保活）→ Relaying（透传上游）
+enum EarlyPhase {
+    Waiting {
+        fut: EarlyCallFut,
+        ping: tokio::time::Interval,
+        post: Box<EarlyPostCall>,
+    },
+    Relaying(BoxedSseStream),
+    Done,
+}
+
+/// 处理流式请求（早响应模式，对齐官方时序）
+///
+/// 官方 Messages API 在请求校验通过后立即 flush 200 并发出 message_start /
+/// content_block_start，随后以 ping 保活等待生成，首个 delta 才携带真实内容；
+/// 200 之后的失败以流内 `error` 事件下发。此路径照此时序：初始事件即刻下发、
+/// 上游调用挪进流内，消除「上游等首 token 期间下游零字节」的首字慢感知。
+///
+/// 与默认路径的口径差异：缓存拆分需要凭据 id，而凭据要到上游调用成功才最终确定。
+/// 这里用粘性 preferred（生产主路径基本命中）、缺省回退顶档首个可用凭据先行记账；
+/// failover 换凭据时本请求的缓存记账凭据与实际凭据不一致（打 warn），仅影响本地
+/// 模拟缓存的记账口径，不影响上游真实成本。
+async fn handle_stream_request_early(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: &str,
+    model: &str,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    tool_key_map: super::converter::ToolPropertyKeyMap,
+    cache_tracker: Arc<CacheTracker>,
+    cache_profile: CacheProfile,
+    binding_table: Arc<BindingTable>,
+    binding_key: Option<u64>,
+    preferred: Option<u64>,
+    binding_src: &'static str,
+) -> Response {
+    // 期望凭据：粘性 preferred；无绑定时取顶档首个可用凭据（均衡模式下可能与实际
+    // 选中不同，仅作缓存记账口径）。无可用凭据时记 0，随后的上游调用会以
+    // NoAvailableCredentials 失败并走流内 error 事件收尾。
+    let expected_cred = preferred
+        .or_else(|| provider.top_priority_credential_ids(Some(model)).first().copied())
+        .unwrap_or(0);
+
+    // 原子地计算缓存命中并更新 checkpoint 表（按期望凭据先行记账）
+    let (cache_result, cache_writeback) =
+        cache_tracker.compute_and_update(expected_cred, &cache_profile);
+    let cache_context = CacheUsageContext {
+        cache_creation_input_tokens: cache_result.cache_creation_input_tokens,
+        cache_read_input_tokens: cache_result.cache_read_input_tokens,
+        cache_creation_5m_input_tokens: cache_result.cache_creation_5m_input_tokens,
+        cache_creation_1h_input_tokens: cache_result.cache_creation_1h_input_tokens,
+        uncached_input_tokens: cache_result.uncached_input_tokens,
+        cache_read_billed: cache_result.cache_read_billed,
+        cache_disabled: matches!(cache_tracker.cache_scope(), CacheScope::Off),
+    };
+
+    let mut ctx =
+        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    ctx.set_tool_key_map(tool_key_map);
+    ctx.set_cache_usage(cache_context);
+    ctx.set_credential_id(expected_cred as i64);
+    ctx.set_billing_writeback(cache_tracker.clone(), cache_writeback);
+
+    // 初始事件（message_start + 文本块 start）即刻下发——这正是本模式的全部意义
+    let initial_events = ctx.generate_initial_events();
+    let initial_stream = stream::iter(
+        initial_events
+            .into_iter()
+            .map(|e| Ok(Bytes::from(e.to_sse_string()))),
+    );
+
+    // 上游调用挪进流内：future 在 Waiting 相位内被轮询，等待期间 ping 保活。
+    // 下游断开时整条响应流被 drop，future 随之取消，上游请求中止语义与默认路径一致。
+    let call_fut: EarlyCallFut = {
+        let provider = provider.clone();
+        let request_body = request_body.to_string();
+        Box::pin(async move {
+            call_api_stream_with_signature_fallback(provider.as_ref(), &request_body, preferred)
+                .await
+        })
+    };
+    let post = EarlyPostCall {
+        ctx: Some(ctx),
+        provider,
+        binding_table,
+        binding_key,
+        preferred,
+        binding_src,
+        model: model.to_string(),
+        expected_cred,
+    };
+
+    let wait_stream = stream::unfold(
+        EarlyPhase::Waiting {
+            fut: call_fut,
+            ping: interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            post: Box::new(post),
+        },
+        |phase| async move {
+            match phase {
+                EarlyPhase::Waiting {
+                    mut fut,
+                    mut ping,
+                    mut post,
+                } => {
+                    tokio::select! {
+                        result = &mut fut => match result {
+                            Ok(api_result) => {
+                                update_binding_after_call(
+                                    &post.binding_table,
+                                    post.provider.as_ref(),
+                                    post.binding_key,
+                                    post.preferred,
+                                    Some(api_result.credential_id),
+                                    &post.model,
+                                );
+                                let mut ctx = post.ctx.take().expect("ctx 仅在 Waiting→Relaying 转换时取出一次");
+                                if api_result.credential_id != post.expected_cred {
+                                    tracing::warn!(
+                                        expected = post.expected_cred,
+                                        actual = api_result.credential_id,
+                                        "早响应模式：实际凭据与先行记账凭据不一致（failover），本请求缓存拆分按先行口径"
+                                    );
+                                }
+                                ctx.set_ttft_origin(api_result.upstream_request_at);
+                                ctx.set_credential_id(api_result.credential_id as i64);
+                                ctx.set_binding(
+                                    binding_outcome_label(post.preferred, api_result.credential_id),
+                                    post.binding_src,
+                                );
+                                // 初始事件已发过，传空；SseStateManager 对 message_start /
+                                // content_block_start 去重，后续处理不会重发。
+                                let mut inner: BoxedSseStream = Box::pin(create_sse_stream(
+                                    api_result.response,
+                                    ctx,
+                                    Vec::new(),
+                                ));
+                                // inner 的 ping interval 首个 tick 立即完成，首元素不会悬挂
+                                inner
+                                    .next()
+                                    .await
+                                    .map(|item| (item, EarlyPhase::Relaying(inner)))
+                            }
+                            Err(e) => {
+                                update_binding_after_call(
+                                    &post.binding_table,
+                                    post.provider.as_ref(),
+                                    post.binding_key,
+                                    post.preferred,
+                                    None,
+                                    &post.model,
+                                );
+                                Some((Ok(provider_error_sse(&e, &post.model)), EarlyPhase::Done))
+                            }
+                        },
+                        _ = ping.tick() => {
+                            Some((Ok(create_ping_sse()), EarlyPhase::Waiting { fut, ping, post }))
+                        }
+                    }
+                }
+                EarlyPhase::Relaying(mut inner) => {
+                    inner.next().await.map(|item| (item, EarlyPhase::Relaying(inner)))
+                }
+                EarlyPhase::Done => None,
+            }
+        },
+    );
+
+    // 返回 SSE 响应（200 即刻 flush，不等上游）
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(initial_stream.chain(wait_stream)))
         .unwrap()
 }
 
