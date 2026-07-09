@@ -36,6 +36,9 @@ pub struct ApiCallResult {
     /// 向上游发出本次（成功）请求的时刻。流式下上游往往等首 token 生成好才 flush
     /// 响应头，故 TTFT（首字耗时）应以此为原点、到首个 body 字节，而非响应头到达后。
     pub upstream_request_at: Instant,
+    /// 本次是否因 RPM/并发泄压阀而 spill 到非 preferred 凭据（健康让位，非 preferred
+    /// 失败）。透传自 [`CallContext::preferred_spilled`]，供粘性绑定维护抑制误改绑。
+    pub preferred_spilled: bool,
 }
 
 /// 已缓冲完整响应体的调用结果（非流式专用）
@@ -46,6 +49,8 @@ pub struct ApiCallResult {
 pub struct BufferedApiCallResult {
     pub body: bytes::Bytes,
     pub credential_id: u64,
+    /// 见 [`ApiCallResult::preferred_spilled`]。
+    pub preferred_spilled: bool,
 }
 
 /// Kiro API Provider
@@ -333,6 +338,7 @@ impl KiroProvider {
                 .call_api_with_retry(request_body, false, preferred)
                 .await?;
             let credential_id = result.credential_id;
+            let preferred_spilled = result.preferred_spilled;
 
             let body_started = Instant::now();
             match result.response.bytes().await {
@@ -340,6 +346,7 @@ impl KiroProvider {
                     return Ok(BufferedApiCallResult {
                         body,
                         credential_id,
+                        preferred_spilled,
                     });
                 }
                 Err(e) => {
@@ -406,6 +413,11 @@ impl KiroProvider {
     /// 列出最高优先级档的可用凭据 id（供粘性绑定 resolve 作为候选池）
     pub fn top_priority_credential_ids(&self, model: Option<&str>) -> Vec<u64> {
         self.token_manager.top_priority_credential_ids(model)
+    }
+
+    /// 凭据 60s RPM 窗口计数（粘性放置的负载信号），见 [`MultiTokenManager::credential_rpm_loads`]
+    pub fn credential_rpm_loads(&self, ids: &[u64]) -> Vec<(u64, usize)> {
+        self.token_manager.credential_rpm_loads(ids)
     }
 
     /// 发送流式 API 请求
@@ -628,6 +640,7 @@ impl KiroProvider {
                     response,
                     credential_id: ctx.id,
                     upstream_request_at: send_start,
+                    preferred_spilled: ctx.preferred_spilled,
                 });
             }
 
@@ -962,6 +975,7 @@ impl KiroProvider {
                     response,
                     credential_id: ctx.id,
                     upstream_request_at: send_start,
+                    preferred_spilled: ctx.preferred_spilled,
                 });
             }
 

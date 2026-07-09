@@ -632,9 +632,13 @@ pub async fn handle_websearch_request(
 
     // 3. 粘性绑定：解析 preferred 凭证（MCP 不按模型过滤，传 None）。
     //    候选池收窄到最高优先级档，与 handlers::resolve_sticky_preference 同语义。
+    //    shard_key 传 0：websearch 为单发轻流量，不参与鲸鱼分片路由。
     let preferred = binding_key
         .map(|id| (id, provider.top_priority_credential_ids(None)))
-        .and_then(|(id, available)| binding_table.resolve(id, &available));
+        .and_then(|(id, available)| {
+            let loads = provider.credential_rpm_loads(&available);
+            binding_table.resolve(id, 0, &loads)
+        });
 
     // 4. 调用 Kiro MCP API
     let (search_results, actual_credential) =
@@ -725,7 +729,8 @@ fn maintain_binding(
     }
     if binding_table.report_error(pref) {
         let available = provider.available_credential_ids(None);
-        if let Some(new_cred) = binding_table.rebind(identity, pref, &available) {
+        let loads = provider.credential_rpm_loads(&available);
+        if let Some(new_cred) = binding_table.rebind(identity, pref, &loads) {
             tracing::info!(
                 identity = identity,
                 from = pref,

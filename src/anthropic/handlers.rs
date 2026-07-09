@@ -96,6 +96,7 @@ fn resolve_sticky_preference(
     binding_table: &BindingTable,
     provider: &KiroProvider,
     binding_key: Option<u64>,
+    shard_key: u64,
     model: &str,
 ) -> Option<u64> {
     // 仅 Off 跳过粘性；Global/PerCredential 均绑定，以复用上游按凭证隔离的 prompt cache。
@@ -106,8 +107,10 @@ fn resolve_sticky_preference(
     // 候选池收窄到最高优先级档：绑在低优先级档的身份下次请求会因"凭据不在
     // 候选池"静默改绑迁回顶档，使调整优先级能触发粘性再均衡。错误改绑
     // （update_binding_after_call）仍用全量列表，保留顶档全挂时的降级退路。
+    // 候选附带 60s RPM 计数作放置负载信号；shard_key（会话级）供鲸鱼分片路由。
     let available = provider.top_priority_credential_ids(Some(model));
-    binding_table.resolve(identity, &available)
+    let loads = provider.credential_rpm_loads(&available);
+    binding_table.resolve(identity, shard_key, &loads)
 }
 
 /// 解析绑定身份键并给出来源标签：优先 `metadata.user_id`（device+account），无则
@@ -137,12 +140,17 @@ fn binding_outcome_label(preferred: Option<u64>, actual: u64) -> &'static str {
 ///
 /// - 成功但落在非 preferred 凭证 → preferred 本轮失败，累计错误，必要时改绑
 /// - 调用整体失败 → 累计错误，必要时改绑（下一次请求生效）
+///
+/// 例外：`spilled=true`（RPM/并发泄压阀健康让位到他号）不算 preferred 失败——
+/// preferred 本身健康、只是当下满负荷，泄压是设计内行为。若在此记错，持续高频
+/// 身份会每分钟攒够阈值触发改绑抖动、反复丢弃上游暖缓存（见回归测试）。
 fn update_binding_after_call(
     binding_table: &BindingTable,
     provider: &KiroProvider,
     binding_key: Option<u64>,
     preferred: Option<u64>,
     actual: Option<u64>,
+    spilled: bool,
     model: &str,
 ) {
     let (identity, pref) = match (binding_key, preferred) {
@@ -156,9 +164,14 @@ fn update_binding_after_call(
     if !preferred_failed {
         return;
     }
+    // 泄压阀健康让位：非 preferred 失败，不记错、不改绑。
+    if spilled {
+        return;
+    }
     if binding_table.report_error(pref) {
         let available = provider.available_credential_ids(Some(model));
-        if let Some(new_cred) = binding_table.rebind(identity, pref, &available) {
+        let loads = provider.credential_rpm_loads(&available);
+        if let Some(new_cred) = binding_table.rebind(identity, pref, &loads) {
             tracing::info!(
                 identity = identity,
                 from = pref,
@@ -696,6 +709,7 @@ pub async fn post_messages(
         &binding_table,
         provider.as_ref(),
         binding_key,
+        cache_profile.shard_key().unwrap_or(0),
         &payload.model,
     );
 
@@ -843,6 +857,7 @@ async fn handle_stream_request(
                 binding_key,
                 preferred,
                 None,
+                false,
                 model,
             );
             return map_provider_error(e, model);
@@ -854,6 +869,7 @@ async fn handle_stream_request(
         binding_key,
         preferred,
         Some(api_result.credential_id),
+        api_result.preferred_spilled,
         model,
     );
 
@@ -1038,6 +1054,7 @@ async fn handle_stream_request_early(
                                     post.binding_key,
                                     post.preferred,
                                     Some(api_result.credential_id),
+                                    api_result.preferred_spilled,
                                     &post.model,
                                 );
                                 let mut ctx = post.ctx.take().expect("ctx 仅在 Waiting→Relaying 转换时取出一次");
@@ -1074,6 +1091,7 @@ async fn handle_stream_request_early(
                                     post.binding_key,
                                     post.preferred,
                                     None,
+                                    false,
                                     &post.model,
                                 );
                                 Some((Ok(provider_error_sse(&e, &post.model)), EarlyPhase::Done))
@@ -1421,6 +1439,7 @@ async fn handle_non_stream_request(
                 binding_key,
                 preferred,
                 None,
+                false,
                 model,
             );
             return map_provider_error(e, model);
@@ -1432,6 +1451,7 @@ async fn handle_non_stream_request(
         binding_key,
         preferred,
         Some(api_result.credential_id),
+        api_result.preferred_spilled,
         model,
     );
 
@@ -1957,6 +1977,7 @@ pub async fn post_messages_cc(
         &binding_table,
         provider.as_ref(),
         binding_key,
+        cache_profile.shard_key().unwrap_or(0),
         &payload.model,
     );
 
@@ -2039,6 +2060,7 @@ async fn handle_stream_request_buffered(
                 binding_key,
                 preferred,
                 None,
+                false,
                 model,
             );
             return map_provider_error(e, model);
@@ -2050,6 +2072,7 @@ async fn handle_stream_request_buffered(
         binding_key,
         preferred,
         Some(api_result.credential_id),
+        api_result.preferred_spilled,
         model,
     );
 

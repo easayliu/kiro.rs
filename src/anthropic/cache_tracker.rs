@@ -120,6 +120,29 @@ impl CacheProfile {
         let block = self.blocks.get(bp.block_index)?;
         Some(fingerprint_to_u64(&block.prefix_fingerprint))
     }
+
+    /// 鲸鱼分片的会话级分流键：粒度比 `binding_key` 细一档。
+    ///
+    /// 优先用 `identity_key`（device + account + **session**）：同一 session
+    /// 恒定同一值 → 分片路由能把该会话钉在同一分片成员上（保前缀缓存局部性），
+    /// 不同 session 互异 → 摊到不同成员（拆热点）。
+    ///
+    /// 匿名流量（无 user_id，绑定走 `prefix_binding_key`）回退到第一个 cacheable
+    /// breakpoint 的**下一个** block 指纹：breakpoint block 本身是全体共享的公共
+    /// 前缀（tools/system），其后第一个 block 已进入会话内容——前缀指纹是累计的，
+    /// 该指纹在同一会话内跨轮稳定、不同会话互异，正好是会话级键。无下一个 block
+    /// 时退回 breakpoint block 自身（此时不具备分流性，分片退化为单成员路由）。
+    pub fn shard_key(&self) -> Option<u64> {
+        if let Some(k) = self.identity_key {
+            return Some(k);
+        }
+        let bp = self.cacheable_breakpoints().into_iter().next()?;
+        let block = self
+            .blocks
+            .get(bp.block_index + 1)
+            .or_else(|| self.blocks.get(bp.block_index))?;
+        Some(fingerprint_to_u64(&block.prefix_fingerprint))
+    }
 }
 
 #[derive(Debug, Clone)]

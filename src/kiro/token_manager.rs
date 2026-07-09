@@ -1066,6 +1066,65 @@ fn effective_concurrency_limit(cred: &KiroCredentials, default: Option<u32>) -> 
     }
 }
 
+/// 凭据「鲜活性」判定的一次性快照。
+///
+/// 在持有 `entries` 锁时由 [`MultiTokenManager::capture_freshness`] 捕获（内部再取
+/// `default_rpm_limit`/`default_concurrency_limit` 锁，锁序 entries → default_rpm →
+/// default_concurrency）。`select_next_credential`、`has_fresh_credential` 与
+/// `acquire_context` 的 preferred 路径共用同一份 disabled/opus/throttle/RPM/并发
+/// 谓词，避免各自手抄导致「哪些凭据可用」的判定悄悄漂移。
+struct FreshnessCtx {
+    now: DateTime<Utc>,
+    is_opus: bool,
+    rpm_active: bool,
+    rpm_cutoff: DateTime<Utc>,
+    default_rpm: Option<u32>,
+    concurrency_active: bool,
+    default_concurrency: Option<u32>,
+}
+
+impl FreshnessCtx {
+    /// 有资格参与选号：未禁用、且支持目标模型。`best_fallback` 的入选门槛。
+    fn is_eligible(&self, e: &CredentialEntry) -> bool {
+        !e.disabled && (!self.is_opus || e.credentials.supports_opus())
+    }
+
+    /// 处于 429 冷却窗口内。
+    fn is_throttled(&self, e: &CredentialEntry) -> bool {
+        e.throttled_until.is_some_and(|until| until > self.now)
+    }
+
+    /// 60s RPM 窗口未耗尽（未启用限流或无限额时恒真）。即时计数、不裁剪窗口。
+    fn rpm_ok(&self, e: &CredentialEntry) -> bool {
+        if !self.rpm_active {
+            return true;
+        }
+        match effective_rpm_limit(&e.credentials, self.default_rpm) {
+            Some(limit) => {
+                let count = e.rpm_window.iter().filter(|t| **t > self.rpm_cutoff).count();
+                count < limit as usize
+            }
+            None => true,
+        }
+    }
+
+    /// 在途并发未达上限（不含本次；未启用或无限额时恒真）。
+    fn concurrency_ok(&self, e: &CredentialEntry) -> bool {
+        if !self.concurrency_active {
+            return true;
+        }
+        match effective_concurrency_limit(&e.credentials, self.default_concurrency) {
+            Some(limit) => e.inflight.load(Ordering::Relaxed) < limit as usize,
+            None => true,
+        }
+    }
+
+    /// 「鲜活」：可选号且未冷却、RPM/并发均未满。`best_fresh` 的入选门槛。
+    fn is_fresh(&self, e: &CredentialEntry) -> bool {
+        self.is_eligible(e) && !self.is_throttled(e) && self.rpm_ok(e) && self.concurrency_ok(e)
+    }
+}
+
 /// 比较两个候选凭据，返回 new 是否优于 current
 ///
 /// 规则：
@@ -1137,6 +1196,10 @@ pub struct CallContext {
     /// 删除此字段会使该凭据的在途计数永久 +1，破坏 least-request 均衡。
     #[allow(dead_code)]
     pub inflight: InflightGuard,
+    /// 本次调用是否因 RPM/并发泄压阀「健康让位」而 spill 到非 preferred 凭据。
+    /// 供 handlers 的粘性绑定维护区分「设计内泄压」与「preferred 真失败」：
+    /// 前者不得记 preferred 错误，否则持续高频身份会每分钟触发改绑抖动。
+    pub preferred_spilled: bool,
 }
 
 impl MultiTokenManager {
@@ -1447,26 +1510,31 @@ impl MultiTokenManager {
             .collect()
     }
 
-    /// 根据负载均衡模式选择下一个凭据
+    /// 查询凭据的 60s RPM 窗口计数（粘性放置的负载信号），保持 `ids` 顺序。
     ///
-    /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：先按优先级分档，仅在最高优先级一档（priority 最小者）内
-    ///   做 LRU 均衡。该档凭据全部 disabled / 不支持目标模型时，自然降级到下一档。
+    /// 与 RPM 限流同一记账源（`rpm_window`，HTTP 发出后记账），无需另建统计。
+    /// 只读计数、不裁剪窗口（裁剪由 `record_request_for_rpm` 做）。未知 id 计 0。
+    pub fn credential_rpm_loads(&self, ids: &[u64]) -> Vec<(u64, usize)> {
+        let cutoff = Utc::now() - Duration::seconds(RPM_WINDOW_SECS);
+        let entries = self.entries.lock();
+        ids.iter()
+            .map(|&id| {
+                let load = entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| e.rpm_window.iter().filter(|t| **t > cutoff).count())
+                    .unwrap_or(0);
+                (id, load)
+            })
+            .collect()
+    }
+
+    /// 在持有 `entries` 锁时捕获鲜活性判定所需的全局状态（限流/并发开关与默认限额）。
     ///
-    /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials, InflightGuard)> {
-        let mut entries = self.entries.lock();
-
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
-
-        let now = Utc::now();
+    /// 内部再取 `default_rpm_limit`/`default_concurrency_limit` 锁，调用方须已持
+    /// `entries` 锁以保证锁序 entries → default_rpm → default_concurrency。
+    fn capture_freshness(&self, is_opus: bool, now: DateTime<Utc>) -> FreshnessCtx {
         let rpm_active = self.rpm_feature_enabled.load(Ordering::Relaxed);
-        let rpm_cutoff = now - Duration::seconds(RPM_WINDOW_SECS);
-        // 锁外读不到，但只读一次：在 entries 锁内额外拿一次 default_rpm_limit
-        // 锁是短锁，且这两个锁的获取顺序在所有代码路径上一致（entries → default_rpm_limit）。
         let default_rpm = if rpm_active {
             *self.default_rpm_limit.lock()
         } else {
@@ -1478,6 +1546,35 @@ impl MultiTokenManager {
         } else {
             None
         };
+        FreshnessCtx {
+            now,
+            is_opus,
+            rpm_active,
+            rpm_cutoff: now - Duration::seconds(RPM_WINDOW_SECS),
+            default_rpm,
+            concurrency_active,
+            default_concurrency,
+        }
+    }
+
+    /// 根据负载均衡模式选择下一个凭据
+    ///
+    /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
+    /// - balanced 模式：先按优先级分档，仅在最高优先级一档（priority 最小者）内
+    ///   做 LRU 均衡。该档凭据全部 disabled / 不支持目标模型时，自然降级到下一档。
+    ///
+    /// # 参数
+    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials, InflightGuard)> {
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+
+        let now = Utc::now();
+        let mut entries = self.entries.lock();
+        // 锁序 entries → default_rpm → default_concurrency（capture_freshness 内部）
+        // → load_balancing_mode，在所有代码路径上一致。
+        let fctx = self.capture_freshness(is_opus, now);
         let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
         // 单次扫描同时维护两个候选：
@@ -1490,10 +1587,7 @@ impl MultiTokenManager {
 
         for i in 0..entries.len() {
             let entry = &entries[i];
-            if entry.disabled {
-                continue;
-            }
-            if is_opus && !entry.credentials.supports_opus() {
+            if !fctx.is_eligible(entry) {
                 continue;
             }
             had_eligible = true;
@@ -1502,35 +1596,11 @@ impl MultiTokenManager {
                 best_fallback = Some(i);
             }
 
-            // 鲜活性检查（throttled / RPM）：失败则不能更新 best_fresh，但 fallback 已记录
-            if entry.throttled_until.is_some_and(|until| until > now) {
+            // 鲜活性检查（throttled / RPM / 并发）：失败则不更新 best_fresh，但 fallback 已记录。
+            // +1 由选中后的 InflightGuard::acquire 在同一把 entries 锁内完成，故并发判定读到
+            // 的是"不含本次请求"的在途数，limit=N 即最多 N 个并发。
+            if !fctx.is_fresh(entry) {
                 continue;
-            }
-            if rpm_active {
-                if let Some(limit) = effective_rpm_limit(&entry.credentials, default_rpm) {
-                    // 用 filter().count() 即时计数，避免修改 rpm_window；
-                    // 真正的窗口裁剪由 record_request_for_rpm 在选中后做。
-                    let count = entry
-                        .rpm_window
-                        .iter()
-                        .filter(|t| **t > rpm_cutoff)
-                        .count();
-                    if count >= limit as usize {
-                        continue;
-                    }
-                }
-            }
-            if concurrency_active {
-                if let Some(limit) =
-                    effective_concurrency_limit(&entry.credentials, default_concurrency)
-                {
-                    // 在途数已达上限：跳过此号（best_fallback 已记录，全员满时仍有退路）。
-                    // +1 由选中后的 InflightGuard::acquire 在同一把 entries 锁内完成，
-                    // 故此处读到的是"不含本次请求"的在途数，limit=N 即最多 N 个并发。
-                    if entry.inflight.load(Ordering::Relaxed) >= limit as usize {
-                        continue;
-                    }
-                }
             }
 
             if is_better(entry, best_fresh.map(|j| &entries[j]), is_balanced) {
@@ -1572,61 +1642,15 @@ impl MultiTokenManager {
     ///
     /// 鲜活性判定与 `select_next_credential` 的 `best_fresh` 分支保持一致。
     pub fn has_fresh_credential(&self, model: Option<&str>) -> bool {
-        let entries = self.entries.lock();
-
         let is_opus = model
             .map(|m| m.to_lowercase().contains("opus"))
             .unwrap_or(false);
 
         let now = Utc::now();
-        let rpm_active = self.rpm_feature_enabled.load(Ordering::Relaxed);
-        let rpm_cutoff = now - Duration::seconds(RPM_WINDOW_SECS);
-        // 锁顺序与 select_next_credential 一致：entries → default_rpm_limit
-        let default_rpm = if rpm_active {
-            *self.default_rpm_limit.lock()
-        } else {
-            None
-        };
-        let concurrency_active = self.concurrency_feature_enabled.load(Ordering::Relaxed);
-        let default_concurrency = if concurrency_active {
-            *self.default_concurrency_limit.lock()
-        } else {
-            None
-        };
-
-        entries.iter().any(|entry| {
-            if entry.disabled {
-                return false;
-            }
-            if is_opus && !entry.credentials.supports_opus() {
-                return false;
-            }
-            if entry.throttled_until.is_some_and(|until| until > now) {
-                return false;
-            }
-            if rpm_active {
-                if let Some(limit) = effective_rpm_limit(&entry.credentials, default_rpm) {
-                    let count = entry
-                        .rpm_window
-                        .iter()
-                        .filter(|t| **t > rpm_cutoff)
-                        .count();
-                    if count >= limit as usize {
-                        return false;
-                    }
-                }
-            }
-            if concurrency_active {
-                if let Some(limit) =
-                    effective_concurrency_limit(&entry.credentials, default_concurrency)
-                {
-                    if entry.inflight.load(Ordering::Relaxed) >= limit as usize {
-                        return false;
-                    }
-                }
-            }
-            true
-        })
+        let entries = self.entries.lock();
+        // 锁序与 select_next_credential 一致：entries → default_rpm → default_concurrency。
+        let fctx = self.capture_freshness(is_opus, now);
+        entries.iter().any(|entry| fctx.is_fresh(entry))
     }
 
     /// 获取 API 调用上下文
@@ -1640,7 +1664,8 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     /// - `preferred`: 优先使用的凭据 id（来自用户粘性绑定）。仅在第一轮尝试；
-    ///   若该凭据不可用或本轮 Token 获取失败，后续轮次走默认选择逻辑。
+    ///   若该凭据不可用、已达并发/RPM 上限或本轮 Token 获取失败，
+    ///   后续轮次走默认选择逻辑。
     pub async fn acquire_context(
         &self,
         model: Option<&str>,
@@ -1650,6 +1675,11 @@ impl MultiTokenManager {
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
         let mut preferred_pending = preferred;
+        // 粘性凭据是否被泄压阀「健康让位」spill 到他号（RPM/并发满，非其失败）。
+        // 一旦首轮泄压即置真并粘住整个重试循环：preferred 从未真正试发失败，最终
+        // 落在哪个凭据都不应记为 preferred 错误。传给上层 update_binding_after_call
+        // 抑制误改绑（否则持续高频身份每分钟触发 rebind 抖动，见回归测试）。
+        let mut spilled_preferred = false;
 
         let is_opus = model
             .map(|m| m.to_lowercase().contains("opus"))
@@ -1664,52 +1694,47 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials, inflight) = {
+            let (id, credentials, inflight, spilled) = {
                 let now = Utc::now();
-                // 第一轮优先尝试粘性绑定凭据（只试一次，后续轮次 fallback）
-                // 仍要校验 throttled_until：被上游限流的凭据若被粘性命中，
-                // 会绕过冷却继续发送请求并累积 throttle_count，永远逃不出冷却。
-                let concurrency_active =
-                    self.concurrency_feature_enabled.load(Ordering::Relaxed);
-                let preferred_hit = preferred_pending.take().and_then(|pid| {
-                    let entries = self.entries.lock();
-                    // 锁序与 select_next_credential 一致：entries → default_concurrency_limit
-                    let default_concurrency = if concurrency_active {
-                        *self.default_concurrency_limit.lock()
-                    } else {
-                        None
-                    };
-                    entries
-                        .iter()
-                        .find(|e| {
-                            e.id == pid
-                                && !e.disabled
-                                && e.throttled_until.is_none_or(|until| until <= now)
-                        })
-                        .filter(|e| !is_opus || e.credentials.supports_opus())
-                        // 并发泄压阀：preferred 已达并发上限时不强钉，返回 None 回落普通
-                        // 选号，让高并发 session 的溢出请求 spill 到闲置凭据（代价：被 spill
-                        // 的请求在新凭据上吃一次冷 prefill）。仅溢出请求受影响，绑定不变，
-                        // 下一个不撞并发的请求仍会优先命中 preferred。语义与 select_next
-                        // 一致：limit=N 即最多 N 个在途（inflight 不含本次）。
-                        .filter(|e| {
-                            if !concurrency_active {
-                                return true;
+                // 第一轮优先尝试粘性绑定凭据（只试一次，后续轮次 fallback）。
+                // preferred 的判定分三种归宿，交由 update_binding_after_call 区分记账：
+                //  - 命中：阀门未触发，钉 preferred（valve_spilled=false）。
+                //  - 不可用：不在池/禁用/不支持模型/冷却中 → 回落普通选号，按 preferred
+                //    失败记账（这些是真实健康信号，与本改动前一致；冷却中若强钉会绕过
+                //    429 冷却、累积 throttle_count 永远逃不出）。valve_spilled=false。
+                //  - 泄压 spill：preferred 健康、仅 RPM/并发满 → 让位，但**仅当存在其它
+                //    鲜活凭据**才 spill（否则 spill 只会落到同样饱和的冷凭据，多吃一次冷
+                //    prefill 且照样超限，不如钉 preferred 保住暖缓存）。valve_spilled=true，
+                //    不记 preferred 错误：这是设计内的健康让位，绑定须保持不变。
+                let (preferred_hit, valve_spilled) = match preferred_pending.take() {
+                    None => (None, false),
+                    Some(pid) => {
+                        let entries = self.entries.lock();
+                        let fctx = self.capture_freshness(is_opus, now);
+                        match entries.iter().find(|e| e.id == pid) {
+                            Some(e) if fctx.is_eligible(e) && !fctx.is_throttled(e) => {
+                                if fctx.rpm_ok(e) && fctx.concurrency_ok(e) {
+                                    // 锁内 +1 占位（与 select_next_credential 一致）
+                                    let guard = InflightGuard::acquire(e.inflight.clone());
+                                    (Some((e.id, e.credentials.clone(), guard)), false)
+                                } else if entries.iter().any(|o| o.id != pid && fctx.is_fresh(o)) {
+                                    (None, true)
+                                } else {
+                                    let guard = InflightGuard::acquire(e.inflight.clone());
+                                    (Some((e.id, e.credentials.clone(), guard)), false)
+                                }
                             }
-                            match effective_concurrency_limit(&e.credentials, default_concurrency) {
-                                Some(limit) => e.inflight.load(Ordering::Relaxed) < limit as usize,
-                                None => true,
-                            }
-                        })
-                        .map(|e| {
-                            // 锁内 +1 占位（与 select_next_credential 一致）
-                            let guard = InflightGuard::acquire(e.inflight.clone());
-                            (e.id, e.credentials.clone(), guard)
-                        })
-                });
+                            _ => (None, false),
+                        }
+                    }
+                };
+                if valve_spilled {
+                    spilled_preferred = true;
+                }
 
                 if let Some(hit) = preferred_hit {
-                    hit
+                    let (id, credentials, inflight) = hit;
+                    (id, credentials, inflight, spilled_preferred)
                 } else {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
@@ -1735,7 +1760,8 @@ impl MultiTokenManager {
                 };
 
                 if let Some(hit) = current_hit {
-                    hit
+                    let (id, credentials, inflight) = hit;
+                    (id, credentials, inflight, spilled_preferred)
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
                     let mut best = self.select_next_credential(model);
@@ -1771,7 +1797,7 @@ impl MultiTokenManager {
                         // 更新 current_id
                         let mut current_id = self.current_id.lock();
                         *current_id = new_id;
-                        (new_id, new_creds, guard)
+                        (new_id, new_creds, guard, spilled_preferred)
                     } else {
                         let entries = self.entries.lock();
                         // 注意：必须在 bail! 之前计算 available_count，
@@ -1791,7 +1817,10 @@ impl MultiTokenManager {
             // 注意：RPM 记账不在这里做——由 provider 在 HTTP 请求成功发出后调用
             // record_request_for_rpm，连接失败（请求未到达上游）的轮次不占 RPM 槽位。
             match self.try_ensure_token(id, &credentials, inflight).await {
-                Ok(ctx) => return Ok(ctx),
+                Ok(mut ctx) => {
+                    ctx.preferred_spilled = spilled;
+                    return Ok(ctx);
+                }
                 Err(e) => {
                     // 失败路径：inflight guard 已随 try_ensure_token 的入参 move 进去，
                     // 错误返回时在该函数内 Drop（-1），不会泄漏到下一轮重试。
@@ -1880,6 +1909,7 @@ impl MultiTokenManager {
                 credentials: credentials.clone(),
                 token,
                 inflight,
+                preferred_spilled: false,
             });
         }
 
@@ -1972,6 +2002,7 @@ impl MultiTokenManager {
             credentials: creds,
             token,
             inflight,
+            preferred_spilled: false,
         })
     }
 
@@ -5016,6 +5047,169 @@ mod tests {
         // preferred=1 已达并发上限 → 泄压阀回落普通选号，spill 到闲置的 id=2。
         let ctx = manager.acquire_context(None, Some(1)).await.unwrap();
         assert_eq!(ctx.id, 2, "preferred 达并发上限 → spill 到 id=2");
+    }
+
+    // ---- 粘性绑定的 RPM 泄压阀：preferred RPM 窗口已满时 spill 到其它凭据 ----
+
+    #[tokio::test]
+    async fn sticky_preferred_honored_when_rpm_below_limit() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.default_rpm_limit = Some(2);
+        let manager = MultiTokenManager::new(
+            config,
+            vec![mk_api_cred("k1"), mk_api_cred("k2")],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // id=1 窗口内 1 次 < 2：preferred 应被命中（正常粘性）。
+        {
+            let mut entries = manager.entries.lock();
+            let e1 = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            e1.rpm_window.push_back(Utc::now());
+        }
+        let ctx = manager.acquire_context(None, Some(1)).await.unwrap();
+        assert_eq!(ctx.id, 1, "preferred RPM 未满 → 命中绑定凭据 id=1");
+    }
+
+    #[tokio::test]
+    async fn sticky_preferred_spills_when_rpm_exhausted() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.default_rpm_limit = Some(2);
+        let manager = MultiTokenManager::new(
+            config,
+            vec![mk_api_cred("k1"), mk_api_cred("k2")],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // 把 id=1 的 RPM 窗口填满（60s 内 2 条 = 上限）。
+        {
+            let mut entries = manager.entries.lock();
+            let e1 = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            let now = Utc::now();
+            e1.rpm_window.push_back(now);
+            e1.rpm_window.push_back(now);
+        }
+
+        // preferred=1 RPM 已耗尽 → 泄压阀回落普通选号，spill 到闲置的 id=2。
+        let ctx = manager.acquire_context(None, Some(1)).await.unwrap();
+        assert_eq!(ctx.id, 2, "preferred RPM 窗口已满 → spill 到 id=2");
+    }
+
+    #[tokio::test]
+    async fn sticky_preferred_rpm_window_slides_out() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.default_rpm_limit = Some(2);
+        let manager = MultiTokenManager::new(
+            config,
+            vec![mk_api_cred("k1"), mk_api_cred("k2")],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // 窗口里塞 2 条已超 60s 的旧时间戳：不计入 RPM，preferred 正常命中。
+        {
+            let mut entries = manager.entries.lock();
+            let e1 = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            let old = Utc::now() - Duration::seconds(RPM_WINDOW_SECS + 5);
+            e1.rpm_window.push_back(old);
+            e1.rpm_window.push_back(old);
+        }
+        let ctx = manager.acquire_context(None, Some(1)).await.unwrap();
+        assert_eq!(ctx.id, 1, "窗口外旧记录不占 RPM → 仍命中 preferred");
+    }
+
+    // ---- 泄压 spill 的记账标记 preferred_spilled ----
+
+    #[tokio::test]
+    async fn sticky_valve_spill_sets_preferred_spilled_flag() {
+        // 回归：RPM 泄压 spill 到他号时，CallContext.preferred_spilled 必须为 true，
+        // 供 handlers 抑制误改绑（否则持续高频身份每分钟触发 rebind 抖动）。
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.default_rpm_limit = Some(2);
+        let manager = MultiTokenManager::new(
+            config,
+            vec![mk_api_cred("k1"), mk_api_cred("k2")],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        {
+            let mut entries = manager.entries.lock();
+            let e1 = entries.iter_mut().find(|e| e.id == 1).unwrap();
+            let now = Utc::now();
+            e1.rpm_window.push_back(now);
+            e1.rpm_window.push_back(now);
+        }
+
+        let ctx = manager.acquire_context(None, Some(1)).await.unwrap();
+        assert_eq!(ctx.id, 2, "preferred RPM 满 → spill 到闲置 id=2");
+        assert!(ctx.preferred_spilled, "泄压 spill 必须标记 preferred_spilled");
+    }
+
+    #[tokio::test]
+    async fn sticky_preferred_hit_not_marked_spilled() {
+        // 正常命中 preferred（阀门未触发）→ 不得标记 spilled。
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        let manager = MultiTokenManager::new(
+            config,
+            vec![mk_api_cred("k1"), mk_api_cred("k2")],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let ctx = manager.acquire_context(None, Some(1)).await.unwrap();
+        assert_eq!(ctx.id, 1, "阀门未触发 → 命中 preferred");
+        assert!(!ctx.preferred_spilled, "正常命中不得标记 spilled");
+    }
+
+    #[tokio::test]
+    async fn sticky_preferred_honored_when_no_fresh_alternative() {
+        // 联动（Part B）：preferred RPM 满、但**无其它鲜活凭据**（id=2 也满）时，
+        // 泄压只会落到同样饱和的冷凭据——不如仍钉 preferred 保住暖缓存，且不标 spilled。
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.default_rpm_limit = Some(2);
+        let manager = MultiTokenManager::new(
+            config,
+            vec![mk_api_cred("k1"), mk_api_cred("k2")],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        {
+            let mut entries = manager.entries.lock();
+            let now = Utc::now();
+            for e in entries.iter_mut() {
+                e.rpm_window.push_back(now);
+                e.rpm_window.push_back(now);
+            }
+        }
+
+        let ctx = manager.acquire_context(None, Some(1)).await.unwrap();
+        assert_eq!(ctx.id, 1, "无鲜活替补 → 仍钉 preferred（不泄压到冷饱和号）");
+        assert!(
+            !ctx.preferred_spilled,
+            "未泄压（钉回 preferred）→ 不得标记 spilled"
+        );
     }
 
     // ---- 粘性绑定候选池收窄到最高优先级档 ----

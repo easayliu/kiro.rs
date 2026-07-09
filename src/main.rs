@@ -328,7 +328,9 @@ async fn main() {
 
     // 后台清理粘性绑定表：定期回收长时间未活跃的 device→凭证绑定，
     // 防止 binding_table 随独立 device 数只增不减（绑定仅内存维护，无此清理会
-    // 随运行时长无界增长）。空闲超过 STALE_IDLE 的绑定下次请求会重新选凭证。
+    // 随运行时长无界增长）。本任务只做内存回收：空闲超过 COLD_IDLE（75 分钟，
+    // 见 binding.rs）的绑定在回流时就会被 resolve 按当前负载重新放置，
+    // 不依赖此处的清理时机。
     {
         let binding_table = app_state.binding_table.clone();
         tokio::spawn(async move {
