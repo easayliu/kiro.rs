@@ -109,11 +109,11 @@ impl CredentialStore {
                 value INTEGER NOT NULL
             ) STRICT;
 
-            -- 播种取号器（幂等）：老库首次升级取现存最大 id + 1；升级前已删除的
-            -- 高位 id 无从得知，可能被复用一次，此后永不复用。
-            INSERT INTO meta (key, value)
-            SELECT 'next_credential_id', COALESCE(MAX(id), 0) + 1 FROM credentials
-            WHERE NOT EXISTS (SELECT 1 FROM meta WHERE key = 'next_credential_id');",
+            -- 播种取号器（幂等，OR IGNORE 靠主键去重——聚合 SELECT 恒输出一行，
+            -- WHERE NOT EXISTS 挡不住）：老库首次升级取现存最大 id + 1；升级前已
+            -- 删除的高位 id 无从得知，可能被复用一次，此后永不复用。
+            INSERT OR IGNORE INTO meta (key, value)
+            SELECT 'next_credential_id', COALESCE(MAX(id), 0) + 1 FROM credentials;",
         )
         .context("初始化凭据库 schema 失败")?;
 
@@ -702,6 +702,20 @@ mod tests {
         // floor 领先取号器（内存领先于库的边界）→ 尊重 floor
         assert_eq!(s.alloc_id(10).unwrap(), 10);
         assert_eq!(s.alloc_id(1).unwrap(), 11);
+    }
+
+    #[test]
+    fn init_schema_idempotent_across_restarts() {
+        let s = store();
+        s.upsert(&oauth(1, "rt-1")).unwrap();
+        assert_eq!(s.alloc_id(2).unwrap(), 2);
+        // 模拟重启：同库再跑 init_schema，必须幂等成功且不重播种（取号器值保持 3）
+        {
+            let conn = s.conn.lock();
+            CredentialStore::init_schema(&conn).unwrap();
+            CredentialStore::init_schema(&conn).unwrap();
+        }
+        assert_eq!(s.alloc_id(1).unwrap(), 3);
     }
 
     #[test]
