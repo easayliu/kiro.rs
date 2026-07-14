@@ -99,10 +99,12 @@ pub async fn responses_nonstream(resp: Response, id: String, model: String, crea
         "output": output_items,
         "usage": {
             "input_tokens": input_total,
-            "input_tokens_details": { "cached_tokens": cache_read },
+            "input_tokens_details": {
+                "cached_tokens": cache_read,
+                "cache_write_tokens": cache_write,
+            },
             "output_tokens": out_tok,
             "total_tokens": input_total + out_tok,
-            "cache_write_tokens": cache_write,
         },
     });
     json_response(StatusCode::OK, &out)
@@ -513,10 +515,12 @@ impl RespStreamState {
                     "model": self.model, "status": "completed", "output": output,
                     "usage": {
                         "input_tokens": input_total,
-                        "input_tokens_details": { "cached_tokens": cache_read },
+                        "input_tokens_details": {
+                            "cached_tokens": cache_read,
+                            "cache_write_tokens": cache_write
+                        },
                         "output_tokens": out_tok,
-                        "total_tokens": input_total + out_tok,
-                        "cache_write_tokens": cache_write
+                        "total_tokens": input_total + out_tok
                     }
                 }
             }),

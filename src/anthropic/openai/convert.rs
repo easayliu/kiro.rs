@@ -202,6 +202,11 @@ pub fn responses_request_to_anthropic(req: &Value) -> Result<Value, String> {
 /// 断点会把 system + 全部在先内容纳入可缓存前缀。多轮对话中每轮在自身末尾落一个
 /// 断点，下一轮即命中到该断点为止的前缀（cache_read），新增部分记 cache_creation，
 /// 与 OpenAI 自动缓存行为一致。小于 min-cacheable 的前缀由 cache_tracker 自然忽略。
+///
+/// TTL 用 `1h`：OpenAI GPT-5.6 缓存保底存活 ≥30 分钟（官方文档，`ttl` 唯一值 30m，
+/// 是最小时长非上限）。Anthropic 无 30m 档，取 1h 覆盖该保底窗口，避免 5m 默认档
+/// 过早判过期、在 5~30 分钟间隔时误报未命中。GPT 的 1h 缓存写计价按 1.25×
+/// （见 `official_price_usd` 的 GPT 分支），不套 Anthropic 的 2×。
 pub fn inject_auto_cache_breakpoint(anthropic: &mut Value) {
     let Some(msgs) = anthropic.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
@@ -217,7 +222,7 @@ pub fn inject_auto_cache_breakpoint(anthropic: &mut Value) {
     }
     if let Some(arr) = content.as_array_mut() {
         if let Some(last_block) = arr.last_mut() {
-            last_block["cache_control"] = json!({ "type": "ephemeral" });
+            last_block["cache_control"] = json!({ "type": "ephemeral", "ttl": "1h" });
         }
     }
 }
@@ -399,12 +404,15 @@ pub fn map_usage(anthropic_usage: &Value) -> Value {
         .and_then(Value::as_i64)
         .unwrap_or(0);
     let prompt_tokens = inp + cache_read + cache_write;
+    // cache_write_tokens 置于 prompt_tokens_details 内，对齐 OpenAI Chat Completions 官方结构。
     json!({
         "prompt_tokens": prompt_tokens,
         "completion_tokens": out,
         "total_tokens": prompt_tokens + out,
-        "prompt_tokens_details": { "cached_tokens": cache_read },
-        "cache_write_tokens": cache_write,
+        "prompt_tokens_details": {
+            "cached_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+        },
     })
 }
 
@@ -501,7 +509,8 @@ mod tests {
         assert_eq!(u["completion_tokens"], 5);
         assert_eq!(u["total_tokens"], 134);
         assert_eq!(u["prompt_tokens_details"]["cached_tokens"], 100);
-        assert_eq!(u["cache_write_tokens"], 20);
+        assert_eq!(u["prompt_tokens_details"]["cache_write_tokens"], 20);
+        assert!(u.get("cache_write_tokens").is_none(), "不应再有顶层 cache_write_tokens");
     }
 
     #[test]
@@ -536,6 +545,8 @@ mod tests {
         let last = msgs.last().unwrap();
         let last_block = last["content"].as_array().unwrap().last().unwrap();
         assert_eq!(last_block["cache_control"]["type"], "ephemeral");
+        // TTL 1h：覆盖 OpenAI ≥30min 保底窗口
+        assert_eq!(last_block["cache_control"]["ttl"], "1h");
         // 仍能被内部类型反序列化（cache_control 合法）
         let _mr: MessagesRequest = serde_json::from_value(a).unwrap();
     }

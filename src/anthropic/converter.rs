@@ -380,10 +380,12 @@ pub fn official_price_usd(
     output: i32,
 ) -> f64 {
     let (input_rate, output_rate) = model_price_per_mtok(model);
+    // GPT-5.6 官方缓存写统一 1.25×（无 1h/2× 概念，仅 30m 保底档）；Claude 1h 写为 2×。
+    let cache_1h_mult = if model_is_gpt(model) { 1.25 } else { 2.0 };
     let cost = uncached_input.max(0) as f64 * input_rate
         + cache_read.max(0) as f64 * input_rate * 0.1
         + cache_creation_5m.max(0) as f64 * input_rate * 1.25
-        + cache_creation_1h.max(0) as f64 * input_rate * 2.0
+        + cache_creation_1h.max(0) as f64 * input_rate * cache_1h_mult
         + output.max(0) as f64 * output_rate;
     let usd = cost / 1_000_000.0;
     (usd * 1_000_000.0).round() / 1_000_000.0
@@ -2710,6 +2712,10 @@ mod tests {
         // 缓存：Sol cached input = 0.1 × $5 = $0.50；cache write(5m) = 1.25 × $5 = $6.25。
         assert!((official_price_usd("gpt-5.6-sol", 0, 1_000_000, 0, 0, 0) - 0.50).abs() < 1e-9);
         assert!((official_price_usd("gpt-5.6-sol", 0, 0, 1_000_000, 0, 0) - 6.25).abs() < 1e-9);
+        // GPT 1h 缓存写也按 1.25×（非 Claude 的 2×）：Terra 1h 写 = 1.25 × $2.5 = $3.125。
+        assert!((official_price_usd("gpt-5.6-terra", 0, 0, 0, 1_000_000, 0) - 3.125).abs() < 1e-9);
+        // 对照：Claude 1h 写仍为 2×（$5 → $10）。
+        assert!((official_price_usd("claude-opus-4-8", 0, 0, 0, 1_000_000, 0) - 10.0).abs() < 1e-9);
     }
 
     /// 输出倍率：未启用透传；启用后四舍五入并保底 1；关闭可还原。
