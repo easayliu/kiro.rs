@@ -25,9 +25,10 @@
 mod billing_stats;
 mod cache_tracker;
 mod converter;
-mod handlers;
+pub(crate) mod handlers;
 mod injection_scan;
-mod middleware;
+pub(crate) mod middleware;
+mod openai;
 mod router;
 mod stream;
 pub mod types;

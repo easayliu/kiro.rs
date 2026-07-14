@@ -643,6 +643,16 @@ pub async fn post_messages(
     Extension(RequestId(request_id)): Extension<RequestId>,
     JsonExtractor(payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    handle_messages(state, request_id, payload).await
+}
+
+/// 内层消息处理：供 Anthropic `/v1/messages` 与 OpenAI 适配层
+/// （`/v1/chat/completions`、`/v1/responses`）复用同一套凭证/缓存/计费/流转换管线。
+pub(crate) async fn handle_messages(
+    state: AppState,
+    request_id: String,
+    payload: MessagesRequest,
+) -> Response {
     // 关联 id 由 request_id_middleware 注入：优先沿用上游（newapi）带来的 request-id。
     tracing::debug!(
         request_id = %request_id,

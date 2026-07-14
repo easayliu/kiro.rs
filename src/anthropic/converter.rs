@@ -139,11 +139,23 @@ fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
 /// - opus 4.5/4-5 → claude-opus-4.5
 /// - 其他 opus → claude-opus-4.6
 /// - 所有 haiku → claude-haiku-4.5
+/// - gpt → gpt-5.6-{sol|terra|luna}（上游 2026-07 上线，272K 上下文 / 128K 输出，
+///   透传上游 id 不兜底：按名字里的 sol/terra/luna 精确路由，裸 "gpt" 默认 terra（1.2× 均衡档）
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
     if model_lower.contains("fable") {
         Some("claude-opus-4.8".to_string())
+    } else if model_lower.contains("gpt") {
+        // 三档：sol（2.4× 旗舰）/ terra（1.2× 均衡）/ luna（0.6× 轻量）。名字里带哪档取哪档，
+        // 裸 "gpt" 默认 terra。上游 modelId 直接透传，不做世代兜底。
+        if model_lower.contains("sol") {
+            Some("gpt-5.6-sol".to_string())
+        } else if model_lower.contains("luna") {
+            Some("gpt-5.6-luna".to_string())
+        } else {
+            Some("gpt-5.6-terra".to_string())
+        }
     } else if model_lower.contains("sonnet") {
         if model_lower.contains("sonnet-5") || model_lower.contains("sonnet5") {
             Some("claude-sonnet-5".to_string())
@@ -331,8 +343,12 @@ pub fn credit_to_usd(credit: f64) -> f64 {
 
 /// 模型官方价（USD / MTok）：`(base_input, output)`。
 ///
-/// 数据来自 Anthropic 官方 pricing（platform.claude.com/docs ... pricing）。
-/// cache 价由固定倍率派生：5m 写 = 1.25× base input，1h 写 = 2×，cache 读 = 0.1×。
+/// Claude 数据来自 Anthropic 官方 pricing（platform.claude.com/docs ... pricing）。
+/// GPT-5.6 三档来自 OpenAI 官方 pricing（developers.openai.com/api/docs/pricing，GA 2026-07-09）：
+/// Sol 5/30、Terra 2.5/15、Luna 1/6（USD/MTok，均 output=6×input）。
+/// cache 价由固定倍率派生：5m 写 = 1.25× base input，1h 写 = 2×，cache 读 = 0.1×
+/// （OpenAI 官方实测：GPT-5.6 cached input=0.1×、cache write=1.25×，与此一致；
+///  GPT 无 1h 档，仅在 cache_creation_1h>0 时才触发 2×）。
 /// 1M 上下文为标准价无溢价。未知模型按 Sonnet 兜底。
 fn model_price_per_mtok(model: &str) -> (f64, f64) {
     match map_model(model).as_deref() {
@@ -344,6 +360,9 @@ fn model_price_per_mtok(model: &str) -> (f64, f64) {
             (3.0, 15.0)
         }
         Some("claude-haiku-4.5") => (1.0, 5.0),
+        Some("gpt-5.6-sol") => (5.0, 30.0),
+        Some("gpt-5.6-terra") => (2.5, 15.0),
+        Some("gpt-5.6-luna") => (1.0, 6.0),
         _ => (3.0, 15.0),
     }
 }
@@ -389,6 +408,8 @@ fn window_size_for(model: &str, dynamic: &HashMap<String, i32>) -> i32 {
         | Some("claude-opus-4.6")
         | Some("claude-opus-4.7")
         | Some("claude-opus-4.8") => 1_000_000,
+        // GPT 5.6 三档均为 272K 输入窗口（上游 ListAvailableModels 实测）。
+        Some("gpt-5.6-sol") | Some("gpt-5.6-terra") | Some("gpt-5.6-luna") => 272_000,
         _ => 200_000,
     }
 }
@@ -1501,6 +1522,12 @@ fn model_supports_thinking(model: &str) -> bool {
     )
 }
 
+/// 归一化后是否为 GPT 系列（gpt-5.6-*）。GPT 用与 Claude 不同的
+/// `additionalModelRequestFields` schema（`reasoning` 而非 `thinking`/`output_config`）。
+fn model_is_gpt(model: &str) -> bool {
+    map_model(model).as_deref().is_some_and(|m| m.starts_with("gpt-"))
+}
+
 fn build_additional_model_request_fields(req: &MessagesRequest) -> Option<serde_json::Value> {
     let t = req.thinking.as_ref()?;
     // 新 Kiro runtime 端点实测：`thinking.type` 仅接受枚举 ["adaptive","disabled"]，
@@ -1509,15 +1536,23 @@ fn build_additional_model_request_fields(req: &MessagesRequest) -> Option<serde_
     if !t.is_enabled() {
         return None;
     }
-    // 模型不支持 thinking 时不下发该字段（否则上游 400）。
-    if !model_supports_thinking(&req.model) {
-        return None;
-    }
     let effort = req
         .output_config
         .as_ref()
         .map(|c| c.effort.as_str())
         .unwrap_or("high");
+    // GPT 系列：schema 为 `{"reasoning":{"mode":"standard|pro","effort":<enum>}}`
+    // （上游 ListAvailableModels 实测；effort 枚举 none/low/medium/high/xhigh/max 与 Anthropic
+    // OutputConfig 兼容，直接透传）。mode 用默认 standard，故只下发 effort。
+    if model_is_gpt(&req.model) {
+        return Some(serde_json::json!({
+            "reasoning": { "effort": effort },
+        }));
+    }
+    // 模型不支持 thinking 时不下发该字段（否则上游 400）。
+    if !model_supports_thinking(&req.model) {
+        return None;
+    }
     Some(serde_json::json!({
         "thinking": { "type": "adaptive", "display": "summarized" },
         "output_config": { "effort": effort },
@@ -2487,7 +2522,56 @@ mod tests {
 
     #[test]
     fn test_map_model_unsupported() {
-        assert!(map_model("gpt-4").is_none());
+        // 完全无法识别的模型名仍返回 None（不兜底）。
+        assert!(map_model("totally-unknown-model").is_none());
+        assert!(map_model("llama-3").is_none());
+    }
+
+    #[test]
+    fn test_map_model_gpt() {
+        // gpt 系列按 sol/terra/luna 精确路由，裸 "gpt" 默认 terra。
+        assert_eq!(map_model("gpt-5.6-sol"), Some("gpt-5.6-sol".to_string()));
+        assert_eq!(map_model("gpt-5.6-terra"), Some("gpt-5.6-terra".to_string()));
+        assert_eq!(map_model("gpt-5.6-luna"), Some("gpt-5.6-luna".to_string()));
+        assert_eq!(map_model("gpt-4"), Some("gpt-5.6-terra".to_string()));
+        assert_eq!(map_model("GPT-5.6-Sol"), Some("gpt-5.6-sol".to_string()));
+    }
+
+    #[test]
+    fn test_gpt_context_window() {
+        assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
+        assert_eq!(get_context_window_size("gpt-5.6-terra"), 272_000);
+        assert_eq!(get_context_window_size("gpt-5.6-luna"), 272_000);
+    }
+
+    #[test]
+    fn test_gpt_reasoning_field() {
+        use super::super::types::Thinking;
+        // GPT thinking 请求下发 `reasoning`（而非 Claude 的 thinking/output_config）。
+        let mut req = req_with_thinking(
+            Some(Thinking { thinking_type: "enabled".to_string(), budget_tokens: 20000 }),
+            Some("xhigh"),
+        );
+        req.model = "gpt-5.6-sol".to_string();
+        let fields = build_additional_model_request_fields(&req).expect("GPT 应下发 reasoning 字段");
+        assert_eq!(
+            fields,
+            serde_json::json!({ "reasoning": { "effort": "xhigh" } }),
+        );
+
+        // 无 output_config 时 effort 回退 high。
+        let mut req2 = req_with_thinking(
+            Some(Thinking { thinking_type: "adaptive".to_string(), budget_tokens: 20000 }),
+            None,
+        );
+        req2.model = "gpt-5.6-terra".to_string();
+        let fields2 = build_additional_model_request_fields(&req2).unwrap();
+        assert_eq!(fields2["reasoning"]["effort"], "high");
+
+        // 不带 thinking 时不下发字段（上游默认 effort=high）。
+        let mut req3 = req_with_thinking(None, None);
+        req3.model = "gpt-5.6-luna".to_string();
+        assert!(build_additional_model_request_fields(&req3).is_none());
     }
 
     #[test]
@@ -2611,6 +2695,21 @@ mod tests {
         assert!((official_price_usd("claude-opus-4-8", 0, 0, 0, 1_000_000, 0) - 10.0).abs() < 1e-9);
         // Haiku cache 读 = 0.1 × $1 = $0.10 / MTok。
         assert!((official_price_usd("claude-haiku-4-5", 0, 1_000_000, 0, 0, 0) - 0.10).abs() < 1e-9);
+    }
+
+    /// GPT-5.6 三档官方价（OpenAI 官方 pricing）：input/output 与缓存倍率。
+    #[test]
+    fn official_price_gpt_5_6_tiers() {
+        // Sol 5/30，Terra 2.5/15，Luna 1/6（USD/MTok）。
+        assert!((official_price_usd("gpt-5.6-sol", 1_000_000, 0, 0, 0, 0) - 5.0).abs() < 1e-9);
+        assert!((official_price_usd("gpt-5.6-sol", 0, 0, 0, 0, 1_000_000) - 30.0).abs() < 1e-9);
+        assert!((official_price_usd("gpt-5.6-terra", 1_000_000, 0, 0, 0, 0) - 2.5).abs() < 1e-9);
+        assert!((official_price_usd("gpt-5.6-terra", 0, 0, 0, 0, 1_000_000) - 15.0).abs() < 1e-9);
+        assert!((official_price_usd("gpt-5.6-luna", 1_000_000, 0, 0, 0, 0) - 1.0).abs() < 1e-9);
+        assert!((official_price_usd("gpt-5.6-luna", 0, 0, 0, 0, 1_000_000) - 6.0).abs() < 1e-9);
+        // 缓存：Sol cached input = 0.1 × $5 = $0.50；cache write(5m) = 1.25 × $5 = $6.25。
+        assert!((official_price_usd("gpt-5.6-sol", 0, 1_000_000, 0, 0, 0) - 0.50).abs() < 1e-9);
+        assert!((official_price_usd("gpt-5.6-sol", 0, 0, 1_000_000, 0, 0) - 6.25).abs() < 1e-9);
     }
 
     /// 输出倍率：未启用透传；启用后四舍五入并保底 1；关闭可还原。
