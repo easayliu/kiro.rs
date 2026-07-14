@@ -300,6 +300,9 @@ fn injected_floor_hardcoded(model: &str) -> Option<i32> {
         Some("claude-opus-4.5") | Some("claude-sonnet-4.5") | Some("claude-haiku-4.5") => {
             Some(4100)
         }
+        // GPT-5.6 三档：裸请求实测注入地板 ≈1592（6 样本 ±1；远小于 6500 兜底）。
+        // env_state 瞬时波动可让真实注入略高，strip_injected_prompt 的 .max(local) 钳制兜底。
+        Some("gpt-5.6-sol") | Some("gpt-5.6-terra") | Some("gpt-5.6-luna") => Some(1592),
         _ => None,
     }
 }
@@ -2465,6 +2468,12 @@ mod tests {
         // 低地板模型用各自实测值，不受 6500 全局基线影响。
         assert_eq!(effective_injected_floor("claude-sonnet-4.6"), 4109);
         assert_eq!(strip_injected_prompt("claude-sonnet-4.6", 4109 + 500, 480), 500);
+        // GPT-5.6 三档：实测地板 1592（远小于 6500 兜底），扣 1592 得真实内容。
+        assert_eq!(effective_injected_floor("gpt-5.6-terra"), 1592);
+        assert_eq!(effective_injected_floor("gpt-5.6-sol"), 1592);
+        assert_eq!(effective_injected_floor("gpt-5.6-luna"), 1592);
+        assert_eq!(effective_injected_floor("gpt-4"), 1592); // 归一化到 terra
+        assert_eq!(strip_injected_prompt("gpt-5.6-terra", 1592 + 800, 750), 800);
         // 未实测模型回退全局基线 6500。
         assert_eq!(effective_injected_floor("brand-new-model"), 6500);
 
