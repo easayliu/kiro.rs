@@ -1254,10 +1254,12 @@ struct StreamStats {
     start: Instant,
     bytes: usize,
     frames: usize,
-    /// 是否见过 meteringEvent（计费事件，上游生成全部完成后才发，是最可靠的收尾信号）
+    /// 是否见过 meteringEvent（计费事件，上游生成全部完成后才发，是可靠的收尾信号）
     saw_metering: bool,
     /// 是否见过 contextUsageEvent（上下文用量，同样在流末尾）
     saw_context_usage: bool,
+    /// 是否见过 metadataEvent（上游权威收笔信号，比 metering 更早、更可靠）
+    saw_metadata: bool,
 }
 
 impl StreamStats {
@@ -1268,6 +1270,7 @@ impl StreamStats {
             frames: 0,
             saw_metering: false,
             saw_context_usage: false,
+            saw_metadata: false,
         }
     }
 
@@ -1276,6 +1279,7 @@ impl StreamStats {
         match event {
             Event::Metering(_) => self.saw_metering = true,
             Event::ContextUsage(_) => self.saw_context_usage = true,
+            Event::Metadata(_) => self.saw_metadata = true,
             _ => {}
         }
     }
@@ -1379,9 +1383,11 @@ fn create_sse_stream(
                             // is_timeout=true + elapsed≈720s → reqwest 总超时；
                             // is_decode=true + "close_notify" → 上游/代理中途关 TLS 连接。
                             // likely_complete 用于区分"真截断"与"rustls 缺 close_notify 误判"：
-                            //   收到 meteringEvent 且解码器无残留 → 响应其实已完整，换 native-tls 即可消除该错误。
+                            //   收到 metadataEvent(权威收笔)或 meteringEvent 且解码器无残留 →
+                            //   响应其实已完整，换 native-tls 即可消除该错误。
                             let pending = decoder.pending_bytes();
-                            let likely_complete = stats.saw_metering && pending == 0;
+                            let likely_complete =
+                                (stats.saw_metadata || stats.saw_metering) && pending == 0;
                             tracing::error!(
                                 model = %ctx.model,
                                 is_timeout = e.is_timeout(),
@@ -1392,6 +1398,7 @@ fn create_sse_stream(
                                 bytes = stats.bytes,
                                 frames = stats.frames,
                                 pending_bytes = pending,
+                                saw_metadata = stats.saw_metadata,
                                 saw_metering = stats.saw_metering,
                                 saw_context_usage = stats.saw_context_usage,
                                 likely_complete = likely_complete,
@@ -1415,11 +1422,11 @@ fn create_sse_stream(
                         }
                         None => {
                             // 流结束（上游 EOF）。按「传输层如何终止」分类，避免把"干净收尾但
-                            // 漏发 metering"误判成截断（上游无显式完成事件，metering 缺失只是弱信号）：
-                            //   pending_bytes>0           → 切在半个帧中间 = 真截断（传输层铁证）；
-                            //   pending==0 && !metering    → 已收到协议结束符、解码器无残留 = 传输完整，
-                            //                                仅上游漏发 meteringEvent，内容应完整（非截断）；
-                            //   pending==0 && metering     → 正常完成。
+                            // 漏发收尾事件"误判成截断（metadata/metering 缺失只是弱信号）：
+                            //   pending_bytes>0                     → 切在半个帧中间 = 真截断（传输层铁证）；
+                            //   pending==0 && !metadata && !metering → 已收到协议结束符、解码器无残留 =
+                            //                                          传输完整，仅上游漏发收尾事件，内容应完整（非截断）；
+                            //   pending==0 && (metadata || metering) → 正常完成（metadata 是权威收笔信号）。
                             let pending = decoder.pending_bytes();
                             if pending > 0 {
                                 tracing::warn!(
@@ -1429,23 +1436,25 @@ fn create_sse_stream(
                                     bytes = stats.bytes,
                                     frames = stats.frames,
                                     pending_bytes = pending,
+                                    saw_metadata = stats.saw_metadata,
                                     saw_metering = stats.saw_metering,
                                     saw_context_usage = stats.saw_context_usage,
                                     output_tokens = ctx.output_tokens,
                                     "输出被截断：流在事件帧中间中断（解码器残留半帧），客户端会拿到半截回复，已发 error 事件触发重试"
                                 );
-                            } else if !stats.saw_metering {
+                            } else if !stats.saw_metadata && !stats.saw_metering {
                                 tracing::warn!(
                                     model = %ctx.model,
-                                    termination = "clean_eof_no_metering",
+                                    termination = "clean_eof_no_terminal_event",
                                     elapsed_secs = stats.start.elapsed().as_secs_f64(),
                                     bytes = stats.bytes,
                                     frames = stats.frames,
                                     pending_bytes = pending,
+                                    saw_metadata = stats.saw_metadata,
                                     saw_metering = stats.saw_metering,
                                     saw_context_usage = stats.saw_context_usage,
                                     output_tokens = ctx.output_tokens,
-                                    "流已规整结束（收到协议结束符、无残留半帧）但上游漏发 meteringEvent：传输完整、内容应完整，仅计费元数据缺失（非截断）"
+                                    "流已规整结束（收到协议结束符、无残留半帧）但上游既无 metadataEvent 也无 meteringEvent：传输完整、内容应完整，仅收尾元数据缺失（非截断）"
                                 );
                             } else {
                                 // 计费汇总由 generate_final_events 的「请求完成（流式）」承担；
@@ -1463,6 +1472,8 @@ fn create_sse_stream(
                                         frames = stats.frames,
                                         frames_decoded = decoder.frames_decoded(),
                                         bytes_skipped = skipped,
+                                        saw_metadata = stats.saw_metadata,
+                                        saw_metering = stats.saw_metering,
                                         output_tokens = ctx.output_tokens,
                                         "上游流干净结束但解码期间跳过过字节/帧（CRC/帧长错误）：下游可能丢了事件帧，疑似代理侧截断而非模型收笔"
                                     );
@@ -1474,6 +1485,8 @@ fn create_sse_stream(
                                         bytes = stats.bytes,
                                         frames = stats.frames,
                                         bytes_skipped = skipped,
+                                        saw_metadata = stats.saw_metadata,
+                                        saw_metering = stats.saw_metering,
                                         output_tokens = ctx.output_tokens,
                                         "上游流正常结束（EOF）"
                                     );
@@ -1585,6 +1598,9 @@ async fn handle_non_stream_request(
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
+    // metadataEvent 映射来的上游权威 stop_reason；收尾时在无本地安全覆盖、无 tool_use
+    // 时取代盲猜的默认 end_turn。
+    let mut upstream_stop_reason: Option<String> = None;
     // contextUsageEvent 算出的上游实际输入 token 总量（含注入的 system prompt）。
     // 用于计费时重算未缓存 token，比基于用户请求的估算更贴近上游真实用量。
     let mut context_input_tokens: Option<i32> = None;
@@ -1679,6 +1695,17 @@ async fn handle_non_stream_request(
                         Event::Metering(metering) => {
                             upstream_credit = Some(metering.usage);
                         }
+                        Event::Metadata(metadata) => {
+                            // 上游权威收笔信号：每次都打印 stopReason，便于观察漏发。
+                            tracing::info!(
+                                model = %model,
+                                stop_reason = ?metadata.stop_reason,
+                                "收到 metadataEvent（上游收笔信号，非流式）"
+                            );
+                            if let Some(mapped) = metadata.anthropic_stop_reason() {
+                                upstream_stop_reason = Some(mapped);
+                            }
+                        }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
@@ -1694,9 +1721,15 @@ async fn handle_non_stream_request(
         }
     }
 
-    // 确定 stop_reason
-    if has_tool_use && stop_reason == "end_turn" {
-        stop_reason = "tool_use".to_string();
+    // 确定 stop_reason。stop_reason != "end_turn" 表示已有本地安全覆盖（截断/窗口超限），
+    // 优先级最高、保持不动；否则 tool_use 结构事实优先，再否则用上游权威 stopReason，
+    // 最后才是默认 end_turn。与流式 get_stop_reason 的优先级一致。
+    if stop_reason == "end_turn" {
+        if has_tool_use {
+            stop_reason = "tool_use".to_string();
+        } else if let Some(upstream) = upstream_stop_reason {
+            stop_reason = upstream;
+        }
     }
 
     // 构建响应内容

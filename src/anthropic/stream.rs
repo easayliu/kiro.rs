@@ -380,8 +380,12 @@ pub struct SseStateManager {
     message_ended: bool,
     /// 下一个块索引
     next_block_index: i32,
-    /// 当前 stop_reason
+    /// 本地安全覆盖的 stop_reason（截断→max_tokens、上下文用满→window_exceeded 等），
+    /// 优先级最高，用于保护客户端
     stop_reason: Option<String>,
+    /// 上游 metadataEvent 映射来的权威 stop_reason（END_TURN/MAX_TOKENS/…），
+    /// 优先级低于本地安全覆盖与 tool_use 结构事实，但高于默认 end_turn
+    upstream_stop_reason: Option<String>,
     /// 是否有工具调用
     has_tool_use: bool,
     /// message_delta/final 阶段透传的缓存使用细分
@@ -403,6 +407,7 @@ impl SseStateManager {
             message_ended: false,
             next_block_index: 0,
             stop_reason: None,
+            upstream_stop_reason: None,
             has_tool_use: false,
             final_usage: None,
         }
@@ -432,9 +437,14 @@ impl SseStateManager {
         self.has_tool_use = has;
     }
 
-    /// 设置 stop_reason
+    /// 设置 stop_reason（本地安全覆盖，优先级最高）
     pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
         self.stop_reason = Some(reason.into());
+    }
+
+    /// 设置上游 metadataEvent 映射来的权威 stop_reason
+    pub fn set_upstream_stop_reason(&mut self, reason: impl Into<String>) {
+        self.upstream_stop_reason = Some(reason.into());
     }
 
     /// 检查是否存在非 thinking 类型的内容块（如 text 或 tool_use）
@@ -445,11 +455,17 @@ impl SseStateManager {
     }
 
     /// 获取最终的 stop_reason
+    ///
+    /// 优先级：本地安全覆盖(截断/窗口超限) > tool_use 结构事实(客户端需据此执行工具) >
+    /// 上游权威 stopReason(END_TURN/MAX_TOKENS/…) > 默认 end_turn。
+    /// 上游值只取代过去"盲猜 end_turn"的默认档，不越过安全覆盖与 tool_use。
     pub fn get_stop_reason(&self) -> String {
         if let Some(ref reason) = self.stop_reason {
             reason.clone()
         } else if self.has_tool_use {
             "tool_use".to_string()
+        } else if let Some(ref upstream) = self.upstream_stop_reason {
+            upstream.clone()
         } else {
             "end_turn".to_string()
         }
@@ -907,6 +923,18 @@ impl StreamContext {
             }
             Event::Metering(metering) => {
                 self.upstream_credit = Some(metering.usage);
+                Vec::new()
+            }
+            Event::Metadata(metadata) => {
+                // 上游权威收笔信号：每次都打印 stopReason，便于观察是否有响应漏发此事件。
+                tracing::info!(
+                    model = %self.model,
+                    stop_reason = ?metadata.stop_reason,
+                    "收到 metadataEvent（上游收笔信号）"
+                );
+                if let Some(mapped) = metadata.anthropic_stop_reason() {
+                    self.state_manager.set_upstream_stop_reason(mapped);
+                }
                 Vec::new()
             }
             Event::Error {
