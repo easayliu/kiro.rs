@@ -99,7 +99,21 @@ impl CredentialStore {
                 credential_id INTEGER PRIMARY KEY,
                 success_count INTEGER NOT NULL DEFAULT 0,
                 last_used_at  INTEGER
-            ) STRICT;",
+            ) STRICT;
+
+            -- 库级元数据（目前仅 next_credential_id：持久化单调取号器，删除不回收，
+            -- 保证凭据 id 永不复用——复用会让 request_stats 等按 id 关联的历史错误
+            -- 记录被新凭据「认领」）。
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            ) STRICT;
+
+            -- 播种取号器（幂等）：老库首次升级取现存最大 id + 1；升级前已删除的
+            -- 高位 id 无从得知，可能被复用一次，此后永不复用。
+            INSERT INTO meta (key, value)
+            SELECT 'next_credential_id', COALESCE(MAX(id), 0) + 1 FROM credentials
+            WHERE NOT EXISTS (SELECT 1 FROM meta WHERE key = 'next_credential_id');",
         )
         .context("初始化凭据库 schema 失败")?;
 
@@ -115,6 +129,26 @@ impl CredentialStore {
         let conn = self.conn.lock();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM credentials", [], |r| r.get(0))?;
         Ok(n == 0)
+    }
+
+    /// 分配下一个凭据 id：持久化单调取号器，删除不回收，保证 id 永不复用。
+    ///
+    /// 出号取三者最大：取号器当前值、库内现存最大 id + 1（防 [`migrate_from_json`]
+    /// (Self::migrate_from_json) 等自带 id 的旁路插入把号用到取号器前面）、调用方
+    /// `floor`（调用方已知的最小可用 id，如内存中现存最大 id + 1，防内存领先于库的边界）。
+    pub fn alloc_id(&self, floor: u64) -> anyhow::Result<u64> {
+        let conn = self.conn.lock();
+        let id: i64 = conn
+            .query_row(
+                "UPDATE meta
+                    SET value = MAX(value, (SELECT COALESCE(MAX(id), 0) + 1 FROM credentials), ?1) + 1
+                  WHERE key = 'next_credential_id'
+                  RETURNING value - 1",
+                [floor as i64],
+                |r| r.get(0),
+            )
+            .context("分配凭据 id 失败")?;
+        Ok(id as u64)
     }
 
     /// 载入全部凭据，按 (priority, id) 升序（DB 侧排序，命中 `idx_credentials_priority`）。
@@ -159,17 +193,26 @@ impl CredentialStore {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         {
-            // 删除不在当前集合里的行（反映 admin 删除）。
+            // 删除不在当前集合里的行（反映 admin 删除），并同事务清理这些凭据的
+            // `credential_stats` 残留行（与 [`delete_batch`](Self::delete_batch) 语义一致，
+            // 防止残留统计被日后复用同 id 的凭据「认领」）。
             let keep: Vec<i64> = creds.iter().filter_map(|c| c.id.map(|i| i as i64)).collect();
             let placeholders = keep.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = if keep.is_empty() {
-                "DELETE FROM credentials".to_string()
+            let (sql_creds, sql_stats) = if keep.is_empty() {
+                (
+                    "DELETE FROM credentials".to_string(),
+                    "DELETE FROM credential_stats".to_string(),
+                )
             } else {
-                format!("DELETE FROM credentials WHERE id NOT IN ({placeholders})")
+                (
+                    format!("DELETE FROM credentials WHERE id NOT IN ({placeholders})"),
+                    format!("DELETE FROM credential_stats WHERE credential_id NOT IN ({placeholders})"),
+                )
             };
             let params_ref: Vec<&dyn rusqlite::ToSql> =
                 keep.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
-            tx.execute(&sql, params_ref.as_slice())?;
+            tx.execute(&sql_creds, params_ref.as_slice())?;
+            tx.execute(&sql_stats, params_ref.as_slice())?;
             for cred in creds {
                 upsert_with(&tx, cred)?;
             }
@@ -568,11 +611,16 @@ mod tests {
         let s = store();
         s.upsert(&oauth(1, "rt-1")).unwrap();
         s.upsert(&oauth(2, "rt-2")).unwrap();
+        s.save_credential_stats(&[(1, 9, None), (2, 8, None)]).unwrap();
         // 仅保留 #2
         s.sync_all(&[oauth(2, "rt-2")]).unwrap();
         let all = s.load_all().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, Some(2));
+        // #1 的统计残留行一并清除，#2 的保留（与 delete_batch 语义一致）
+        let stats = s.load_credential_stats().unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].0, 2);
     }
 
     #[test]
@@ -638,6 +686,30 @@ mod tests {
         };
         // 既无 refresh_token 又无 kiro_api_key → 表级 CHECK 拒绝
         assert!(s.upsert(&dead).is_err());
+    }
+
+    #[test]
+    fn alloc_id_never_reuses_deleted_ids() {
+        let s = store();
+        s.upsert(&oauth(1, "rt-1")).unwrap();
+        s.upsert(&oauth(2, "rt-2")).unwrap();
+        // 现存最大 id=2 → 首次取号 3
+        assert_eq!(s.alloc_id(3).unwrap(), 3);
+        s.upsert(&oauth(3, "rt-3")).unwrap();
+        // 删除最大 id 的 #3 后再取号：不回收，出 4 而非复用 3
+        s.delete_batch(&[3]).unwrap();
+        assert_eq!(s.alloc_id(3).unwrap(), 4);
+        // floor 领先取号器（内存领先于库的边界）→ 尊重 floor
+        assert_eq!(s.alloc_id(10).unwrap(), 10);
+        assert_eq!(s.alloc_id(1).unwrap(), 11);
+    }
+
+    #[test]
+    fn alloc_id_covers_bypass_inserts() {
+        let s = store();
+        // migrate_from_json 等旁路自带高位 id 插入后，取号器不落到已占用号段
+        s.upsert(&oauth(7, "rt-7")).unwrap();
+        assert_eq!(s.alloc_id(1).unwrap(), 8);
     }
 
     #[test]

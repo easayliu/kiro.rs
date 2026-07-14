@@ -3426,10 +3426,16 @@ impl MultiTokenManager {
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
         };
 
-        // 4. 分配新 ID
-        let new_id = {
+        // 4. 分配新 ID：走 DB 持久化单调取号器（删除不回收，id 永不复用，防止
+        //    request_stats 等按 id 关联的旧凭据错误历史被新凭据「认领」）。
+        //    内存现存最大 id + 1 作为 floor 兜底；无 store（测试）时退化为纯内存 max + 1。
+        let floor = {
             let entries = self.entries.lock();
             entries.iter().map(|e| e.id).max().unwrap_or(0) + 1
+        };
+        let new_id = match &self.store {
+            Some(store) => store.alloc_id(floor)?,
+            None => floor,
         };
 
         // 5. 设置 ID 并保留用户输入的元数据
