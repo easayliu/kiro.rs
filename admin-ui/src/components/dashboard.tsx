@@ -7,6 +7,7 @@ import {
   Plus,
   Upload,
   FileUp,
+  KeyRound,
   Trash2,
   RotateCcw,
   CheckCircle2,
@@ -39,6 +40,7 @@ import { CredentialCard } from '@/components/credential-card'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
+import { BatchApiKeyImportDialog } from '@/components/batch-api-key-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { ProxyGroupsDialog } from '@/components/proxy-groups-dialog'
@@ -128,6 +130,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
+  const [batchApiKeyImportDialogOpen, setBatchApiKeyImportDialogOpen] = useState(false)
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   // 「详情」一键展开/收起全部：广播给所有卡片（version 每次点击递增触发同步）
@@ -1295,6 +1298,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     <span className="hidden sm:inline">KAM</span>
                   </Button>
                 )}
+                {!readOnly && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setBatchApiKeyImportDialogOpen(true)}
+                    title="批量导入 API Key"
+                    aria-label="批量导入 API Key"
+                    className="shrink-0 gap-1.5 px-2.5 text-xs [&_svg]:size-3.5 sm:px-3"
+                  >
+                    <KeyRound />
+                    <span className="hidden sm:inline">API Key</span>
+                  </Button>
+                )}
 
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
@@ -1713,6 +1729,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       <BalanceDialog credentialId={selectedCredentialId} open={balanceDialogOpen} onOpenChange={setBalanceDialogOpen} onBalanceLoaded={handleBalanceLoaded} />
       <AddCredentialDialog open={addDialogOpen} onOpenChange={setAddDialogOpen} />
       <BatchImportDialog open={batchImportDialogOpen} onOpenChange={setBatchImportDialogOpen} />
+      <BatchApiKeyImportDialog open={batchApiKeyImportDialogOpen} onOpenChange={setBatchApiKeyImportDialogOpen} />
       <KamImportDialog open={kamImportDialogOpen} onOpenChange={setKamImportDialogOpen} />
       <BatchVerifyDialog
         open={verifyDialogOpen}

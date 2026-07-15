@@ -122,9 +122,12 @@ export interface SetConcurrencyLimitRequest {
 
 // 添加凭据请求
 export interface AddCredentialRequest {
-  refreshToken: string
+  /** OAuth（social/idc）凭据必填；API Key 凭据不需要 */
+  refreshToken?: string
   email?: string
-  authMethod?: 'social' | 'idc'
+  authMethod?: 'social' | 'idc' | 'api_key'
+  /** API Key 凭据必填，格式 ksk_xxxxxxxx */
+  kiroApiKey?: string
   clientId?: string
   clientSecret?: string
   priority?: number

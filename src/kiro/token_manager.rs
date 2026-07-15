@@ -3340,6 +3340,36 @@ impl MultiTokenManager {
             }
         }
 
+        // 回写账号名（email）：上游 getUsageLimits 的 userInfo.email 即账号名。
+        // 仅当本地凭据尚无 email 时回填（不覆盖用户手填值），主要惠及未手填 email 的
+        // API Key 凭据——批量导入后验活即可自动带出账号名。
+        if let Some(upstream_email) = usage_limits.email() {
+            let changed = {
+                let mut entries = self.entries.lock();
+                match entries.iter_mut().find(|e| e.id == id) {
+                    Some(entry)
+                        if entry
+                            .credentials
+                            .email
+                            .as_deref()
+                            .map(str::trim)
+                            .unwrap_or("")
+                            .is_empty() =>
+                    {
+                        entry.credentials.email = Some(upstream_email.to_string());
+                        tracing::info!("凭据 #{} 账号名已回填: {}", id, upstream_email);
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if changed {
+                if let Err(e) = self.persist_credential(id) {
+                    tracing::warn!("账号名回填后持久化失败（不影响本次请求）: {}", e);
+                }
+            }
+        }
+
         Ok(usage_limits)
     }
 

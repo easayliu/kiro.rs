@@ -23,6 +23,24 @@ pub struct UsageLimitsResponse {
     /// 使用量明细列表
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
+
+    /// 账号信息（上游返回的 email / userId）
+    #[serde(default)]
+    pub user_info: Option<UserInfo>,
+}
+
+/// 账号信息
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInfo {
+    /// 账号邮箱（作为账号名展示）
+    #[serde(default)]
+    pub email: Option<String>,
+
+    /// 账号 ID
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub user_id: Option<String>,
 }
 
 /// 超额计费配置
@@ -179,6 +197,15 @@ impl FreeTrialInfo {
 }
 
 impl UsageLimitsResponse {
+    /// 获取账号邮箱（账号名），空串视为无
+    pub fn email(&self) -> Option<&str> {
+        self.user_info
+            .as_ref()
+            .and_then(|u| u.email.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
     /// 获取订阅标题
     pub fn subscription_title(&self) -> Option<&str> {
         self.subscription_info

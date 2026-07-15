@@ -17,10 +17,11 @@ interface AddCredentialDialogProps {
   onOpenChange: (open: boolean) => void
 }
 
-type AuthMethod = 'social' | 'idc'
+type AuthMethod = 'social' | 'idc' | 'api_key'
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
+  const [kiroApiKey, setKiroApiKey] = useState('')
   const [email, setEmail] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
   const [authRegion, setAuthRegion] = useState('')
@@ -39,6 +40,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
   const resetForm = () => {
     setRefreshToken('')
+    setKiroApiKey('')
     setEmail('')
     setAuthMethod('social')
     setAuthRegion('')
@@ -57,7 +59,16 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     e.preventDefault()
 
     // 验证必填字段
-    if (!refreshToken.trim()) {
+    if (authMethod === 'api_key') {
+      if (!kiroApiKey.trim()) {
+        toast.error('请输入 Kiro API Key')
+        return
+      }
+      if (!kiroApiKey.trim().startsWith('ksk_')) {
+        toast.error('Kiro API Key 格式应为 ksk_xxxxxxxx')
+        return
+      }
+    } else if (!refreshToken.trim()) {
       toast.error('请输入 Refresh Token')
       return
     }
@@ -70,7 +81,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
     mutate(
       {
-        refreshToken: refreshToken.trim(),
+        refreshToken: authMethod === 'api_key' ? undefined : refreshToken.trim(),
+        kiroApiKey: authMethod === 'api_key' ? kiroApiKey.trim() : undefined,
         email: email.trim() || undefined,
         authMethod,
         authRegion: authRegion.trim() || undefined,
@@ -106,20 +118,39 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
 
         <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
           <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
-            {/* Refresh Token */}
-            <div className="space-y-2">
-              <label htmlFor="refreshToken" className="text-sm font-medium">
-                Refresh Token <span className="text-bad">*</span>
-              </label>
-              <Input
-                id="refreshToken"
-                type="password"
-                placeholder="请输入 Refresh Token"
-                value={refreshToken}
-                onChange={(e) => setRefreshToken(e.target.value)}
-                disabled={isPending}
-              />
-            </div>
+            {/* Refresh Token（OAuth 凭据）/ Kiro API Key（API Key 凭据） */}
+            {authMethod === 'api_key' ? (
+              <div className="space-y-2">
+                <label htmlFor="kiroApiKey" className="text-sm font-medium">
+                  Kiro API Key <span className="text-bad">*</span>
+                </label>
+                <Input
+                  id="kiroApiKey"
+                  type="password"
+                  placeholder="ksk_xxxxxxxx"
+                  value={kiroApiKey}
+                  onChange={(e) => setKiroApiKey(e.target.value)}
+                  disabled={isPending}
+                />
+                <p className="text-xs text-muted-foreground">
+                  在 app.kiro.dev 生成的 API Key，直接作为 Bearer 使用，无需 Refresh Token
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <label htmlFor="refreshToken" className="text-sm font-medium">
+                  Refresh Token <span className="text-bad">*</span>
+                </label>
+                <Input
+                  id="refreshToken"
+                  type="password"
+                  placeholder="请输入 Refresh Token"
+                  value={refreshToken}
+                  onChange={(e) => setRefreshToken(e.target.value)}
+                  disabled={isPending}
+                />
+              </div>
+            )}
 
             {/* 邮箱（可选，仅用于前端显示） */}
             <div className="space-y-2">
@@ -153,6 +184,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               >
                 <option value="social">Social</option>
                 <option value="idc">IdC/Builder-ID/IAM</option>
+                <option value="api_key">API Key</option>
               </select>
             </div>
 
