@@ -907,6 +907,76 @@ struct PendingBlock {
     origin: BlockOrigin,
 }
 
+/// 切片里是否存在**未配对**的 `tool_use`（其 `tool_result` 被切点截在了外面）。
+///
+/// count_tokens 是「请求校验器 + 计数器」的合体，不是纯计数器：它要求每个 `tool_use`
+/// 的 `tool_result` 紧跟在下一条 message 里，否则 400
+/// （`tool_use ids were found without tool_result blocks immediately after`）。
+/// 这对真实请求是合理约束，但我们要数的是**任意前缀**，切点落在配对中间就必然违约。
+///
+/// 注意这**不是异常请求**：`cache_control` 打在 `tool_use` 上是官方合法用法，原请求
+/// 配对完整；非法的只是我们切出来的子请求。故检出后应安静降级，不该告警。
+///
+/// 必须逐个 id 检查而非只看最后一条 message：并行工具调用时 assistant 一条 message 里
+/// 可以有多个 `tool_use`，切点若落在对应的多个 `tool_result` 中间，未配对的 id 就出现在
+/// **倒数第二条** message 里。
+fn slice_has_unpaired_tool_use(messages: &[Message]) -> bool {
+    for (i, msg) in messages.iter().enumerate() {
+        let Some(blocks) = msg.content.as_array() else {
+            continue;
+        };
+        let tool_use_ids: Vec<&str> = blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_use"))
+            .filter_map(|b| b.get("id").and_then(|v| v.as_str()))
+            .collect();
+        if tool_use_ids.is_empty() {
+            continue;
+        }
+        // 下一条 message 必须存在，且含全部对应的 tool_result。
+        let next_results: Vec<&str> = messages
+            .get(i + 1)
+            .and_then(|m| m.content.as_array())
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_result"))
+                    .filter_map(|b| b.get("tool_use_id").and_then(|v| v.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if tool_use_ids.iter().any(|id| !next_results.contains(id)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 从 `n_blocks` 起向前退，找出**最大的能切成合法子请求**的前缀。
+///
+/// 返回 `(切片, 是否补过哨兵, 实际覆盖的 block 数)`。切不出任何合法前缀时返回 None。
+///
+/// 为何要退而不是放弃：切不了只是因为切点恰好落在 `tool_use`/`tool_result` 配对中间，
+/// **有问题的只是断点处那一两个 block**（一个 tool_use 通常几十 token），它前面几千 token
+/// 的前缀是完全能精确切的。直接整段退回本地比例，等于把已经能精确算的部分也一起丢掉。
+/// 退到最近的合法边界后，只有那一小段残差需要用比例补，误差小一到两个数量级。
+///
+/// 回退步数设上限：一次 tool_use/tool_result 配对最多跨两条 message、十几个 block，
+/// 退不出来说明形状异常，此时放弃比继续扫更合理。
+fn slice_largest_valid(
+    payload: &MessagesRequest,
+    n_blocks: usize,
+) -> Option<(MessagesRequest, bool, usize)> {
+    const MAX_WALKBACK: usize = 32;
+    let lower = n_blocks.saturating_sub(MAX_WALKBACK).max(1);
+    for n in (lower..=n_blocks).rev() {
+        if let Some((slice, padded)) = slice_payload_at_block(payload, n) {
+            return Some((slice, padded, n));
+        }
+    }
+    None
+}
+
 /// 补位用的哨兵 message 内容。count_tokens 不接受空 messages，而缓存断点常常打在
 /// system 末尾（此时前缀切片只有 tools/system）。用固定内容补一条，再减去「只含该
 /// 哨兵、无 tools/system」的基线计数，即得纯前缀的官方 token 数——开销由实测相减
@@ -943,6 +1013,11 @@ async fn count_prefix_official(slice: &MessagesRequest, padded: bool) -> Option<
 
 /// 分段重算失败时的兜底：把 `uncached` 用**本地** total 重算，使三段与本地口径自洽。
 ///
+/// 注意这**不等于「本请求按本地计费」**：三段在此只是回到本地口径的中间表示，计费层的
+/// `billed_split` 随后会把它们整体缩放到 `content_total`（trust=on 时即官方全量计数）。
+/// 故受影响的只有三段之间的**劈分比例**，计费**总量仍是精确的**——全量 payload 永远是
+/// 合法请求，`count_tokens` 数它没有障碍，只有「任意前缀」才会撞上配对约束。
+///
 /// `cache_read` / `cache_creation` 本就是本地口径，此处只需把 `uncached` 从
 /// 「官方 total − 本地分段」改成「本地 total − 本地分段」，即可恢复
 /// 「三段之和 == total」。调用方随后仍会按 total 上报——两者同为本地口径，无混用。
@@ -963,7 +1038,7 @@ fn fallback_to_local(profile: &CacheProfile, result: &mut CacheResult) {
         cache_creation = result.cache_creation_input_tokens,
         uncached_before = result.uncached_input_tokens,
         uncached_after = uncached,
-        "缓存分段退回本地口径（三段与本地 total 自洽）"
+        "缓存分段退回本地比例（三段与本地 total 自洽，随后由 billed_split 缩放到计费总量）"
     );
     result.uncached_input_tokens = uncached;
 }
@@ -1002,14 +1077,19 @@ pub async fn recount_cache_segments(profile: &CacheProfile, result: &mut CacheRe
         return; // 无可缓存段，分段本就全 0，uncached == total，天然自洽
     };
 
-    // 边界是「含该 block」，切片长度 = index + 1。
-    let read_slice = result
-        .matched_block
-        .and_then(|i| slice_payload_at_block(payload, i + 1));
-    let bp_slice = slice_payload_at_block(payload, last_bp + 1);
+    // 边界是「含该 block」，切片长度 = index + 1。切不动时退到最近的合法边界，
+    // 残段（通常就是一个 tool_use，几十 token）稍后按 official_scale 补回。
+    let read_target = result.matched_block.map(|i| i + 1);
+    let read_sliced = read_target.and_then(|n| slice_largest_valid(payload, n));
+    let bp_target = last_bp + 1;
 
-    let Some((bp_slice, bp_padded)) = bp_slice else {
-        tracing::debug!("缓存分段重算：断点前缀无法切片，整体退回本地口径");
+    let Some((bp_slice, bp_padded, bp_covered)) = slice_largest_valid(payload, bp_target) else {
+        // 一个合法前缀都切不出来（形状异常）。可预期的降级，非异常：总量仍由
+        // content_total 锚定，只有劈分退回本地比例。
+        tracing::debug!(
+            source = "local_ratio",
+            "缓存分段重算：切不出任何合法子请求，劈分退回本地比例"
+        );
         fallback_to_local(profile, result);
         return;
     };
@@ -1023,8 +1103,8 @@ pub async fn recount_cache_segments(profile: &CacheProfile, result: &mut CacheRe
     let (total_official, read_official, bp_official) = tokio::join!(
         crate::token::count_payload_remote(payload),
         async {
-            match read_slice {
-                Some((p, padded)) => count_prefix_official(&p, padded).await,
+            match &read_sliced {
+                Some((p, padded, _)) => count_prefix_official(p, *padded).await,
                 None => Some(0), // 未命中 → cache_read 段为空
             }
         },
@@ -1035,13 +1115,50 @@ pub async fn recount_cache_segments(profile: &CacheProfile, result: &mut CacheRe
         (total_official, read_official, bp_official)
     else {
         tracing::warn!(
-            source = "local_fallback",
-            "缓存分段重算：远程计数失败，整体退回本地口径"
+            source = "local_ratio",
+            "缓存分段重算：远程计数失败，劈分退回本地比例（总量仍按 content_total 锚定）"
         );
         fallback_to_local(profile, result);
         return;
     };
     let total_input_tokens = total_official as i32;
+
+    // 退过边界的话，把「退掉的那几个 block」的本地 token 按 official_scale 折算补回。
+    //
+    // 退边界只发生在切点落进 tool_use/tool_result 配对中间时（官方对止于 tool_use 的
+    // 前缀一律 400——已验证 5 种变体，包括不定义 tools、tool_use 后再跟 text，全部拒绝）。
+    // 此时有问题的只是断点处那一两个 block（一个 tool_use 通常几十 token），它前面的前缀
+    // 仍精确。故只对残段做比例近似，误差比整段退回本地比例小一到两个数量级。
+    let scale = profile.official_scale();
+    let patch = |covered: usize, target: usize| -> i32 {
+        if covered >= target {
+            return 0;
+        }
+        let cum_at = |n: usize| -> i32 {
+            n.checked_sub(1)
+                .and_then(|i| profile.blocks.get(i))
+                .map(|b| b.cumulative_tokens)
+                .unwrap_or(0)
+        };
+        let local_gap = (cum_at(target) - cum_at(covered)).max(0);
+        (local_gap as f64 * scale).round() as i32
+    };
+    let read_patch = read_sliced
+        .as_ref()
+        .zip(read_target)
+        .map(|((_, _, covered), target)| patch(*covered, target))
+        .unwrap_or(0);
+    let bp_patch = patch(bp_covered, bp_target);
+    if read_patch > 0 || bp_patch > 0 {
+        tracing::debug!(
+            read_patch,
+            bp_patch,
+            scale,
+            "缓存分段重算：切点落在 tool_use 配对中，已退到合法边界并按比例补回残段"
+        );
+    }
+    let read_official = read_official as i32 + read_patch;
+    let bp_official = bp_official as i32 + bp_patch;
 
     let cache_read = read_official.min(bp_official);
     let cache_creation = bp_official - cache_read;
@@ -1132,6 +1249,12 @@ fn slice_payload_at_block(
             }
         })
         .collect::<Vec<_>>();
+
+    // 切点若把某个 tool_use 与其 tool_result 分开，切片就是非法请求（count_tokens 会
+    // 400）。此处不发请求即判定，由调用方退到更早的合法边界（见 slice_largest_valid）。
+    if slice_has_unpaired_tool_use(&messages) {
+        return None;
+    }
 
     // count_tokens 要求 messages 非空，而「断点打在 system 末尾」恰是最常见的形态
     // （Claude Code 即如此）。此时补一条哨兵 message 让请求合法，其自身开销由调用方
@@ -2046,6 +2169,52 @@ mod tests {
     }
 
     /// 读写守恒核心：第一轮计费回写 billed_creation 后，第二轮命中时
+    /// 切片里 tool_use 未配对的检测。count_tokens 要求 tool_result 紧跟下一条 message，
+    /// 切点落在配对中间就必然 400 —— 提前检出可省掉一次必然失败的跨洋往返。
+    #[test]
+    fn detects_unpaired_tool_use_in_slice() {
+        let msg = |role: &str, content: serde_json::Value| Message {
+            role: role.to_string(),
+            content,
+        };
+        let tu = |id: &str| json!({"type":"tool_use","id":id,"name":"f","input":{}});
+        let tr = |id: &str| json!({"type":"tool_result","tool_use_id":id,"content":"ok"});
+
+        // 配对完整 → 可切。
+        assert!(!slice_has_unpaired_tool_use(&[
+            msg("user", json!("q")),
+            msg("assistant", json!([tu("a")])),
+            msg("user", json!([tr("a")])),
+        ]));
+
+        // 切点止于 tool_use（tool_result 被切掉）→ 不可切。
+        assert!(slice_has_unpaired_tool_use(&[
+            msg("user", json!("q")),
+            msg("assistant", json!([tu("a")])),
+        ]));
+
+        // 并行工具调用：切点落在两个 tool_result 中间 → 未配对的 id 出现在**倒数第二条**
+        // message 里，只看最后一条是查不出来的。
+        assert!(slice_has_unpaired_tool_use(&[
+            msg("user", json!("q")),
+            msg("assistant", json!([tu("a"), tu("b")])),
+            msg("user", json!([tr("a")])), // 缺 b
+        ]));
+
+        // 并行工具调用配对完整 → 可切。
+        assert!(!slice_has_unpaired_tool_use(&[
+            msg("user", json!("q")),
+            msg("assistant", json!([tu("a"), tu("b")])),
+            msg("user", json!([tr("a"), tr("b")])),
+        ]));
+
+        // 无工具的普通对话 → 可切。
+        assert!(!slice_has_unpaired_tool_use(&[
+            msg("user", json!("hi")),
+            msg("assistant", json!([{"type":"text","text":"yo"}])),
+        ]));
+    }
+
     /// clamp 的上界必须与被夹的值同单位：blocks 的 cumulative_tokens 是本地口径，
     /// 而 total_input_tokens 配了远程即官方口径。用官方 total 夹本地值会削掉真实值，
     /// 污染回写比例的分母（见 CacheProfile::clamp_local）。

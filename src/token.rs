@@ -192,7 +192,14 @@ async fn call_remote_count_tokens(
         .await?;
 
     if !response.status().is_success() {
-        return Err(format!("API 返回错误状态: {}", response.status()).into());
+        // 带上响应体：官方把真正的原因放在 body 里（余额不足 / org 停用 / 请求体不合法
+        // 各自的 message 完全不同），只报状态码等于把诊断信息丢掉，排查时只能靠猜。
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let body = body.trim();
+        // 截断防止超长 body 灌爆日志。
+        let brief: String = body.chars().take(300).collect();
+        return Err(format!("API 返回错误状态: {} — {}", status, brief).into());
     }
 
     let result: CountTokensResponse = response.json().await?;
