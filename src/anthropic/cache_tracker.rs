@@ -1278,16 +1278,22 @@ fn slice_payload_at_block(
         // 计数与指纹都基于 strip 后文本，若官方切片保留该行，两套口径对「同一段前缀」
         // 的定义就不一致（切换时总量出现阶跃），且每请求都变的 header 会被计进
         // cache_read 按 0.1× 收。
+        //
+        // 剥完为空的块必须**剔除**而非留空串：API 拒绝空 text block
+        // （`system: text content blocks must be non-empty`），而整块只有一行 header
+        // 的情况真实存在。剔除与本地口径也一致——空文本本就贡献 0 token。
         system: payload
             .system
             .as_ref()
             .map(|s| {
                 s[..n_system.min(s.len())]
                     .iter()
-                    .map(|m| {
+                    .filter_map(|m| {
                         let mut v = serde_json::to_value(m).unwrap_or(serde_json::Value::Null);
                         strip_billing_header_line(&mut v);
-                        serde_json::from_value(v).unwrap_or_else(|_| m.clone())
+                        let stripped: super::types::SystemMessage =
+                            serde_json::from_value(v).unwrap_or_else(|_| m.clone());
+                        (!stripped.text.trim().is_empty()).then_some(stripped)
                     })
                     .collect::<Vec<_>>()
             })
@@ -2169,6 +2175,46 @@ mod tests {
     }
 
     /// 读写守恒核心：第一轮计费回写 billed_creation 后，第二轮命中时
+    /// 剥掉 billing header 后变空的 system 块必须剔除：API 拒绝空 text block
+    /// （`system: text content blocks must be non-empty`），而整块只有一行 header
+    /// 的情况真实存在（生产 400 实例）。
+    #[test]
+    fn slice_drops_system_blocks_emptied_by_header_strip() {
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 16,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!("hi"),
+            }],
+            stream: false,
+            system: Some(vec![
+                crate::anthropic::types::SystemMessage {
+                    text: "real content".to_string(),
+                    block_type: Some("text".to_string()),
+                    cache_control: None,
+                },
+                // 整块只有 billing header，strip 后为空。
+                crate::anthropic::types::SystemMessage {
+                    text: "x-anthropic-billing-header: abc123".to_string(),
+                    block_type: Some("text".to_string()),
+                    cache_control: None,
+                },
+            ]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        // 切到含全部 system 的边界。
+        let n = flatten_cacheable_blocks(&req).len();
+        let (slice, _) = slice_payload_at_block(&req, n).expect("应能切出合法子请求");
+        let sys = slice.system.expect("system 不应整体消失");
+        assert_eq!(sys.len(), 1, "只剩非空块");
+        assert_eq!(sys[0].text, "real content");
+    }
+
     /// 切片里 tool_use 未配对的检测。count_tokens 要求 tool_result 紧跟下一条 message，
     /// 切点落在配对中间就必然 400 —— 提前检出可省掉一次必然失败的跨洋往返。
     #[test]
