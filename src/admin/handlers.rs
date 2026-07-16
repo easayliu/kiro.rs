@@ -13,6 +13,7 @@ use super::{
         BatchSetCredentialGroupRequest,
         BatchSetDisabledRequest,
         BatchSetOverageRequest, BatchSetPriorityRequest, BatchSetRpmLimitRequest, MeResponse,
+        SetCountTokensConfigRequest, SetTrustInboundCountRequest,
         SetCacheSkipRateRequest, SetConcurrencyLimitRequest, SetOutputMultiplierRequest,
         SetCredentialGroupRequest, SetDefaultConcurrencyLimitRequest, SetDefaultRpmLimitRequest,
         SetDisabledRequest,
@@ -341,6 +342,24 @@ pub async fn set_relay_host(
     }
 }
 
+/// GET /api/admin/config/count-tokens
+/// 获取 count_tokens 远程配置
+pub async fn get_count_tokens_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_count_tokens_config())
+}
+
+/// PUT /api/admin/config/count-tokens
+/// 设置 count_tokens 远程配置（apiUrl 传 null/空串关闭远程）
+pub async fn set_count_tokens_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetCountTokensConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_count_tokens_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/config/global-cache
 /// 获取全局缓存模式
 pub async fn get_global_cache(State(state): State<AdminState>) -> impl IntoResponse {
@@ -362,6 +381,24 @@ pub async fn set_global_cache(
 
 /// GET /api/admin/config/injection-scan
 /// 获取入站注入扫描开关
+/// GET /api/admin/config/trust-inbound-count
+/// 获取输入侧计费口径开关
+pub async fn get_trust_inbound_count(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_trust_inbound_count())
+}
+
+/// PUT /api/admin/config/trust-inbound-count
+/// 设置输入侧计费口径开关（开启后 input 计费直接采信入站计数）
+pub async fn set_trust_inbound_count(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetTrustInboundCountRequest>,
+) -> impl IntoResponse {
+    match state.service.set_trust_inbound_count(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 pub async fn get_injection_scan(State(state): State<AdminState>) -> impl IntoResponse {
     let response = state.service.get_injection_scan();
     Json(response)

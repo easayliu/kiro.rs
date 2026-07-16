@@ -40,7 +40,8 @@ pub use converter::{
     chunked_write_guidance_enabled, map_model, output_token_multiplier,
     set_chunked_write_guidance, set_dynamic_model_windows, set_injected_prompt_tokens,
     set_max_request_body_size, set_output_token_multiplier, set_surface_persona,
-    surface_persona_enabled, KIRO_MAX_REQUEST_BODY_SIZE_DEFAULT,
+    set_trust_inbound_count, surface_persona_enabled, trust_inbound_count,
+    KIRO_MAX_REQUEST_BODY_SIZE_DEFAULT,
 };
 pub use handlers::{
     early_first_token_delay_params, early_first_token_enabled, set_early_first_token,

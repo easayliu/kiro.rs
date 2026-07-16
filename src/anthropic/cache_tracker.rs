@@ -57,6 +57,19 @@ pub struct CacheResult {
     /// 读写守恒（不再二次缩放）；`None` 表示首次命中或前序请求计费尚未回写，
     /// 回退到「缩放本地估算」。
     pub cache_read_billed: Option<i32>,
+    /// 命中前缀的 block 边界（含该 block），即 cache_read 段的终点。`None` 表示未命中。
+    ///
+    /// 与 [`Self::last_breakpoint_block`] 一起，供上层用官方口径重算分段
+    /// （见 `token::recount_cache_segments`）：本地 `count_tokens` 与远程官方口径
+    /// 不同源，直接相减会混用单位——中文虚高、英文可能夹到 0。
+    pub matched_block: Option<usize>,
+    /// 最后一个可缓存 breakpoint 的 block 边界（含该 block），即 read+creation 段的终点。
+    pub last_breakpoint_block: Option<usize>,
+    /// 三段是否已是**官方口径**（由 `recount_cache_segments` 成功重算得出）。
+    ///
+    /// 计费层据此决定能否直接采信：为 false 时三段仍是本地口径，必须走
+    /// `billed_split` 缩放到计费总量，否则会把本地数当官方数用（实测差 ~1.6×）。
+    pub segments_official: bool,
 }
 
 /// `compute_and_update` 返回的回写句柄。
@@ -78,7 +91,16 @@ pub struct CacheWriteback {
 
 #[derive(Debug, Clone)]
 pub struct CacheProfile {
+    /// 原始请求。缓存分段重算需要按 block 边界切片重新计数（见 [`recount_cache_segments`]），
+    /// 而切片只能从原 payload 还原。用 Arc 避免逐层传递时的深拷贝。
+    payload: std::sync::Arc<MessagesRequest>,
     total_input_tokens: i32,
+    /// 本地启发式口径的 total。与 blocks 的 `cumulative_tokens` 同源同单位。
+    ///
+    /// `total_input_tokens` 配了远程后是官方口径，而 blocks 恒为本地口径。分段重算
+    /// 成功时两者都换成官方、自洽；失败时则用本次值把 total 也退回本地，保证
+    /// 「三段之和 == total」在任何路径下都成立——宁可全本地，也不要半官半本。
+    local_total_input_tokens: i32,
     min_cacheable_tokens: i32,
     blocks: Vec<CacheBlock>,
     breakpoints: Vec<CacheBreakpoint>,
@@ -92,6 +114,15 @@ pub struct CacheProfile {
 }
 
 impl CacheProfile {
+    /// 本地启发式口径的 total，与 blocks 的 `cumulative_tokens` 同单位。
+    ///
+    /// 计费缩放（`CacheUsage::billed_split`）必须拿它当基准：三段由 block 累加而来，
+    /// 恒为本地口径；若改用 `count_all_tokens` 的结果（配了远程即官方口径）作基准，
+    /// scale 会算成 1.0 而非应有的 ~1.6，三段就不会被缩放到计费总量上。
+    pub fn local_total_input_tokens(&self) -> i32 {
+        self.local_total_input_tokens
+    }
+
     /// 粘性绑定使用的用户身份 hash。
     ///
     /// 粒度比 `identity_key` 粗一档：只含 device_id + account_uuid，刻意不含
@@ -429,7 +460,13 @@ impl CacheTracker {
         let binding_key = extract_binding_key(payload);
 
         CacheProfile {
+            payload: std::sync::Arc::new(payload.clone()),
             total_input_tokens: total_input_tokens.max(0),
+            local_total_input_tokens: crate::token::count_all_tokens_local(
+                payload.system.clone(),
+                payload.messages.clone(),
+                payload.tools.clone(),
+            ) as i32,
             min_cacheable_tokens: minimum_cacheable_tokens_for_model(&payload.model),
             blocks,
             breakpoints,
@@ -661,6 +698,10 @@ impl CacheTracker {
                 cache_creation_1h_input_tokens: cache_1h,
                 uncached_input_tokens: uncached,
                 cache_read_billed: matched_billed,
+                matched_block: matched_block_index,
+                last_breakpoint_block: Some(last_breakpoint.block_index),
+                // 本地口径；仅 recount_cache_segments 成功后置 true。
+                segments_official: false,
             },
             CacheWriteback {
                 bucket_key: effective_id,
@@ -682,6 +723,28 @@ impl CacheTracker {
     /// 写入用 `existing.max(new)` 单调更新，保证幂等重写/TTL downgrade 不回退。
     /// 仅在收到 `contextUsageEvent`（有上游真实总量）时调用；无 metering 的请求不回写，
     /// 让对应前缀维持 `None` 并在下次命中时回退到缩放本地估算。
+    /// 清空所有 checkpoint 的 `billed_cumulative`，保留 checkpoint 本身。
+    ///
+    /// `billed_cumulative` 记的是「这段前缀**上一次被计费时**的 read+creation 之和」，
+    /// 其口径取决于当时 `trust_inbound_count` 的开关状态：开=官方口径，关=上游反推口径。
+    /// 开关一翻，历史值就成了另一套口径的数，再被 `billed_split` 当锚点钉住即单位混用。
+    ///
+    /// 故开关变更时调用本方法作废历史 billed。清空后下次命中走
+    /// `billed_read = None` 分支（回退缩放本地估算），等价于该前缀的首次计费——
+    /// 只损失一轮读写守恒，不会算错。checkpoint 本身保留，缓存命中不受影响。
+    pub fn reset_billed_cumulative(&self) {
+        let mut all_entries = self.entries.lock();
+        let mut cleared = 0usize;
+        for bucket in all_entries.values_mut() {
+            for entry in bucket.values_mut() {
+                if entry.billed_cumulative.take().is_some() {
+                    cleared += 1;
+                }
+            }
+        }
+        tracing::info!(cleared, "计费口径变更：已作废历史 billed 累计");
+    }
+
     pub fn apply_billing_writeback(
         &self,
         writeback: &CacheWriteback,
@@ -762,12 +825,37 @@ fn compute_ttl_breakdown(profile: &CacheProfile, matched_tokens: i32) -> (i32, i
 }
 
 impl CacheProfile {
+    /// 本地口径 → 官方口径的实测换算系数。
+    ///
+    /// `min_cacheable_tokens` 是 Anthropic **官方口径**的门槛（4096/2048/1024/512），
+    /// 而 block 的 `cumulative_tokens` 恒为本地 `ceil(字节/4)`——模型无关。二者直接比较
+    /// 会误判，且误差随分词器换代拉大：同一段 8800 字节英文实测 opus-4.8/sonnet-5 官方
+    /// 计 3616（scale 1.60）、opus-4.7 计 3621，而 sonnet-4.6/haiku-4.5 只计 2214
+    /// （scale 0.98，老分词器）。故 opus 系会把官方 4096–6580 的前缀误判为不可缓存，
+    /// 整段本该 0.1× 的 cache_read 被按全价计。
+    ///
+    /// 这里用本请求自身的「官方 total / 本地 total」当系数——零额外网络调用，且天然
+    /// 模型感知（官方 total 由对应模型的分词器算出）。未启用远程时两者相等，系数为 1，
+    /// 行为与历史完全一致。
+    ///
+    /// 系数在整个前缀上取均值，而真实 token 密度逐段有别，故仍是近似；但相比不换算的
+    /// 1.6× 系统性偏差，残余误差是百分之几量级。
+    fn official_scale(&self) -> f64 {
+        if self.local_total_input_tokens <= 0 || self.total_input_tokens <= 0 {
+            return 1.0;
+        }
+        self.total_input_tokens as f64 / self.local_total_input_tokens as f64
+    }
+
     fn cacheable_breakpoints(&self) -> Vec<ResolvedBreakpoint> {
+        let scale = self.official_scale();
         self.breakpoints
             .iter()
             .filter_map(|breakpoint| {
                 let block = self.blocks.get(breakpoint.block_index)?;
-                if block.cumulative_tokens < self.min_cacheable_tokens {
+                // 折算到官方口径再比官方门槛。
+                let official_cum = (block.cumulative_tokens as f64 * scale).round() as i32;
+                if official_cum < self.min_cacheable_tokens {
                     return None;
                 }
 
@@ -805,6 +893,285 @@ struct PendingBlock {
     tokens: i32,
     breakpoint_ttl: Option<Duration>,
     segment: BlockSegment,
+    /// 该 block 在原 payload 中的定位，供 [`slice_payload_at_block`] 按边界重建子请求。
+    /// Tools/System 为其在各自数组中的下标；Messages 为 (message_index, block_index)。
+    origin: BlockOrigin,
+}
+
+/// 补位用的哨兵 message 内容。count_tokens 不接受空 messages，而缓存断点常常打在
+/// system 末尾（此时前缀切片只有 tools/system）。用固定内容补一条，再减去「只含该
+/// 哨兵、无 tools/system」的基线计数，即得纯前缀的官方 token 数——开销由实测相减
+/// 得出，不依赖任何硬编码常数（实测各模型开销并不相同：7 / 8 / 12 三档）。
+const SENTINEL_MESSAGE: &str = "x";
+
+/// 数一个前缀切片的官方 token 数；切片若补过哨兵，则扣掉哨兵基线。
+///
+/// 基线随模型不同，且会被 [`crate::token::count_payload_remote`] 的内容 hash 缓存
+/// 兜住——每模型只会真打一次。
+async fn count_prefix_official(slice: &MessagesRequest, padded: bool) -> Option<i32> {
+    let counted = crate::token::count_payload_remote(slice).await? as i32;
+    if !padded {
+        return Some(counted);
+    }
+    let baseline = MessagesRequest {
+        model: slice.model.clone(),
+        max_tokens: slice.max_tokens,
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: serde_json::Value::String(SENTINEL_MESSAGE.to_string()),
+        }],
+        stream: false,
+        system: None,
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        output_config: None,
+        metadata: None,
+    };
+    let base = crate::token::count_payload_remote(&baseline).await? as i32;
+    Some((counted - base).max(0))
+}
+
+/// 分段重算失败时的兜底：把 `uncached` 用**本地** total 重算，使三段与本地口径自洽。
+///
+/// `cache_read` / `cache_creation` 本就是本地口径，此处只需把 `uncached` 从
+/// 「官方 total − 本地分段」改成「本地 total − 本地分段」，即可恢复
+/// 「三段之和 == total」。调用方随后仍会按 total 上报——两者同为本地口径，无混用。
+///
+/// 之所以不保留官方 total：混合口径会静默错计（实测同一段 8800 字节英文前缀，
+/// 官方 3616 / 本地 2250，混用后 uncached 虚高 1366），而全本地虽有绝对值偏差，
+/// 至少内部恒等、可预测。
+fn fallback_to_local(profile: &CacheProfile, result: &mut CacheResult) {
+    let uncached = (profile.local_total_input_tokens
+        - result.cache_read_input_tokens
+        - result.cache_creation_input_tokens)
+        .max(0);
+    tracing::debug!(
+        source = "local",
+        official_total = profile.total_input_tokens,
+        local_total = profile.local_total_input_tokens,
+        cache_read = result.cache_read_input_tokens,
+        cache_creation = result.cache_creation_input_tokens,
+        uncached_before = result.uncached_input_tokens,
+        uncached_after = uncached,
+        "缓存分段退回本地口径（三段与本地 total 自洽）"
+    );
+    result.uncached_input_tokens = uncached;
+}
+
+/// 用官方口径重算缓存三段，消除「total 走远程、分段走本地」的单位混用。
+///
+/// 背景：`cache_read` / `cache_creation` 由 block 累加得出，用的是本地启发式
+/// `ceil(字节/4)`；而 `total_input_tokens` 配了远程后是官方口径。两者相减即混用单位——
+/// 实测同一段 8800 字节英文前缀，官方计 3616、本地计 2250，导致 uncached 虚高 1366，
+/// 且 cache_read 少报（0.1 倍价的量被按全价计）。
+///
+/// 做法：对两个边界前缀各切一次 payload 送去 count_tokens，得到官方口径的累计值：
+/// - `count(切到 matched_block)`            → cache_read
+/// - `count(切到 last_breakpoint_block)`    → cache_read + cache_creation
+/// - `uncached = total − (read + creation)`
+///
+/// 三次计数的 message 结构开销在相减时自然抵消，故分段值精确；`uncached` 保留一份
+/// 开销，与 Anthropic「input_tokens 含 per-message 结构开销」的语义一致。
+///
+/// 两次切片计数互不依赖，并发发出，整体仍约一个 RTT。任一环节失败即整体放弃、
+/// 保留原本地口径结果（宁可维持旧行为，也不产出半官半本的混合值）。
+pub async fn recount_cache_segments(profile: &CacheProfile, result: &mut CacheResult) {
+    let payload = profile.payload.as_ref();
+    // 仅在「采信入站计数」时重算。trust=off 时计费以上游反推为锚、由 `billed_split`
+    // 把本地三段整体缩放过去——此时把分段换成官方口径反而制造错配：`billed_split` 的
+    // `estimated_total` 取自 `count_all_tokens`（另一条无缓存的路径，远程故障时退本地），
+    // 与官方分段不同源，`scale_one(cache_read)` 会算出错误尺度。故 off 时全程本地，不动。
+    if !super::converter::trust_inbound_count() {
+        return;
+    }
+    // 未启用远程：total 与分段同为本地口径，本就自洽，无需重算也不该告警。
+    if !crate::token::remote_enabled() {
+        return;
+    }
+    let Some(last_bp) = result.last_breakpoint_block else {
+        return; // 无可缓存段，分段本就全 0，uncached == total，天然自洽
+    };
+
+    // 边界是「含该 block」，切片长度 = index + 1。
+    let read_slice = result
+        .matched_block
+        .and_then(|i| slice_payload_at_block(payload, i + 1));
+    let bp_slice = slice_payload_at_block(payload, last_bp + 1);
+
+    let Some((bp_slice, bp_padded)) = bp_slice else {
+        tracing::debug!("缓存分段重算：断点前缀无法切片，整体退回本地口径");
+        fallback_to_local(profile, result);
+        return;
+    };
+
+    // 三次计数并发发出（互不依赖），整体约一个 RTT；且都走同一份内容 hash 缓存。
+    //
+    // total 在此**自己数一遍**，不复用外部传入的 `profile.total_input_tokens`：后者由
+    // `count_all_tokens` 得出，那条路径没有计数缓存，远程故障时会退回本地估算——而本函数
+    // 的分段计数有缓存、仍可能返回官方值，两者就此错配（实测：total 退本地 2259、分段命中
+    // 缓存 3602，相减为负被夹到 0）。自己数则三段同源、同缓存，要么全官方要么全退本地。
+    let (total_official, read_official, bp_official) = tokio::join!(
+        crate::token::count_payload_remote(payload),
+        async {
+            match read_slice {
+                Some((p, padded)) => count_prefix_official(&p, padded).await,
+                None => Some(0), // 未命中 → cache_read 段为空
+            }
+        },
+        count_prefix_official(&bp_slice, bp_padded),
+    );
+
+    let (Some(total_official), Some(read_official), Some(bp_official)) =
+        (total_official, read_official, bp_official)
+    else {
+        tracing::warn!(
+            source = "local_fallback",
+            "缓存分段重算：远程计数失败，整体退回本地口径"
+        );
+        fallback_to_local(profile, result);
+        return;
+    };
+    let total_input_tokens = total_official as i32;
+
+    let cache_read = read_official.min(bp_official);
+    let cache_creation = bp_official - cache_read;
+    let uncached = (total_input_tokens - bp_official).max(0);
+
+    tracing::debug!(
+        source = "remote",
+        local_read = result.cache_read_input_tokens,
+        local_creation = result.cache_creation_input_tokens,
+        local_uncached = result.uncached_input_tokens,
+        official_read = cache_read,
+        official_creation = cache_creation,
+        official_uncached = uncached,
+        "缓存分段已重算为官方口径"
+    );
+
+    // 5m/1h 拆分按官方 creation 等比缩放，保持二者之和 == cache_creation。
+    let local_creation = result.cache_creation_input_tokens.max(0);
+    if local_creation > 0 && cache_creation != local_creation {
+        let scale = |v: i32| ((v as i64 * cache_creation as i64) / local_creation as i64) as i32;
+        result.cache_creation_5m_input_tokens = scale(result.cache_creation_5m_input_tokens);
+        result.cache_creation_1h_input_tokens =
+            cache_creation - result.cache_creation_5m_input_tokens;
+    }
+
+    result.cache_read_input_tokens = cache_read;
+    result.cache_creation_input_tokens = cache_creation;
+    result.uncached_input_tokens = uncached;
+    result.segments_official = true;
+}
+
+/// block 在原 payload 中的来源坐标。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockOrigin {
+    Tool(usize),
+    System(usize),
+    /// (message_index, content_block_index)
+    Message(usize, usize),
+}
+
+/// 按 block 边界切出「前 `n_blocks` 个 block」对应的子 payload。
+///
+/// 用于把缓存分段换算成官方口径：对切片调 count_tokens 得到该前缀的精确 token 数
+/// （见 `token::count_cache_segments`）。block 顺序恒为 tools → system → messages，
+/// 故前缀切片始终是合法请求（messages 从头取，首条仍是 user）。
+///
+/// 切点可能落在某条 message 的中间（message 按内容块展开），此时保留该 message 的
+/// 前若干个内容块。`n_blocks = 0` 返回 None（空 payload 无法计数）。
+fn slice_payload_at_block(
+    payload: &MessagesRequest,
+    n_blocks: usize,
+) -> Option<(MessagesRequest, bool)> {
+    if n_blocks == 0 {
+        return None;
+    }
+    let blocks = flatten_cacheable_blocks(payload);
+    let taken = &blocks[..n_blocks.min(blocks.len())];
+
+    let mut n_tools = 0usize;
+    let mut n_system = 0usize;
+    // message_index -> 保留到的最大 content block 下标
+    let mut msg_last: std::collections::BTreeMap<usize, usize> = Default::default();
+    for b in taken {
+        match b.origin {
+            BlockOrigin::Tool(i) => n_tools = n_tools.max(i + 1),
+            BlockOrigin::System(i) => n_system = n_system.max(i + 1),
+            BlockOrigin::Message(mi, bi) => {
+                let e = msg_last.entry(mi).or_insert(bi);
+                *e = (*e).max(bi);
+            }
+        }
+    }
+
+    let messages = msg_last
+        .iter()
+        .map(|(&mi, &last_bi)| {
+            let m = &payload.messages[mi];
+            let content = match &m.content {
+                serde_json::Value::Array(arr) => {
+                    serde_json::Value::Array(arr[..=last_bi.min(arr.len() - 1)].to_vec())
+                }
+                // 非数组（纯字符串等）只会展开成单个 block，整体保留。
+                other => other.clone(),
+            };
+            Message {
+                role: m.role.clone(),
+                content,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // count_tokens 要求 messages 非空，而「断点打在 system 末尾」恰是最常见的形态
+    // （Claude Code 即如此）。此时补一条哨兵 message 让请求合法，其自身开销由调用方
+    // 用同口径的空基线扣除（见 [`SENTINEL_MESSAGE`] / `count_prefix_official`）。
+    let padded = messages.is_empty();
+    let messages = if padded {
+        vec![Message {
+            role: "user".to_string(),
+            content: serde_json::Value::String(SENTINEL_MESSAGE.to_string()),
+        }]
+    } else {
+        messages
+    };
+
+    Some((MessagesRequest {
+        model: payload.model.clone(),
+        max_tokens: payload.max_tokens,
+        messages,
+        stream: false,
+        // system 需与本地口径同样剥掉 billing header 行：`flatten_cacheable_blocks`
+        // 计数与指纹都基于 strip 后文本，若官方切片保留该行，两套口径对「同一段前缀」
+        // 的定义就不一致（切换时总量出现阶跃），且每请求都变的 header 会被计进
+        // cache_read 按 0.1× 收。
+        system: payload
+            .system
+            .as_ref()
+            .map(|s| {
+                s[..n_system.min(s.len())]
+                    .iter()
+                    .map(|m| {
+                        let mut v = serde_json::to_value(m).unwrap_or(serde_json::Value::Null);
+                        strip_billing_header_line(&mut v);
+                        serde_json::from_value(v).unwrap_or_else(|_| m.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|s| !s.is_empty()),
+        tools: payload
+            .tools
+            .as_ref()
+            .map(|t| t[..n_tools.min(t.len())].to_vec())
+            .filter(|t| !t.is_empty()),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        },
+        padded,
+    ))
 }
 
 fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
@@ -825,6 +1192,7 @@ fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
                 tokens: count_tool_definition_tokens(tool) as i32,
                 breakpoint_ttl,
                 segment: BlockSegment::Tools,
+                origin: BlockOrigin::Tool(tool_index),
             });
         }
     }
@@ -853,6 +1221,7 @@ fn flatten_cacheable_blocks(payload: &MessagesRequest) -> Vec<PendingBlock> {
                 tokens,
                 breakpoint_ttl,
                 segment: BlockSegment::System,
+                origin: BlockOrigin::System(system_index),
             });
         }
     }
@@ -910,6 +1279,7 @@ fn build_message_block(
     breakpoint_ttl: Option<Duration>,
 ) -> PendingBlock {
     PendingBlock {
+        origin: BlockOrigin::Message(message_index, block_index),
         tokens: count_message_content_tokens(&block) as i32,
         value: canonicalize_json(serde_json::json!({
             "kind": "message",
@@ -1667,6 +2037,47 @@ mod tests {
     }
 
     /// 读写守恒核心：第一轮计费回写 billed_creation 后，第二轮命中时
+    /// 断点是否够格缓存，须按官方口径判断：`min_cacheable_tokens` 是官方门槛，
+    /// 而 block 的 cumulative_tokens 是本地 ceil(字节/4)。实测同段文本 opus-4.8
+    /// 官方/本地 ≈ 1.60、sonnet-4.6 ≈ 0.98，不换算会在 opus 系上把够格的前缀判死。
+    #[test]
+    fn breakpoints_use_official_scale_against_threshold() {
+        // opus-4.8 门槛 4096。本地累计 3000，若不换算 → 3000 < 4096 判不可缓存。
+        // 官方 total 4800 / 本地 total 3000 → scale 1.6 → 3000×1.6 = 4800 ≥ 4096 → 够格。
+        let profile = CacheProfile {
+            payload: std::sync::Arc::new(build_request("sys", vec![])),
+            total_input_tokens: 4800,
+            local_total_input_tokens: 3000,
+            min_cacheable_tokens: 4096,
+            blocks: vec![CacheBlock {
+                prefix_fingerprint: [1u8; 32],
+                cumulative_tokens: 3000,
+            }],
+            breakpoints: vec![CacheBreakpoint {
+                block_index: 0,
+                ttl: DEFAULT_CACHE_TTL,
+            }],
+            identity_key: None,
+            binding_key: None,
+        };
+        assert_eq!(
+            profile.cacheable_breakpoints().len(),
+            1,
+            "换算到官方口径后应够格（4800 ≥ 4096）"
+        );
+
+        // 未启用远程：官方 total == 本地 total → scale 1.0 → 保持历史行为（判不够格）。
+        let local_only = CacheProfile {
+            total_input_tokens: 3000,
+            ..profile.clone()
+        };
+        assert_eq!(
+            local_only.cacheable_breakpoints().len(),
+            0,
+            "scale=1 时行为与历史一致（3000 < 4096）"
+        );
+    }
+
     /// cache_read_billed 应原样等于上一轮的 billed creation（与本地估算/缩放无关）。
     #[test]
     fn billed_writeback_makes_read_equal_previous_creation() {

@@ -3896,6 +3896,72 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 获取 count_tokens 远程配置（Admin API）。真源在 `crate::token` 的全局配置。
+    pub fn get_count_tokens_config(&self) -> (Option<String>, Option<String>, String) {
+        crate::token::get_config_snapshot()
+    }
+
+    /// 设置 count_tokens 远程配置（Admin API）；持久化到 config.json。
+    ///
+    /// `api_url` 传 `None`/空白串 = 关闭远程、全部回退本地启发式。
+    /// 改动即时生效：`crate::token` 的配置存于 RwLock，下次计数即读到新值。
+    /// 先写内存再持久化，持久化失败则回滚内存，保证两者一致。
+    pub fn set_count_tokens_config(
+        &self,
+        api_url: Option<String>,
+        api_key: Option<String>,
+        auth_type: String,
+    ) -> anyhow::Result<()> {
+        let normalize = |v: Option<String>| {
+            v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        };
+        let api_url = normalize(api_url);
+        let api_key = normalize(api_key);
+        let auth_type = match auth_type.trim() {
+            "bearer" => "bearer".to_string(),
+            _ => "x-api-key".to_string(),
+        };
+
+        let previous = crate::token::get_config_snapshot();
+        crate::token::update_config(api_url.clone(), api_key.clone(), auth_type.clone());
+
+        if let Err(e) =
+            self.persist_count_tokens_config(api_url.as_deref(), api_key.as_deref(), &auth_type)
+        {
+            crate::token::update_config(previous.0, previous.1, previous.2);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn persist_count_tokens_config(
+        &self,
+        api_url: Option<&str>,
+        api_key: Option<&str>,
+        auth_type: &str,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，count_tokens 配置仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.count_tokens_api_url = api_url.map(str::to_string);
+        config.count_tokens_api_key = api_key.map(str::to_string);
+        config.count_tokens_auth_type = auth_type.to_string();
+        config
+            .save()
+            .with_context(|| format!("持久化 count_tokens 配置失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
     fn persist_relay_host(&self, value: Option<&str>) -> anyhow::Result<()> {
         use anyhow::Context;
 

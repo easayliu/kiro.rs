@@ -14,6 +14,7 @@ use crate::kiro::token_manager::MultiTokenManager;
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse,
+    CountTokensConfigResponse, SetCountTokensConfigRequest,
     BatchDeleteCredentialsRequest, BatchDeleteCredentialsResponse,
     BatchSetCredentialGroupFailure, BatchSetCredentialGroupRequest,
     BatchSetCredentialGroupResponse, BatchSetDisabledRequest, BatchSetDisabledResponse,
@@ -447,6 +448,44 @@ impl AdminService {
         })
     }
 
+    /// 获取 count_tokens 远程配置。密钥只回传"是否已设置"，不回传明文。
+    pub fn get_count_tokens_config(&self) -> CountTokensConfigResponse {
+        let (api_url, api_key, auth_type) = self.token_manager.get_count_tokens_config();
+        let default_api_url = crate::token::DEFAULT_COUNT_TOKENS_API_URL.to_string();
+        let effective_api_url = api_url.clone().unwrap_or_else(|| default_api_url.clone());
+        CountTokensConfigResponse {
+            api_url,
+            default_api_url,
+            effective_api_url,
+            api_key_set: api_key.is_some(),
+            enabled: api_key.is_some(),
+            auth_type,
+        }
+    }
+
+    /// 设置 count_tokens 远程配置；即时生效并持久化到 config.json。
+    ///
+    /// `api_url` 传 null/空串 = 用官方默认地址；`api_key` 传 null 表示保持原值
+    /// （前端不必回显密钥即可改其他字段），传空串表示清空 = 关闭远程。
+    pub fn set_count_tokens_config(
+        &self,
+        req: SetCountTokensConfigRequest,
+    ) -> Result<CountTokensConfigResponse, AdminServiceError> {
+        let (_, current_key, current_auth) = self.token_manager.get_count_tokens_config();
+
+        let api_key = match req.api_key {
+            None => current_key,
+            Some(k) => Some(k),
+        };
+        let auth_type = req.auth_type.unwrap_or(current_auth);
+
+        self.token_manager
+            .set_count_tokens_config(req.api_url, api_key, auth_type)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        Ok(self.get_count_tokens_config())
+    }
+
     /// 获取全局缓存模式
     pub fn get_global_cache(&self) -> GlobalCacheResponse {
         GlobalCacheResponse {
@@ -482,6 +521,46 @@ impl AdminService {
     }
 
     /// 获取注入扫描开关
+    /// 获取输入侧计费口径开关。
+    pub fn get_trust_inbound_count(&self) -> crate::admin::types::TrustInboundCountResponse {
+        let (_, api_key, _) = self.token_manager.get_count_tokens_config();
+        crate::admin::types::TrustInboundCountResponse {
+            enabled: crate::anthropic::trust_inbound_count(),
+            remote_count_enabled: api_key.is_some(),
+        }
+    }
+
+    /// 设置输入侧计费口径开关（同时持久化到 config.json）
+    pub fn set_trust_inbound_count(
+        &self,
+        req: crate::admin::types::SetTrustInboundCountRequest,
+    ) -> Result<crate::admin::types::TrustInboundCountResponse, AdminServiceError> {
+        let changed = crate::anthropic::trust_inbound_count() != req.enabled;
+        crate::anthropic::set_trust_inbound_count(req.enabled);
+
+        // 口径切换会让历史 billed 累计变成「另一套口径的数」（开=官方、关=上游反推），
+        // 再被当锚点钉住即单位混用。作废之，让下次命中按首次计费处理。
+        if changed {
+            self.cache_tracker.reset_billed_cumulative();
+        }
+
+        if let Some(config_path) = self.token_manager.config().config_path() {
+            match crate::model::config::Config::load(config_path) {
+                Ok(mut config) => {
+                    config.trust_inbound_count = req.enabled;
+                    if let Err(e) = config.save() {
+                        tracing::warn!("保存输入侧计费口径开关失败: {}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("重新加载配置失败，输入侧计费口径开关仅当前进程生效: {}", e);
+                }
+            }
+        }
+
+        Ok(self.get_trust_inbound_count())
+    }
+
     pub fn get_injection_scan(&self) -> crate::admin::types::InjectionScanResponse {
         crate::admin::types::InjectionScanResponse {
             enabled: crate::anthropic::injection_scan_enabled(),

@@ -196,6 +196,37 @@ export async function setRelayHost(relayHost: string | null): Promise<{ relayHos
   return data
 }
 
+// count_tokens 远程配置
+export interface CountTokensConfig {
+  // 自定义地址；null = 用官方默认地址（见 defaultApiUrl）
+  apiUrl: string | null
+  // 官方默认地址，供 placeholder 提示
+  defaultApiUrl: string
+  // 实际生效的地址（自定义优先，否则为默认地址）
+  effectiveApiUrl: string
+  // 后端只回传"是否已配置密钥"，不回传明文
+  apiKeySet: boolean
+  // 是否启用远程计数。以密钥为准：没密钥就不发远程请求
+  enabled: boolean
+  authType: string
+}
+
+export async function getCountTokensConfig(): Promise<CountTokensConfig> {
+  const { data } = await api.get<CountTokensConfig>('/config/count-tokens')
+  return data
+}
+
+// 设置 count_tokens 远程配置（apiUrl 传 null/空串关闭远程，立即生效并持久化）
+// apiKey 传 null/undefined = 保持原值不变；传空串 = 清空
+export async function setCountTokensConfig(payload: {
+  apiUrl: string | null
+  apiKey?: string | null
+  authType?: string
+}): Promise<CountTokensConfig> {
+  const { data } = await api.put<CountTokensConfig>('/config/count-tokens', payload)
+  return data
+}
+
 // 早响应模式（含模拟首字延迟）配置
 export interface EarlyFirstTokenConfig {
   enabled: boolean
@@ -239,6 +270,23 @@ export async function getRpmHardLimit(): Promise<{ enabled: boolean }> {
 // 设置 RPM 硬闸门开关
 export async function setRpmHardLimit(enabled: boolean): Promise<{ enabled: boolean }> {
   const { data } = await api.put<{ enabled: boolean }>('/config/rpm-hard-limit', { enabled })
+  return data
+}
+
+// 输入侧计费口径：是否直接采信入站计数（而非上游 contextUsage 反推）
+export interface TrustInboundCount {
+  enabled: boolean
+  // 入站计数是否走远程精确口径；false 时开启本开关会用本地启发式计费
+  remoteCountEnabled: boolean
+}
+
+export async function getTrustInboundCount(): Promise<TrustInboundCount> {
+  const { data } = await api.get<TrustInboundCount>('/config/trust-inbound-count')
+  return data
+}
+
+export async function setTrustInboundCount(enabled: boolean): Promise<TrustInboundCount> {
+  const { data } = await api.put<TrustInboundCount>('/config/trust-inbound-count', { enabled })
   return data
 }
 

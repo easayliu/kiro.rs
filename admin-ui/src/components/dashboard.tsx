@@ -54,6 +54,10 @@ import {
   useSetLoadBalancingMode,
   useRelayHost,
   useSetRelayHost,
+  useCountTokensConfig,
+  useSetCountTokensConfig,
+  useTrustInboundCount,
+  useSetTrustInboundCount,
   useCacheScope,
   useSetCacheScope,
   useInjectionScan,
@@ -161,6 +165,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [defaultRpmDialogOpen, setDefaultRpmDialogOpen] = useState(false)
   const [defaultRpmValue, setDefaultRpmValue] = useState('')
   const [relayHostDialogOpen, setRelayHostDialogOpen] = useState(false)
+  const [ctDialogOpen, setCtDialogOpen] = useState(false)
   const [eftDialogOpen, setEftDialogOpen] = useState(false)
   const [eftForm, setEftForm] = useState({
     enabled: true,
@@ -171,6 +176,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
     maxMs: '',
   })
   const [relayHostValue, setRelayHostValue] = useState('')
+  const [ctUrlValue, setCtUrlValue] = useState('')
+  const [ctKeyValue, setCtKeyValue] = useState('')
+  const [ctAuthValue, setCtAuthValue] = useState('x-api-key')
   const [batchConcurrencyDialogOpen, setBatchConcurrencyDialogOpen] = useState(false)
   const [batchConcurrencyValue, setBatchConcurrencyValue] = useState('')
   const [defaultConcurrencyDialogOpen, setDefaultConcurrencyDialogOpen] = useState(false)
@@ -269,6 +277,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const setDefaultRpmMutation = useSetDefaultRpmLimit()
   const { data: relayHostData } = useRelayHost()
   const setRelayHostMutation = useSetRelayHost()
+  const { data: ctData } = useCountTokensConfig()
+  const setCtMutation = useSetCountTokensConfig()
   const { data: earlyFirstTokenData, isLoading: isLoadingEft } = useEarlyFirstToken()
   const setEftMutation = useSetEarlyFirstToken()
   const { data: rpmHardLimitData, isLoading: isLoadingRpmHard } = useRpmHardLimit()
@@ -306,6 +316,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const { data: cacheScopeData, isLoading: isLoadingCacheScope } = useCacheScope()
   const { mutate: setCacheScopeMutation, isPending: isSettingCacheScope } = useSetCacheScope()
+  const { data: ticData, isLoading: isLoadingTic } = useTrustInboundCount()
+  const { mutate: setTicMutation, isPending: isSettingTic } = useSetTrustInboundCount()
   const { data: injectionScanData, isLoading: isLoadingInjectionScan } = useInjectionScan()
   const { mutate: setInjectionScanMutation, isPending: isSettingInjectionScan } = useSetInjectionScan()
   const { data: surfacePersonaData, isLoading: isLoadingSurfacePersona } = useSurfacePersona()
@@ -840,6 +852,49 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
   }
 
+  const openCtDialog = () => {
+    // 只回填自定义地址；留空即表示用官方默认（placeholder 里提示）
+    setCtUrlValue(ctData?.apiUrl ?? '')
+    // 密钥不回显（后端只告知是否已设置）；留空即保持原值不变
+    setCtKeyValue('')
+    setCtAuthValue(ctData?.authType ?? 'x-api-key')
+    setCtDialogOpen(true)
+  }
+
+  const handleCtSubmit = () => {
+    const url = ctUrlValue.trim()
+    const key = ctKeyValue.trim()
+    setCtMutation.mutate(
+      {
+        // 留空 = 用官方默认地址
+        apiUrl: url === '' ? null : url,
+        // 留空 = 保持原密钥不变（后端不回显密钥，故不能把「空」当成清空，
+        // 否则改地址会静默清掉密钥、关停远程）。要关闭请用下方「关闭远程」。
+        apiKey: key === '' ? null : key,
+        authType: ctAuthValue,
+      },
+      {
+        onSuccess: () => toast.success('远程 count_tokens 配置已保存'),
+        onError: err => toast.error('保存失败: ' + (err as Error).message),
+      },
+    )
+    setCtDialogOpen(false)
+  }
+
+  // 关闭远程 = 清空密钥（开关以密钥为准）
+  const handleCtDisable = () => {
+    setCtMutation.mutate(
+      { apiUrl: ctUrlValue.trim() === '' ? null : ctUrlValue.trim(), apiKey: '' },
+      {
+        onSuccess: () => {
+          toast.success('已关闭远程 count_tokens，回退本地估算')
+          setCtDialogOpen(false)
+        },
+        onError: err => toast.error('保存失败: ' + (err as Error).message),
+      },
+    )
+  }
+
   const openEftDialog = () => {
     setEftForm({
       enabled: earlyFirstTokenData?.enabled ?? true,
@@ -1023,6 +1078,19 @@ export function Dashboard({ onLogout }: DashboardProps) {
       current === 'global' ? 'per_credential' : current === 'per_credential' ? 'off' : 'global'
     setCacheScopeMutation(next, {
       onSuccess: () => toast.success(`缓存模式已切换到 ${cacheScopeLabel(next)}`),
+      onError: err => toast.error(`切换失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
+  const handleToggleTrustInboundCount = () => {
+    const next = !(ticData?.enabled ?? false)
+    // 没配远程 count_tokens 就开启 = 拿本地启发式当计费值，中文偏低约 25%、英文偏高约 30%
+    if (next && !(ticData?.remoteCountEnabled ?? false)) {
+      toast.warning('未启用远程 count_tokens，输入将按本地启发式计费（中文偏低、英文偏高）')
+    }
+    setTicMutation(next, {
+      onSuccess: () =>
+        toast.success(next ? '输入侧改为采信入站计数' : '输入侧恢复上游 contextUsage 反推'),
       onError: err => toast.error(`切换失败: ${extractErrorMessage(err)}`),
     })
   }
@@ -1870,6 +1938,29 @@ export function Dashboard({ onLogout }: DashboardProps) {
               onClick={() => { setPoliciesOpen(false); openRelayHostDialog() }}
             />
             <PolicyRow
+              label="远程 count_tokens"
+              sub={
+                ctData?.enabled
+                  ? '输入/输出均按精确口径计数，调不通自动回退本地'
+                  : '未启用（本地启发式估算，中文偏低、英文偏高）'
+              }
+              value={ctData?.enabled ? '已启用' : '关闭'}
+              disabled={setCtMutation.isPending}
+              onClick={() => { setPoliciesOpen(false); openCtDialog() }}
+            />
+            <PolicyRow
+              label="输入计费口径"
+              sub={
+                (ticData?.enabled ?? false)
+                  ? '采信入站计数，稳定可复现'
+                  : '上游 contextUsage 反推（百分比×窗口，小请求抖动大）'
+              }
+              value={isLoadingTic ? '—' : (ticData?.enabled ?? false) ? '入站计数' : '上游反推'}
+              loading={isLoadingTic}
+              disabled={isLoadingTic || isSettingTic}
+              onClick={handleToggleTrustInboundCount}
+            />
+            <PolicyRow
               label="早响应首字延迟"
               sub={
                 !(earlyFirstTokenData?.enabled ?? false)
@@ -2142,6 +2233,72 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Button>
             <Button onClick={handleRelayHostSubmit} disabled={setRelayHostMutation.isPending}>
               {setRelayHostMutation.isPending ? '保存中…' : '保存'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={ctDialogOpen} onOpenChange={setCtDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>远程 count_tokens</DialogTitle>
+            <DialogDescription>
+              启用后输入与输出 token 均调用远程 API 按官方口径精确计数，立即生效并持久化到 config.json。调用失败自动回退本地启发式，不影响请求成功。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 py-2">
+            <Input
+              type="text"
+              placeholder={ctData?.defaultApiUrl ?? '留空 = 官方默认地址'}
+              value={ctUrlValue}
+              onChange={e => setCtUrlValue(e.target.value)}
+              autoFocus
+              className="font-mono"
+            />
+            <Input
+              type="password"
+              placeholder={ctData?.apiKeySet ? '已配置密钥，留空则不修改' : 'API 密钥（填入即启用）'}
+              value={ctKeyValue}
+              onChange={e => setCtKeyValue(e.target.value)}
+              className="font-mono"
+            />
+            <ToggleGroup
+              type="single"
+              value={ctAuthValue}
+              onValueChange={v => { if (v) setCtAuthValue(v) }}
+              className="w-full"
+            >
+              <ToggleGroupItem value="x-api-key" className="flex-1">x-api-key</ToggleGroupItem>
+              <ToggleGroupItem value="bearer" className="flex-1">bearer</ToggleGroupItem>
+            </ToggleGroup>
+            <p className="text-2xs text-muted-foreground">
+              · 地址留空即用官方默认，无需每次填写；填入则走自定义（自建中继等）
+              <br />
+              · <b>密钥即开关</b>：配了才发远程；未配则全部回退本地 <span className="font-mono">ceil(字节数/4)</span> 估算
+              <br />
+              · 每次请求会多一次到该地址的往返，注意其延迟对首字的影响
+            </p>
+          </div>
+          <DialogFooter className="gap-2 sm:gap-2">
+            {ctData?.enabled && (
+              <Button
+                variant="outline"
+                className="mr-auto text-destructive"
+                onClick={handleCtDisable}
+                disabled={setCtMutation.isPending}
+              >
+                关闭远程
+              </Button>
+            )}
+            <Button
+              variant="outline"
+              onClick={() => setCtDialogOpen(false)}
+              disabled={setCtMutation.isPending}
+            >
+              取消
+            </Button>
+            <Button onClick={handleCtSubmit} disabled={setCtMutation.isPending}>
+              {setCtMutation.isPending ? '保存中…' : '保存'}
             </Button>
           </DialogFooter>
         </DialogContent>

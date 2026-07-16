@@ -19,6 +19,10 @@ import {
   setLoadBalancingMode,
   getRelayHost,
   setRelayHost,
+  getCountTokensConfig,
+  setCountTokensConfig,
+  getTrustInboundCount,
+  setTrustInboundCount,
   getGlobalCache,
   setGlobalCache,
   getInjectionScan,
@@ -258,6 +262,26 @@ export function useSetRelayHost() {
   })
 }
 
+// 获取 count_tokens 远程配置
+export function useCountTokensConfig() {
+  return useQuery({
+    queryKey: ['countTokensConfig'],
+    queryFn: getCountTokensConfig,
+  })
+}
+
+// 设置 count_tokens 远程配置
+export function useSetCountTokensConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (payload: { apiUrl: string | null; apiKey?: string | null; authType?: string }) =>
+      setCountTokensConfig(payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['countTokensConfig'] })
+    },
+  })
+}
+
 // 获取全局缓存模式
 export function useGlobalCache() {
   return useQuery({
@@ -293,6 +317,25 @@ export function useSetInjectionScan() {
     mutationFn: setInjectionScan,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['injectionScan'] })
+    },
+  })
+}
+
+// 获取输入侧计费口径开关
+export function useTrustInboundCount() {
+  return useQuery({
+    queryKey: ['trustInboundCount'],
+    queryFn: getTrustInboundCount,
+  })
+}
+
+// 设置输入侧计费口径开关
+export function useSetTrustInboundCount() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setTrustInboundCount,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['trustInboundCount'] })
     },
   })
 }

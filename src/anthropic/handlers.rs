@@ -123,6 +123,12 @@ pub(crate) struct CacheUsageContext {
     pub uncached_input_tokens: i32,
     /// 命中条目持久化的「上游计费口径」累计 token（W），计费时钉住 cache_read 以守恒。
     pub cache_read_billed: Option<i32>,
+    /// 三段是否已是官方口径（见 `CacheResult::segments_official`）。计费层据此决定
+    /// 能否直接采信，而非按上游反推缩放。
+    pub segments_official: bool,
+    /// 本地口径 total，与三段同单位。作为 `billed_split` 的缩放基准——不能用
+    /// `count_all_tokens` 的结果，那个配了远程是官方口径，与三段不同源。
+    pub local_total_input_tokens: i32,
     /// 是否处于无缓存模式（CacheScope::Off）。为 true 时计费不再扣除 Kiro 服务端
     /// 注入提示词基线（strip_injected_prompt），按上游反推总量原样计费。
     pub cache_disabled: bool,
@@ -1001,8 +1007,11 @@ async fn handle_stream_request(
     );
 
     // 原子地计算缓存命中并更新 checkpoint 表
-    let (cache_result, cache_writeback) =
+    let (mut cache_result, cache_writeback) =
         cache_tracker.compute_and_update(api_result.credential_id, &cache_profile);
+    // 分段由 block 累加（本地口径），total 配了远程后是官方口径——直接相减会混用单位。
+    // 用官方口径重算三段；远程不可用时保持本地口径原样返回。
+    super::cache_tracker::recount_cache_segments(&cache_profile, &mut cache_result).await;
     let cache_context = CacheUsageContext {
         cache_creation_input_tokens: cache_result.cache_creation_input_tokens,
         cache_read_input_tokens: cache_result.cache_read_input_tokens,
@@ -1010,6 +1019,8 @@ async fn handle_stream_request(
         cache_creation_1h_input_tokens: cache_result.cache_creation_1h_input_tokens,
         uncached_input_tokens: cache_result.uncached_input_tokens,
         cache_read_billed: cache_result.cache_read_billed,
+        segments_official: cache_result.segments_official,
+        local_total_input_tokens: cache_profile.local_total_input_tokens(),
         cache_disabled: matches!(cache_tracker.cache_scope(), CacheScope::Off),
     };
 
@@ -1111,8 +1122,10 @@ async fn handle_stream_request_early(
         .unwrap_or(0);
 
     // 原子地计算缓存命中并更新 checkpoint 表（按期望凭据先行记账）
-    let (cache_result, cache_writeback) =
+    let (mut cache_result, cache_writeback) =
         cache_tracker.compute_and_update(expected_cred, &cache_profile);
+    // 同上：把缓存分段换算成与 total 同源的官方口径。
+    super::cache_tracker::recount_cache_segments(&cache_profile, &mut cache_result).await;
     let cache_context = CacheUsageContext {
         cache_creation_input_tokens: cache_result.cache_creation_input_tokens,
         cache_read_input_tokens: cache_result.cache_read_input_tokens,
@@ -1120,6 +1133,8 @@ async fn handle_stream_request_early(
         cache_creation_1h_input_tokens: cache_result.cache_creation_1h_input_tokens,
         uncached_input_tokens: cache_result.uncached_input_tokens,
         cache_read_billed: cache_result.cache_read_billed,
+        segments_official: cache_result.segments_official,
+        local_total_input_tokens: cache_profile.local_total_input_tokens(),
         cache_disabled: matches!(cache_tracker.cache_scope(), CacheScope::Off),
     };
 
@@ -1610,8 +1625,11 @@ async fn handle_non_stream_request(
     );
 
     // 原子地计算缓存命中并更新 checkpoint 表
-    let (cache_result, cache_writeback) =
+    let (mut cache_result, cache_writeback) =
         cache_tracker.compute_and_update(api_result.credential_id, &cache_profile);
+    // 分段由 block 累加（本地口径），total 配了远程后是官方口径——直接相减会混用单位。
+    // 用官方口径重算三段；远程不可用时保持本地口径原样返回。
+    super::cache_tracker::recount_cache_segments(&cache_profile, &mut cache_result).await;
     let cache_context = CacheUsageContext {
         cache_creation_input_tokens: cache_result.cache_creation_input_tokens,
         cache_read_input_tokens: cache_result.cache_read_input_tokens,
@@ -1619,6 +1637,8 @@ async fn handle_non_stream_request(
         cache_creation_1h_input_tokens: cache_result.cache_creation_1h_input_tokens,
         uncached_input_tokens: cache_result.uncached_input_tokens,
         cache_read_billed: cache_result.cache_read_billed,
+        segments_official: cache_result.segments_official,
+        local_total_input_tokens: cache_profile.local_total_input_tokens(),
         cache_disabled: matches!(cache_tracker.cache_scope(), CacheScope::Off),
     };
 
@@ -1818,9 +1838,9 @@ async fn handle_non_stream_request(
 
     content.extend(tool_uses);
 
-    // 估算输出 tokens：tokenizer 计数（output 无上游真值兜底，本地即计费值），
-    // 与流式 count_tokens 口径一致。
-    let true_output_tokens = token::estimate_output_tokens(&content);
+    // 估算输出 tokens：配了远程 count_tokens 则走精确口径，否则本地启发式。
+    // output 无上游真值兜底，此处算出的即计费值。与流式 count_tokens 口径一致。
+    let true_output_tokens = token::estimate_output_tokens(model, &content);
     // 套用输出上报倍率：放大后用于下游 usage 与计费口径；真实切分数仅留作日志对账。
     let output_tokens = super::converter::apply_output_token_multiplier(true_output_tokens);
 
@@ -1843,10 +1863,13 @@ async fn handle_non_stream_request(
             } else {
                 super::converter::strip_injected_prompt(model, context_total, estimated_input_tokens)
             };
-            let billed = estimated_usage.billed_split(
-                estimated_input_tokens,
+            let billed = estimated_usage.billed_or_official(
+                // 缩放基准取本地 total（与三段同单位），不是 estimated_input_tokens
+                // ——后者配了远程是官方口径，会让 scale 退化成 1.0。
+                cache_context.local_total_input_tokens,
                 content_total,
                 cache_context.cache_read_billed,
+                cache_context.segments_official,
             );
             // 计费完成后把缩放后的 billed 累计回写缓存，供下次命中实现读写守恒。
             cache_tracker.apply_billing_writeback(
@@ -1875,14 +1898,14 @@ async fn handle_non_stream_request(
             target: "token-diag",
             model = %model,
             window = window,
-            local_estimate = estimated_input_tokens,
+            inbound_count = estimated_input_tokens,
             upstream_total = upstream_total,
             diff = diff,
             diff_pct = format!("{:.1}%", diff_pct),
             billed_uncached = billing.uncached_input_tokens,
             billed_cache_read = billing.cache_read_input_tokens,
             billed_cache_creation = billing.cache_creation_input_tokens,
-            "[token-diag] 上游反推 vs 本地估算（非流式）"
+            "[token-diag] 上游反推 vs 入站计数（非流式）"
         );
     }
 
@@ -2252,8 +2275,11 @@ async fn handle_stream_request_buffered(
     );
 
     // 原子地计算缓存命中并更新 checkpoint 表
-    let (cache_result, cache_writeback) =
+    let (mut cache_result, cache_writeback) =
         cache_tracker.compute_and_update(api_result.credential_id, &cache_profile);
+    // 分段由 block 累加（本地口径），total 配了远程后是官方口径——直接相减会混用单位。
+    // 用官方口径重算三段；远程不可用时保持本地口径原样返回。
+    super::cache_tracker::recount_cache_segments(&cache_profile, &mut cache_result).await;
     let cache_context = CacheUsageContext {
         cache_creation_input_tokens: cache_result.cache_creation_input_tokens,
         cache_read_input_tokens: cache_result.cache_read_input_tokens,
@@ -2261,6 +2287,8 @@ async fn handle_stream_request_buffered(
         cache_creation_1h_input_tokens: cache_result.cache_creation_1h_input_tokens,
         uncached_input_tokens: cache_result.uncached_input_tokens,
         cache_read_billed: cache_result.cache_read_billed,
+        segments_official: cache_result.segments_official,
+        local_total_input_tokens: cache_profile.local_total_input_tokens(),
         cache_disabled: matches!(cache_tracker.cache_scope(), CacheScope::Off),
     };
 

@@ -211,6 +211,9 @@ async fn main() {
     // 计费扣除 Kiro 服务端注入的固定提示词基线（终端用户只按真实内容计费）。
     anthropic::set_injected_prompt_tokens(config.kiro_injected_prompt_tokens);
 
+    // 输入侧计费是否采信入站计数（绕开上游 contextUsage 百分比反推的抖动）。
+    anthropic::set_trust_inbound_count(config.trust_inbound_count);
+
     // 输出 token 上报倍率（仅放大计费/上报口径，上游真实成本与缓存命中率不变）。
     anthropic::set_output_token_multiplier(config.output_token_multiplier);
 

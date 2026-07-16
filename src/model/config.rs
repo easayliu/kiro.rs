@@ -139,6 +139,17 @@ pub struct Config {
     #[serde(default = "default_kiro_injected_prompt_tokens")]
     pub kiro_injected_prompt_tokens: i32,
 
+    /// 输入侧计费是否直接采信入站计数，而非上游 contextUsage 反推（默认 false）。
+    ///
+    /// 上游只回百分比，乘 1M 窗口反推会把末位抖动放大：实测同一请求反推 6652/6711/6609，
+    /// 扣注入后计费 167/226/124，而真实内容仅 36 token——小请求下噪声远大于信号。
+    /// 开启后跳过反推与注入扣除，直接用入站计数，稳定可复现。
+    ///
+    /// **建议配合 `countTokensApiKey` 一起开**：入站计数此时为官方精确口径；否则用的是
+    /// 本地启发式 `ceil(字节/4)`（中文偏低约 25%、纯英文偏高约 30%），会系统性错计。
+    #[serde(default)]
+    pub trust_inbound_count: bool,
+
     /// HTTP 代理地址（可选）
     /// 支持格式: http://host:port, https://host:port, socks5://host:port
     #[serde(default)]
@@ -425,6 +436,7 @@ impl Default for Config {
             count_tokens_api_url: None,
             count_tokens_api_key: None,
             count_tokens_auth_type: default_count_tokens_auth_type(),
+            trust_inbound_count: false,
             kiro_injected_prompt_tokens: default_kiro_injected_prompt_tokens(),
             proxy_url: None,
             proxy_username: None,

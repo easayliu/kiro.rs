@@ -320,14 +320,39 @@ pub fn effective_injected_floor(model: &str) -> i32 {
     injected_floor_hardcoded(model).unwrap_or(global)
 }
 
+/// 输入侧是否直接采信入站计数（而非上游 `contextUsage` 反推）。
+///
+/// 上游只给到百分比，乘 1M 窗口反推会把末位抖动放大成几十上百 token（实测同一请求
+/// 反推 6652/6711/6609 → 计费 167/226/124，而真实内容仅 36），小请求下噪声大于信号。
+/// 开启后计费直接用入站计数：配了远程 count_tokens 时即官方精确口径，稳定可复现；
+/// 未配远程时则是本地启发式（`ceil(字节/4)`，中文偏低、英文偏高），慎用。
+static TRUST_INBOUND_COUNT: AtomicBool = AtomicBool::new(false);
+
+/// 设置输入侧是否采信入站计数（启动时由配置注入 / Admin 运行时改）。
+pub fn set_trust_inbound_count(enabled: bool) {
+    TRUST_INBOUND_COUNT.store(enabled, Ordering::Relaxed);
+}
+
+/// 当前是否采信入站计数。
+pub fn trust_inbound_count() -> bool {
+    TRUST_INBOUND_COUNT.load(Ordering::Relaxed)
+}
+
 /// 从上游反推总量里扣掉 Kiro 注入地板，得到计费用的「内容总量」。
 ///
 /// - `model`：本次请求模型（决定 per-model 精确地板，见 [`effective_injected_floor`]）。
 /// - `context_total`：上游 `contextUsage` 反推的 input_tokens（含注入）。
-/// - `local_estimate`：本地对**客户端内容**的 token 估算，作为下限——地板偏大时
-///   floor 到它，避免反向少计内容；并保底 1。
+/// - `local_estimate`：入站侧对**客户端内容**的计数（配了远程 count_tokens 即官方
+///   精确值，否则为本地启发式）。默认作为下限——地板偏大时 floor 到它，避免反向
+///   少计内容；并保底 1。
+///
+/// [`trust_inbound_count`] 开启时改为直接返回该计数，完全不采信上游反推，用于规避
+/// 上游百分比抖动（见 [`TRUST_INBOUND_COUNT`]）。
 /// 生效地板为 0（未配置 / 主开关关）时原样返回，保持原行为。
 pub fn strip_injected_prompt(model: &str, context_total: i32, local_estimate: i32) -> i32 {
+    if trust_inbound_count() {
+        return local_estimate.max(1);
+    }
     let baseline = effective_injected_floor(model);
     if baseline <= 0 {
         return context_total;
@@ -2427,6 +2452,27 @@ mod pairing_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_injected_prompt_trusts_inbound_count_when_enabled() {
+        let _guard = super::INJECTED_BASELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_injected_prompt_tokens(6384);
+        set_trust_inbound_count(true);
+
+        // 开关打开后完全不看上游反推：同一入站计数下，上游值怎么抖结果都一样。
+        // 这正是本开关的目的——规避上游百分比反推的抖动（实测 6652/6711/6609）。
+        assert_eq!(strip_injected_prompt("claude-opus-4-8", 6652, 36), 36);
+        assert_eq!(strip_injected_prompt("claude-opus-4-8", 6711, 36), 36);
+        assert_eq!(strip_injected_prompt("claude-opus-4-8", 6609, 36), 36);
+        // 保底 1，不出现 0 计费。
+        assert_eq!(strip_injected_prompt("claude-opus-4-8", 6609, 0), 1);
+
+        // 关掉后恢复原行为：扣基线、floor 到入站计数。
+        set_trust_inbound_count(false);
+        assert_eq!(strip_injected_prompt("totally-unknown-model", 7101, 223), 717);
+    }
 
     #[test]
     fn strip_injected_prompt_subtracts_baseline_with_floor() {

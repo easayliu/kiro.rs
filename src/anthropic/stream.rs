@@ -309,6 +309,30 @@ impl CacheUsage {
     ///
     /// `billed_read = None`（首次命中 / 前序计费未回写）时退回缩放本地 cache_read。
     /// `estimated_total <= 0` 或 `context_total <= 0` 时原样返回（无可用比例）。
+    /// 计费用的三段：开了官方计数就直接采信，否则走 [`Self::billed_split`] 锚定上游。
+    ///
+    /// 直接采信的前提是**两个条件同时成立**：
+    /// 1. `trust_inbound_count` 开启——计费口径就是入站计数，不该再按上游反推缩放；
+    /// 2. `segments_official`——三段确已由 `cache_tracker::recount_cache_segments` 用官方
+    ///    口径重算且自洽（read + creation + uncached == 官方 total）。
+    ///
+    /// 只看条件 1 是不够的：重算有失败分支（远程 429/超时 → `fallback_to_local`），此时
+    /// 三段退回**本地**口径。若仍短路，就是把本地数当官方数计费——实测低约 38%
+    /// （2250 vs 3616），与「采信入站计数」的语义正好相反。故失败时照常走 `billed_split`
+    /// 缩放，行为与开关关闭时一致。
+    pub(crate) fn billed_or_official(
+        &self,
+        estimated_total: i32,
+        context_total: i32,
+        billed_read: Option<i32>,
+        segments_official: bool,
+    ) -> Self {
+        if segments_official && super::converter::trust_inbound_count() {
+            return *self;
+        }
+        self.billed_split(estimated_total, context_total, billed_read)
+    }
+
     pub(crate) fn billed_split(
         &self,
         estimated_total: i32,
@@ -670,6 +694,10 @@ pub struct StreamContext {
     /// 命中条目持久化的「上游计费口径」累计 token（W）。计费时把 cache_read
     /// 钉到该值以保证读写守恒；`None` 时回退到缩放本地估算。
     cache_read_billed: Option<i32>,
+    /// 三段是否已是官方口径（见 `CacheResult::segments_official`）。
+    segments_official: bool,
+    /// 本地口径 total，与三段同单位；`billed_split` 的缩放基准。
+    local_total_input_tokens: i32,
     /// 计费完成后的回写句柄：(tracker, writeback)。收到 contextUsageEvent 时，
     /// 在 generate_final_events 里把缩放后的 billed 累计回写到缓存条目。
     billing_writeback: Option<(Arc<CacheTracker>, CacheWriteback)>,
@@ -745,6 +773,8 @@ impl StreamContext {
             output_buf: String::new(),
             cache_usage: CacheUsage::default(),
             cache_read_billed: None,
+            segments_official: false,
+            local_total_input_tokens: 0,
             billing_writeback: None,
             upstream_credit: None,
             start: Instant::now(),
@@ -806,6 +836,8 @@ impl StreamContext {
             uncached_input_tokens: ctx.uncached_input_tokens,
         };
         self.cache_read_billed = ctx.cache_read_billed;
+        self.segments_official = ctx.segments_official;
+        self.local_total_input_tokens = ctx.local_total_input_tokens;
         self.cache_disabled = ctx.cache_disabled;
     }
 
@@ -1493,7 +1525,13 @@ impl StreamContext {
                     )
                 };
                 self.cache_usage
-                    .billed_split(self.input_tokens, content_total, self.cache_read_billed)
+                    .billed_or_official(
+                        // 缩放基准取本地 total（与三段同单位），见 CacheUsageContext。
+                        self.local_total_input_tokens,
+                        content_total,
+                        self.cache_read_billed,
+                        self.segments_official,
+                    )
             }
             None => self.cache_usage,
         }
@@ -1625,14 +1663,14 @@ impl StreamContext {
                 target: "token-diag",
                 model = %self.model,
                 window = window,
-                local_estimate = local_est,
+                inbound_count = local_est,
                 upstream_total = upstream_total,
                 diff = diff,
                 diff_pct = format!("{:.1}%", diff_pct),
                 billed_uncached = billing.uncached_input_tokens,
                 billed_cache_read = billing.cache_read_input_tokens,
                 billed_cache_creation = billing.cache_creation_input_tokens,
-                "[token-diag] 上游反推 vs 本地估算"
+                "[token-diag] 上游反推 vs 入站计数"
             );
         }
 
@@ -1647,10 +1685,11 @@ impl StreamContext {
             }
         }
 
-        // 输出 token 计数：对整段输出文本（thinking+正文+tool 入参）做一次 tokenizer
-        // 计数（整串切分，避免逐 chunk 在 BPE 边界处的系统性偏差）。output 无上游真值
-        // 兜底，本地 DeepSeek 切分数即最终上报/计费值。保底 1。
-        let true_output_tokens = (crate::token::count_tokens(&self.output_buf) as i32).max(1);
+        // 输出 token 计数：对整段输出文本（thinking+正文+tool 入参）做一次计数（整串
+        // 切分，避免逐 chunk 在 BPE 边界处的系统性偏差）。配了远程 count_tokens 则走
+        // 精确口径，否则本地启发式。output 无上游真值兜底，此处算出的即计费值。保底 1。
+        let true_output_tokens =
+            (crate::token::count_output_tokens(&self.model, &self.output_buf) as i32).max(1);
         // 套用输出上报倍率：放大后的值用于下游 usage 与计费口径（official_price/统计）；
         // 真实切分数仅留作日志对账。未启用倍率时二者相等。
         self.output_tokens = super::converter::apply_output_token_multiplier(true_output_tokens);
@@ -2877,6 +2916,8 @@ mod tests {
             cache_read_input_tokens: 200,
             cache_creation_5m_input_tokens: 300,
             uncached_input_tokens: 500,
+            // 三段（300+200+500）的本地口径总量，作为缩放基准。
+            local_total_input_tokens: 1000,
             ..Default::default()
         });
 
@@ -2914,6 +2955,8 @@ mod tests {
             cache_read_input_tokens: 200,
             cache_creation_5m_input_tokens: 300,
             uncached_input_tokens: 500,
+            // 三段（300+200+500）的本地口径总量，作为缩放基准。
+            local_total_input_tokens: 1000,
             ..Default::default()
         });
         ctx.context_input_tokens = Some(2000);
@@ -2990,6 +3033,8 @@ mod tests {
         ctx.set_cache_usage(CacheUsageContext {
             uncached_input_tokens: 1000,
             cache_disabled: true,
+            // Off 模式下整段未缓存，本地口径总量即 uncached 本身。
+            local_total_input_tokens: 1000,
             ..Default::default()
         });
         ctx.context_input_tokens = Some(8000);
@@ -3023,6 +3068,8 @@ mod tests {
             cache_read_input_tokens: 200,
             cache_creation_5m_input_tokens: 300,
             uncached_input_tokens: 500,
+            // 三段（300+200+500）的本地口径总量，作为缩放基准。
+            local_total_input_tokens: 1000,
             ..Default::default()
         });
 

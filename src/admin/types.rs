@@ -322,6 +322,39 @@ pub struct SetRelayHostRequest {
     pub relay_host: Option<String>,
 }
 
+// ============ count_tokens 远程配置 ============
+
+/// count_tokens 远程配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CountTokensConfigResponse {
+    /// 自定义 API 地址；null 表示用官方默认地址（见 `default_api_url`）
+    pub api_url: Option<String>,
+    /// 官方默认地址，供前端做 placeholder 提示
+    pub default_api_url: String,
+    /// 实际生效的地址（自定义优先，否则为默认地址）
+    pub effective_api_url: String,
+    /// 是否已配置密钥。密钥本身不回传，避免 Admin API 泄露凭据
+    pub api_key_set: bool,
+    /// 是否启用远程计数。以密钥为准：没密钥就不发远程请求
+    pub enabled: bool,
+    /// 认证类型："x-api-key" 或 "bearer"
+    pub auth_type: String,
+}
+
+/// 设置 count_tokens 远程配置请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCountTokensConfigRequest {
+    /// 远程 API 地址；传 null 或空串表示关闭远程、全部回退本地启发式
+    pub api_url: Option<String>,
+    /// 密钥；传 null 表示保持原值不变，传空串表示清空
+    pub api_key: Option<String>,
+    /// 认证类型："x-api-key"（默认）或 "bearer"
+    #[serde(default)]
+    pub auth_type: Option<String>,
+}
+
 // ============ 全局缓存配置 ============
 
 /// 全局缓存模式响应
@@ -337,6 +370,24 @@ pub struct GlobalCacheResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SetGlobalCacheRequest {
     /// 是否启用全局缓存
+    pub enabled: bool,
+}
+
+/// 输入侧计费口径开关响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustInboundCountResponse {
+    /// 是否直接采信入站计数（而非上游 contextUsage 反推）
+    pub enabled: bool,
+    /// 入站计数当前是否走远程精确口径。为 false 时开启本开关会用本地启发式计费，前端应警示
+    pub remote_count_enabled: bool,
+}
+
+/// 设置输入侧计费口径开关请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTrustInboundCountRequest {
+    /// 是否直接采信入站计数
     pub enabled: bool,
 }
 

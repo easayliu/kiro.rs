@@ -12,7 +12,7 @@ use crate::anthropic::types::{
 };
 use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
-use std::sync::OnceLock;
+use parking_lot::RwLock;
 
 /// Count Tokens API 配置
 #[derive(Clone, Default)]
@@ -29,19 +29,72 @@ pub struct CountTokensConfig {
     pub tls_backend: TlsBackend,
 }
 
-/// 全局配置存储
-static COUNT_TOKENS_CONFIG: OnceLock<CountTokensConfig> = OnceLock::new();
-
-/// 初始化 count_tokens 配置
+/// 远程 count_tokens 的默认地址：Anthropic 官方端点。
 ///
-/// 应在应用启动时调用一次
+/// `api_url` 未配置时回落到此值，免去每次填写；填了则用自定义地址（自建中继等）。
+pub const DEFAULT_COUNT_TOKENS_API_URL: &str = "https://api.anthropic.com/v1/messages/count_tokens";
+
+/// 全局配置存储。
+///
+/// 用 `RwLock` 而非 `OnceLock`：Admin API 需要在运行时改 count_tokens 配置并即时
+/// 生效（`OnceLock::set` 第二次调用会静默失败，页面显示成功但配置不动）。
+static COUNT_TOKENS_CONFIG: RwLock<Option<CountTokensConfig>> = RwLock::new(None);
+
+/// 初始化 count_tokens 配置（启动时调用）
 pub fn init_config(config: CountTokensConfig) {
-    let _ = COUNT_TOKENS_CONFIG.set(config);
+    *COUNT_TOKENS_CONFIG.write() = Some(config);
 }
 
-/// 获取配置
-fn get_config() -> Option<&'static CountTokensConfig> {
-    COUNT_TOKENS_CONFIG.get()
+/// 运行时更新 count_tokens 配置（Admin API 调用，即时生效）
+pub fn update_config(api_url: Option<String>, api_key: Option<String>, auth_type: String) {
+    let mut guard = COUNT_TOKENS_CONFIG.write();
+    if let Some(cfg) = guard.as_mut() {
+        cfg.api_url = api_url;
+        cfg.api_key = api_key;
+        cfg.auth_type = auth_type;
+    }
+}
+
+/// 读取当前 count_tokens 配置（api_url, api_key, auth_type）
+pub fn get_config_snapshot() -> (Option<String>, Option<String>, String) {
+    let guard = COUNT_TOKENS_CONFIG.read();
+    match guard.as_ref() {
+        Some(c) => (c.api_url.clone(), c.api_key.clone(), c.auth_type.clone()),
+        None => (None, None, default_count_tokens_auth_type()),
+    }
+}
+
+fn default_count_tokens_auth_type() -> String {
+    "x-api-key".to_string()
+}
+
+/// 获取配置（内部使用，返回克隆以避免持锁跨 await）
+fn get_config() -> Option<CountTokensConfig> {
+    COUNT_TOKENS_CONFIG.read().clone()
+}
+
+/// 远程 count_tokens 是否已启用（配了密钥即启用）。
+///
+/// 供调用方在做「远程失败则整体退回本地」这类兜底前先行短路——未启用不是失败，
+/// 不该走告警路径。
+pub(crate) fn remote_enabled() -> bool {
+    get_config()
+        .map(|c| resolve_remote(&c).is_some())
+        .unwrap_or(false)
+}
+
+/// 解析出「本次是否走远程、走哪个地址」。
+///
+/// 开关以**密钥**为准：没配密钥就不发远程（避免必然 401 还白跑一次往返）。
+/// 地址缺省时回落 [`DEFAULT_COUNT_TOKENS_API_URL`]。
+fn resolve_remote(config: &CountTokensConfig) -> Option<String> {
+    config.api_key.as_ref()?;
+    Some(
+        config
+            .api_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_COUNT_TOKENS_API_URL.to_string()),
+    )
 }
 
 /// 启发式换算基数（UTF-8 字节 / 4，贴近 Claude BPE 平均压缩比）。
@@ -61,30 +114,42 @@ pub(crate) fn count_all_tokens(
     messages: Vec<Message>,
     tools: Option<Vec<Tool>>,
 ) -> u64 {
-    // 检查是否配置了远程 API
+    // 检查是否启用远程（以密钥为准，地址缺省回落官方）
     if let Some(config) = get_config() {
-        if let Some(api_url) = &config.api_url {
+        if let Some(api_url) = resolve_remote(&config) {
             // 尝试调用远程 API
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(call_remote_count_tokens(
-                    api_url, config, model, &system, &messages, &tools,
+                    &api_url, &config, model, &system, &messages, &tools,
                 ))
             });
 
             match result {
                 Ok(tokens) => {
-                    tracing::debug!("远程 count_tokens API 返回: {}", tokens);
+                    tracing::debug!(
+                        source = "remote",
+                        api_url = %api_url,
+                        tokens,
+                        "count_tokens(input) 走远程"
+                    );
                     return tokens;
                 }
                 Err(e) => {
-                    tracing::warn!("远程 count_tokens API 调用失败，回退到本地计算: {}", e);
+                    tracing::warn!(
+                        source = "local_fallback",
+                        api_url = %api_url,
+                        error = %e,
+                        "count_tokens(input) 远程失败，回退本地启发式"
+                    );
                 }
             }
         }
     }
 
     // 本地计算
-    count_all_tokens_local(system, messages, tools)
+    let tokens = count_all_tokens_local(system, messages, tools);
+    tracing::debug!(source = "local", tokens, "count_tokens(input) 走本地启发式");
+    tokens
 }
 
 /// 调用远程 count_tokens API
@@ -118,9 +183,10 @@ async fn call_remote_count_tokens(
         }
     }
 
-    // 发送请求
+    // 发送请求。anthropic-version 为官方 API 必填头，缺失一律 400。
     let response = req_builder
         .header("Content-Type", "application/json")
+        .header("anthropic-version", "2023-06-01")
         .json(&request)
         .send()
         .await?;
@@ -131,6 +197,148 @@ async fn call_remote_count_tokens(
 
     let result: CountTokensResponse = response.json().await?;
     Ok(result.input_tokens as u64)
+}
+
+/// 远程计数结果的本地缓存：内容 hash → 官方 token 数。
+///
+/// 同一段 system 前缀 / tools 定义在会话里反复出现，其官方 token 数是内容的纯函数，
+/// 算一次即可复用。缓存分段重算尤其吃这个：cache_read 段按定义就是「没变过的前缀」，
+/// 每轮都会以同样内容再数一次。命中即省一次跨洋往返，也直接压低 count_tokens 的 RPM
+/// （该端点不返回任何 `anthropic-ratelimit-*` 头，触限只会静默 429 → 回退本地）。
+/// 满则整体清空（非 LRU）：条目是纯函数结果、无过期语义，清空只是丢失一轮预热，
+/// 不会算错；换取零依赖与读路径上的 `read()` 无写锁竞争。
+static REMOTE_COUNT_CACHE: RwLock<Option<std::collections::HashMap<u64, u64>>> =
+    RwLock::new(None);
+
+/// 远程计数缓存容量（条）。key/value 各 8 字节，几千条也就几十 KB。
+const REMOTE_COUNT_CACHE_CAP: usize = 4096;
+
+fn remote_count_cache_get(key: u64) -> Option<u64> {
+    REMOTE_COUNT_CACHE.read().as_ref()?.get(&key).copied()
+}
+
+fn remote_count_cache_put(key: u64, tokens: u64) {
+    let mut guard = REMOTE_COUNT_CACHE.write();
+    let cache = guard.get_or_insert_with(Default::default);
+    if cache.len() >= REMOTE_COUNT_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key, tokens);
+}
+
+/// 计数缓存的 key：模型 + 请求体内容的 hash（模型不同分词不同，必须入 key）。
+fn remote_count_cache_key(model: &str, body: &serde_json::Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    model.hash(&mut h);
+    serde_json::to_string(body).unwrap_or_default().hash(&mut h);
+    h.finish()
+}
+
+/// 对任意 payload 调远程 count_tokens，返回官方 token 数；未启用远程或失败返回 None。
+///
+/// 结果按内容 hash 缓存（见 [`REMOTE_COUNT_CACHE`]）。调用方拿到 None 时应保留原口径，
+/// 不要用本地估算去补——那会造成单位混用。
+pub(crate) async fn count_payload_remote(payload: &crate::anthropic::types::MessagesRequest) -> Option<u64> {
+    let config = get_config()?;
+    let api_url = resolve_remote(&config)?;
+
+    let request = CountTokensRequest {
+        model: payload.model.clone(),
+        messages: payload.messages.clone(),
+        system: payload.system.clone(),
+        tools: payload.tools.clone(),
+    };
+    let body = serde_json::to_value(&request).ok()?;
+    let key = remote_count_cache_key(&payload.model, &body);
+
+    if let Some(hit) = remote_count_cache_get(key) {
+        tracing::debug!(source = "remote_cached", tokens = hit, "count_tokens(payload) 命中本地缓存");
+        return Some(hit);
+    }
+
+    match call_remote_count_tokens(
+        &api_url,
+        &config,
+        payload.model.clone(),
+        &payload.system,
+        &payload.messages,
+        &payload.tools,
+    )
+    .await
+    {
+        Ok(tokens) => {
+            remote_count_cache_put(key, tokens);
+            tracing::debug!(source = "remote", api_url = %api_url, tokens, "count_tokens(payload) 走远程");
+            Some(tokens)
+        }
+        Err(e) => {
+            tracing::warn!(
+                source = "local_fallback",
+                api_url = %api_url,
+                error = %e,
+                "count_tokens(payload) 远程失败"
+            );
+            None
+        }
+    }
+}
+
+/// 计算一段输出文本的 token 数。
+///
+/// 优先走远程 count_tokens（把文本包成单条 user message 送去数），直接采信官方
+/// 返回值；未配置或调用失败时回退本地启发式。空串返回 0，不产生远程调用。
+///
+/// 注：该端点数的是「一条 message」，返回值含 role/boundary 结构开销，且开销随模型
+/// 不同（实测重复文本线性回归，斜率恒为 1.0，截距：opus-4-8 / sonnet-5 / fable-5 为
+/// 7，sonnet-4-6 / haiku-4-5 为 8，opus-4-7 为 12）。此处不做扣除，以官方口径为准。
+pub(crate) fn count_output_tokens(model: &str, text: &str) -> u64 {
+    if text.is_empty() {
+        return 0;
+    }
+
+    if let Some(config) = get_config() {
+        if let Some(api_url) = resolve_remote(&config) {
+            let messages = vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String(text.to_string()),
+            }];
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(call_remote_count_tokens(
+                    &api_url,
+                    &config,
+                    model.to_string(),
+                    &None,
+                    &messages,
+                    &None,
+                ))
+            });
+
+            match result {
+                Ok(tokens) => {
+                    tracing::debug!(
+                        source = "remote",
+                        api_url = %api_url,
+                        tokens,
+                        "count_tokens(output) 走远程"
+                    );
+                    return tokens;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        source = "local_fallback",
+                        api_url = %api_url,
+                        error = %e,
+                        "count_tokens(output) 远程失败，回退本地启发式"
+                    );
+                }
+            }
+        }
+    }
+
+    let tokens = count_tokens(text);
+    tracing::debug!(source = "local", tokens, "count_tokens(output) 走本地启发式");
+    tokens
 }
 
 /// 每条 message 的结构开销（role token、boundary 分隔符等）。
@@ -148,7 +356,7 @@ const TOKENS_PER_MESSAGE_OVERHEAD: u64 = 4;
 /// 累加 block 级内容 tokens 后再为每条 message 加上结构 overhead，让
 /// `total_input_tokens > cache_tracker 内部累计的 block token 总和`，保证
 /// `uncached = total - (read + creation)` 在全缓存场景也 > 0（对齐 Anthropic）。
-fn count_all_tokens_local(
+pub(crate) fn count_all_tokens_local(
     system: Option<Vec<SystemMessage>>,
     messages: Vec<Message>,
     tools: Option<Vec<Tool>>,
@@ -177,25 +385,27 @@ fn count_all_tokens_local(
 
 /// 估算输出 tokens（非流式路径）。
 ///
-/// 对输出内容（正文 + tool 入参）用内嵌 DeepSeek tokenizer 做切分计数。output
-/// **没有**上游 `contextUsageEvent` 真值兜底，本地 DeepSeek 切分数即最终上报/计费值。
-pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
-    let mut total = 0;
+/// 对输出内容（正文 + tool 入参）计数：配置了 `count_tokens_api_url` 时走远程精确
+/// 口径（见 [`count_output_tokens`]），否则用本地启发式 `ceil(utf8_byte_len / 4)`。
+/// output **没有**上游 `contextUsageEvent` 真值兜底，此处算出的即最终上报/计费值。
+/// 各 block 先拼成整串再一次性计数（与流式 `output_buf` 口径一致：整串切分可避免
+/// 逐 block 在 BPE 边界处的系统性偏差，也把远程调用收敛为每响应一次）。
+pub(crate) fn estimate_output_tokens(model: &str, content: &[serde_json::Value]) -> i32 {
+    let mut buf = String::new();
 
     for block in content {
         if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-            total += count_tokens(text) as i32;
+            buf.push_str(text);
         }
         if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
             // 工具调用开销
             if let Some(input) = block.get("input") {
-                let input_str = serde_json::to_string(input).unwrap_or_default();
-                total += count_tokens(&input_str) as i32;
+                buf.push_str(&serde_json::to_string(input).unwrap_or_default());
             }
         }
     }
 
-    total.max(1)
+    (count_output_tokens(model, &buf) as i32).max(1)
 }
 
 /// 计算系统消息的 tokens

@@ -7,6 +7,8 @@ use axum::{
 
 use super::{
     handlers::{
+        get_count_tokens_config, set_count_tokens_config,
+        get_trust_inbound_count, set_trust_inbound_count,
         add_credential, batch_delete_credentials, batch_set_concurrency_limit,
         batch_set_credential_group,
         batch_set_disabled, batch_set_overage,
@@ -50,6 +52,10 @@ use super::{
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
 /// - `GET /config/relay-host` - 获取上游中继地址
 /// - `PUT /config/relay-host` - 设置上游中继地址（null/空串关闭）
+/// - `GET /config/count-tokens` - 获取 count_tokens 远程配置
+/// - `PUT /config/count-tokens` - 设置 count_tokens 远程配置（apiUrl 置空即关闭）
+/// - `GET /config/trust-inbound-count` - 获取输入侧计费口径开关
+/// - `PUT /config/trust-inbound-count` - 设置输入侧计费口径开关
 /// - `GET /config/global-cache` - 获取全局缓存模式
 /// - `PUT /config/global-cache` - 设置全局缓存模式
 /// - `GET /config/proxy-groups` - 列出所有代理分组
@@ -115,6 +121,14 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/global-cache",
             get(get_global_cache).put(set_global_cache),
+        )
+        .route(
+            "/config/count-tokens",
+            get(get_count_tokens_config).put(set_count_tokens_config),
+        )
+        .route(
+            "/config/trust-inbound-count",
+            get(get_trust_inbound_count).put(set_trust_inbound_count),
         )
         .route(
             "/config/injection-scan",
