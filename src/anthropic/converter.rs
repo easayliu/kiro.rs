@@ -307,6 +307,39 @@ fn injected_floor_hardcoded(model: &str) -> Option<i32> {
     }
 }
 
+/// 生成侧独有的 output token 增量（per-model 实测）。
+///
+/// `token::count_output_tokens` 的差分法数出的是**内容** token（实测五个模型对同一段
+/// 文本均得 10，正确）；而生成时上报的 `output_tokens` 还多一个固定量——结束标记之类，
+/// 只在真实生成时产生，任何计数接口都数不出来。该量**随模型而异**，故必须查表。
+///
+/// 实测方法：对每个模型跑真实生成拿 `usage.output_tokens` 作真值，再对同一段输出文本
+/// 用差分法计数，K = 真值 − 差分值。每模型取两个不同长度的样本（10 词 / 数到 30），
+/// 两样本取值完全一致，且与文本长度无关（另测长度 4~107 的四个样本，K 恒定）。
+///
+/// fable-5 无法干净实测：其 thinking 强制开启（`thinking:disabled` 返回 400），
+/// `output_tokens` 含 thinking token。但污染只会让 K **偏大**，故取观测最小值 2——
+/// 与它同分词器的 opus-4.8 一致。
+fn output_generation_overhead(model: &str) -> i32 {
+    match map_model(model).as_deref() {
+        Some("claude-opus-4.8") | Some("claude-sonnet-5") | Some("claude-fable-5") => 2,
+        Some("claude-opus-4.7") => 4,
+        Some("claude-opus-4.6")
+        | Some("claude-opus-4.5")
+        | Some("claude-sonnet-4.6")
+        | Some("claude-sonnet-4.5")
+        | Some("claude-haiku-4.5") => 3,
+        // 未实测过的模型：已知值全部落在 2~4，取中位数，误差 ≤ ±1。
+        // 比不修正（误差 −2~−4）更接近真值。
+        _ => 3,
+    }
+}
+
+/// 把差分法数出的内容 token 修正为生成侧口径。见 [`output_generation_overhead`]。
+pub fn adjust_output_tokens(model: &str, content_tokens: u64) -> u64 {
+    content_tokens.saturating_add(output_generation_overhead(model).max(0) as u64)
+}
+
 /// 本次请求实际生效的注入扣除地板（token）。
 ///
 /// 全局配置基线（[`injected_prompt_tokens`]）为 0 时整体关闭扣除（返回 0，保持原行为）；
@@ -349,15 +382,25 @@ pub fn trust_inbound_count() -> bool {
 /// [`trust_inbound_count`] 开启时改为直接返回该计数，完全不采信上游反推，用于规避
 /// 上游百分比抖动（见 [`TRUST_INBOUND_COUNT`]）。
 /// 生效地板为 0（未配置 / 主开关关）时原样返回，保持原行为。
-pub fn strip_injected_prompt(model: &str, context_total: i32, local_estimate: i32) -> i32 {
+pub fn strip_injected_prompt(
+    model: &str,
+    context_total: i32,
+    inbound_count: i32,
+    local_floor: i32,
+) -> i32 {
     if trust_inbound_count() {
-        return local_estimate.max(1);
+        return inbound_count.max(1);
     }
     let baseline = effective_injected_floor(model);
     if baseline <= 0 {
         return context_total;
     }
-    (context_total - baseline).max(local_estimate).max(1)
+    // 地板取 local_floor 而非 inbound_count：本分支的 `context_total - baseline` 是
+    // **上游反推口径**（baseline 由裸请求实测 contextUsage 得出），须与同口径的量取 max。
+    // inbound_count 配了远程即官方口径（实测高约 1.6×），拿它当地板会让中小请求普遍被
+    // 顶住 → 行为退化成「等价 trust-on」；而远程一抖它又掉回本地值，同一请求的计费就随
+    // count_tokens 端点是否应答而漂移。trust=off 全程不受远程影响，与 trust=on 彻底分开。
+    (context_total - baseline).max(local_floor).max(1)
 }
 
 /// 1 credit 折算的 USD（上游 Kiro 计价单价）。如折扣/套餐变化在此调整。
@@ -2453,6 +2496,23 @@ mod pairing_tests {
 mod tests {
     use super::*;
 
+    /// output 生成侧增量：per-model 实测值，改动需重新实测（见 output_generation_overhead）。
+    /// 差分法数出的是内容 token，此表补上生成侧独有的固定量。
+    #[test]
+    fn output_generation_overhead_matches_measured_table() {
+        // 实测：每模型两个不同长度样本取值一致。
+        assert_eq!(adjust_output_tokens("claude-opus-4-8", 10), 12);
+        assert_eq!(adjust_output_tokens("claude-sonnet-5", 10), 12);
+        assert_eq!(adjust_output_tokens("claude-opus-4-7", 10), 14);
+        assert_eq!(adjust_output_tokens("claude-opus-4-6", 10), 13);
+        assert_eq!(adjust_output_tokens("claude-sonnet-4-6", 10), 13);
+        assert_eq!(adjust_output_tokens("claude-haiku-4-5", 10), 13);
+        // 未实测模型回退中位数 3（已知值域 2~4，误差 ≤ ±1）。
+        assert_eq!(adjust_output_tokens("totally-unknown-model", 10), 13);
+        // 内容为 0 时不应凭空造出 token 之外的负值/溢出。
+        assert_eq!(adjust_output_tokens("claude-opus-4-8", 0), 2);
+    }
+
     #[test]
     fn strip_injected_prompt_trusts_inbound_count_when_enabled() {
         let _guard = super::INJECTED_BASELINE_TEST_LOCK
@@ -2463,15 +2523,15 @@ mod tests {
 
         // 开关打开后完全不看上游反推：同一入站计数下，上游值怎么抖结果都一样。
         // 这正是本开关的目的——规避上游百分比反推的抖动（实测 6652/6711/6609）。
-        assert_eq!(strip_injected_prompt("claude-opus-4-8", 6652, 36), 36);
-        assert_eq!(strip_injected_prompt("claude-opus-4-8", 6711, 36), 36);
-        assert_eq!(strip_injected_prompt("claude-opus-4-8", 6609, 36), 36);
+        assert_eq!(strip_injected_prompt("claude-opus-4-8", 6652, 36, 36), 36);
+        assert_eq!(strip_injected_prompt("claude-opus-4-8", 6711, 36, 36), 36);
+        assert_eq!(strip_injected_prompt("claude-opus-4-8", 6609, 36, 36), 36);
         // 保底 1，不出现 0 计费。
-        assert_eq!(strip_injected_prompt("claude-opus-4-8", 6609, 0), 1);
+        assert_eq!(strip_injected_prompt("claude-opus-4-8", 6609, 0, 0), 1);
 
         // 关掉后恢复原行为：扣基线、floor 到入站计数。
         set_trust_inbound_count(false);
-        assert_eq!(strip_injected_prompt("totally-unknown-model", 7101, 223), 717);
+        assert_eq!(strip_injected_prompt("totally-unknown-model", 7101, 223, 223), 717);
     }
 
     #[test]
@@ -2485,16 +2545,16 @@ mod tests {
         // 未实测过的模型（查表 miss）回退全局配置基线，行为同旧版单一基线。
         let unknown = "totally-unknown-model";
         // 正常：从上游总量里扣掉基线，得到 Claude 口径的内容量。
-        assert_eq!(strip_injected_prompt(unknown, 7101, 223), 717);
+        assert_eq!(strip_injected_prompt(unknown, 7101, 223, 223), 717);
         // 基线偏大导致差值低于本地估算时 floor 到本地估算（不反向少计）。
-        assert_eq!(strip_injected_prompt(unknown, 6393, 10), 10);
+        assert_eq!(strip_injected_prompt(unknown, 6393, 10, 10), 10);
         // 极端：差值与本地估算都很小，仍至少保 1。
-        assert_eq!(strip_injected_prompt(unknown, 6384, 0), 1);
+        assert_eq!(strip_injected_prompt(unknown, 6384, 0, 0), 1);
 
         // 主开关：基线为 0 时原样返回（关闭扣除，保持原始上游口径），与模型无关。
         set_injected_prompt_tokens(0);
-        assert_eq!(strip_injected_prompt(unknown, 7101, 223), 7101);
-        assert_eq!(strip_injected_prompt("claude-sonnet-5", 7101, 223), 7101);
+        assert_eq!(strip_injected_prompt(unknown, 7101, 223, 223), 7101);
+        assert_eq!(strip_injected_prompt("claude-sonnet-5", 7101, 223, 223), 7101);
     }
 
     #[test]
@@ -2508,18 +2568,18 @@ mod tests {
         // sonnet-5 / opus-4.8 精确地板 6485（非全局 6500）：扣 6485 得真实内容。
         assert_eq!(effective_injected_floor("claude-sonnet-5"), 6485);
         assert_eq!(effective_injected_floor("claude-opus-4-8"), 6485);
-        assert_eq!(strip_injected_prompt("claude-sonnet-5", 6485 + 1000, 900), 1000);
+        assert_eq!(strip_injected_prompt("claude-sonnet-5", 6485 + 1000, 900, 900), 1000);
         // 归一化：带日期后缀的 id 也命中同一地板。
         assert_eq!(effective_injected_floor("claude-sonnet-5-20260701"), 6485);
         // 低地板模型用各自实测值，不受 6500 全局基线影响。
         assert_eq!(effective_injected_floor("claude-sonnet-4.6"), 4109);
-        assert_eq!(strip_injected_prompt("claude-sonnet-4.6", 4109 + 500, 480), 500);
+        assert_eq!(strip_injected_prompt("claude-sonnet-4.6", 4109 + 500, 480, 480), 500);
         // GPT-5.6 三档：实测地板 1592（远小于 6500 兜底），扣 1592 得真实内容。
         assert_eq!(effective_injected_floor("gpt-5.6-terra"), 1592);
         assert_eq!(effective_injected_floor("gpt-5.6-sol"), 1592);
         assert_eq!(effective_injected_floor("gpt-5.6-luna"), 1592);
         assert_eq!(effective_injected_floor("gpt-4"), 1592); // 归一化到 terra
-        assert_eq!(strip_injected_prompt("gpt-5.6-terra", 1592 + 800, 750), 800);
+        assert_eq!(strip_injected_prompt("gpt-5.6-terra", 1592 + 800, 750, 750), 800);
         // 未实测模型回退全局基线 6500。
         assert_eq!(effective_injected_floor("brand-new-model"), 6500);
 

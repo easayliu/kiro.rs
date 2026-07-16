@@ -37,7 +37,7 @@ mod websearch;
 pub use billing_stats::{global as billing_stats, init_persistence as init_billing_stats};
 pub use cache_tracker::{CacheScope, CacheTracker};
 pub use converter::{
-    chunked_write_guidance_enabled, map_model, output_token_multiplier,
+    adjust_output_tokens, chunked_write_guidance_enabled, map_model, output_token_multiplier,
     set_chunked_write_guidance, set_dynamic_model_windows, set_injected_prompt_tokens,
     set_max_request_body_size, set_output_token_multiplier, set_surface_persona,
     set_trust_inbound_count, surface_persona_enabled, trust_inbound_count,

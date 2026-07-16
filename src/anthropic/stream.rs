@@ -1522,6 +1522,7 @@ impl StreamContext {
                         &self.model,
                         context_total,
                         self.input_tokens,
+                        self.local_total_input_tokens,
                     )
                 };
                 self.cache_usage
@@ -1730,6 +1731,12 @@ impl StreamContext {
             output_tokens: self.output_tokens as i64,
             ttft_ms: ttft_ms as i64,
             elapsed_ms: self.start.elapsed().as_millis() as i64,
+            // 三段口径以 segments_official 为准，见 handlers 同处说明。
+            token_unit: if self.segments_official {
+                crate::stats::TOKEN_UNIT_OFFICIAL
+            } else {
+                crate::stats::TOKEN_UNIT_LOCAL
+            },
             status_code: 0,
         });
         tracing::info!(

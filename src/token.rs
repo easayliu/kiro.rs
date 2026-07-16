@@ -284,14 +284,44 @@ pub(crate) async fn count_payload_remote(payload: &crate::anthropic::types::Mess
     }
 }
 
+/// 输出计数差分法的哨兵 user message 内容。
+///
+/// count_tokens 要求 messages 非空且首条为 user，故 assistant 回合前须垫一条。
+/// 内容固定，其贡献在差分中被完全消掉，取什么值都不影响结果。
+const OUTPUT_COUNT_SENTINEL: &str = "x";
+
+/// `call_remote_count_tokens` 的带缓存包装（按 model + messages 内容 hash）。
+///
+/// 差分法的基线只与模型有关，每模型实打一次即可；输出文本本身通常各不相同，
+/// 缓存对它基本不命中，但也不产生额外成本。
+async fn call_remote_count_tokens_cached(
+    api_url: &str,
+    config: &CountTokensConfig,
+    model: &str,
+    messages: &Vec<Message>,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    let key = remote_count_cache_key(
+        model,
+        &serde_json::to_value(messages).unwrap_or(serde_json::Value::Null),
+    );
+    if let Some(hit) = remote_count_cache_get(key) {
+        return Ok(hit);
+    }
+    let tokens =
+        call_remote_count_tokens(api_url, config, model.to_string(), &None, messages, &None).await?;
+    remote_count_cache_put(key, tokens);
+    Ok(tokens)
+}
+
 /// 计算一段输出文本的 token 数。
 ///
-/// 优先走远程 count_tokens（把文本包成单条 user message 送去数），直接采信官方
-/// 返回值；未配置或调用失败时回退本地启发式。空串返回 0，不产生远程调用。
+/// 优先走远程 count_tokens 的**差分法**（见函数体内说明）；未配置或调用失败时回退
+/// 本地启发式 `ceil(字节/4)`。空串返回 0，不产生远程调用。
 ///
-/// 注：该端点数的是「一条 message」，返回值含 role/boundary 结构开销，且开销随模型
-/// 不同（实测重复文本线性回归，斜率恒为 1.0，截距：opus-4-8 / sonnet-5 / fable-5 为
-/// 7，sonnet-4-6 / haiku-4-5 为 8，opus-4-7 为 12）。此处不做扣除，以官方口径为准。
+/// output **没有**上游 `contextUsageEvent` 真值兜底，此处算出的即最终上报/计费值，
+/// 故差分结果还要经 `converter::adjust_output_tokens` 补上生成侧的 per-model 增量。
+/// 实测（对照官方生成的真实 output_tokens）：修正后精确命中；回退本地启发式时则为
+/// `ceil(字节/4)`，误差随语种浮动。
 pub(crate) fn count_output_tokens(model: &str, text: &str) -> u64 {
     if text.is_empty() {
         return 0;
@@ -299,19 +329,54 @@ pub(crate) fn count_output_tokens(model: &str, text: &str) -> u64 {
 
     if let Some(config) = get_config() {
         if let Some(api_url) = resolve_remote(&config) {
-            let messages = vec![Message {
+            // 差分法：数「哨兵 user + assistant(输出文本)」再减去「只有哨兵 user」，
+            // 差额即该 assistant message 的 token 数。
+            //
+            // 为何不直接把输出文本包成 user message 去数：那样返回值含一整条 message 的
+            // role/boundary 开销，且该开销随模型而异（实测 count("x") = 7/12/8 三档）。
+            // 差分把开销消掉，且按 assistant 角色计数——输出本就是 assistant message，
+            // 用 user 角色是错配。实测（对同一段文本，五个模型）差分均得内容 10 token，
+            // 而裸数法误差 +4~+7、差分法 −2~−4，误差减半且不引入任何硬编码常数。
+            //
+            // 残余的 −2~−4 是生成侧独有的量（结束标记等），随模型而异（opus-4.8/sonnet-5
+            // 为 2、sonnet-4.6/haiku-4.5 为 3、opus-4.7 为 4），只能靠 per-model 表消除，
+            // 故此处不再修正。
+            let with_assistant = vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String(OUTPUT_COUNT_SENTINEL.to_string()),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::String(text.to_string()),
+                },
+            ];
+            let sentinel_only = vec![Message {
                 role: "user".to_string(),
-                content: serde_json::Value::String(text.to_string()),
+                content: serde_json::Value::String(OUTPUT_COUNT_SENTINEL.to_string()),
             }];
             let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(call_remote_count_tokens(
-                    &api_url,
-                    &config,
-                    model.to_string(),
-                    &None,
-                    &messages,
-                    &None,
-                ))
+                tokio::runtime::Handle::current().block_on(async {
+                    // 基线只与模型有关，走内容 hash 缓存，每模型实打一次。
+                    let (full, base) = tokio::join!(
+                        call_remote_count_tokens_cached(
+                            &api_url,
+                            &config,
+                            model,
+                            &with_assistant
+                        ),
+                        call_remote_count_tokens_cached(&api_url, &config, model, &sentinel_only),
+                    );
+                    match (full, base) {
+                        // 差分得内容 token，再补生成侧的 per-model 增量（结束标记等，
+                        // 计数接口数不出来，只能查实测表）。
+                        (Ok(f), Ok(b)) => Ok(crate::anthropic::adjust_output_tokens(
+                            model,
+                            f.saturating_sub(b),
+                        )),
+                        (Err(e), _) | (_, Err(e)) => Err(e),
+                    }
+                })
             });
 
             match result {

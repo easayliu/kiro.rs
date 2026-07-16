@@ -297,6 +297,8 @@ fn classify_provider_error(err: &Error, model: &str) -> ProviderErrorInfo {
         cache_read: 0,
         cache_creation: 0,
         output_tokens: 0,
+        // 失败行 token 全 0，口径无意义；记本地以免被官方口径聚合误纳。
+        token_unit: crate::stats::TOKEN_UNIT_LOCAL,
         ttft_ms: 0,
         elapsed_ms: 0,
         status_code: stat_status,
@@ -1861,7 +1863,12 @@ async fn handle_non_stream_request(
             let content_total = if matches!(cache_tracker.cache_scope(), CacheScope::Off) {
                 context_total
             } else {
-                super::converter::strip_injected_prompt(model, context_total, estimated_input_tokens)
+                super::converter::strip_injected_prompt(
+                    model,
+                    context_total,
+                    estimated_input_tokens,
+                    cache_context.local_total_input_tokens,
+                )
             };
             let billed = estimated_usage.billed_or_official(
                 // 缩放基准取本地 total（与三段同单位），不是 estimated_input_tokens
@@ -1933,6 +1940,13 @@ async fn handle_non_stream_request(
         cache_read: billing.cache_read_input_tokens as i64,
         cache_creation: billing.cache_creation_input_tokens as i64,
         output_tokens: output_tokens as i64,
+        // billing 三段的口径以 segments_official 为准（trust=on 且重算成功时为官方，
+        // 否则为本地/上游锚定口径）。逐行标记，聚合时才能不跨口径相加。
+        token_unit: if cache_context.segments_official {
+            crate::stats::TOKEN_UNIT_OFFICIAL
+        } else {
+            crate::stats::TOKEN_UNIT_LOCAL
+        },
         ttft_ms: 0,
         elapsed_ms: request_start.elapsed().as_millis() as i64,
         status_code: 0,

@@ -16,6 +16,11 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 /// 单条请求的统计样本。`ts` 由 [`record`] 在入队时统一打点，调用方无需填写。
+/// [`RequestStat::token_unit`] 取值：本地启发式 `ceil(字节/4)` 口径。
+pub const TOKEN_UNIT_LOCAL: i64 = 0;
+/// [`RequestStat::token_unit`] 取值：官方 count_tokens 口径。
+pub const TOKEN_UNIT_OFFICIAL: i64 = 1;
+
 #[derive(Clone, Debug, Default)]
 pub struct RequestStat {
     /// Unix 秒时间戳（由 record 填充）。
@@ -42,6 +47,11 @@ pub struct RequestStat {
     /// 无 HTTP 响应的内部错误用映射码（无可用凭据 503、其它 502）。
     /// 失败行的 token/成本/延迟均为 0，仅用于错误率统计，不污染成功侧聚合。
     pub status_code: i64,
+    /// 本行 token 各列的计数口径：`0` = 本地启发式 `ceil(字节/4)`；`1` = 官方
+    /// count_tokens 口径。同一段内容两种口径实测相差可达 1.6×（8800 字节英文：
+    /// 官方 3616 / 本地 2250），跨口径 SUM() 出的曲线不可比，故逐行标记。
+    /// 由 `record` 按写入时的实际口径填充，不要手填。
+    pub token_unit: i64,
 }
 
 /// 曲线分组维度。
@@ -172,7 +182,12 @@ mod imp {
                 ttft_ms        INTEGER NOT NULL,
                 elapsed_ms     INTEGER NOT NULL,
                 -- 0=成功；非0=失败请求(上游 API 错误)的状态码。失败行其余指标均为 0。
-                status_code    INTEGER NOT NULL DEFAULT 0
+                status_code    INTEGER NOT NULL DEFAULT 0,
+                -- token 各列的计数口径。同一段内容在不同口径下相差可达 1.6×，跨口径
+                -- SUM() 出来的曲线不可比，故逐行标记，聚合时按需过滤/分组。
+                -- 0=本地启发式 ceil(字节/4)；1=官方 count_tokens 口径。
+                -- 历史行（本列出现前写入）一律记 0：彼时远程计数尚未接入。
+                token_unit     INTEGER NOT NULL DEFAULT 0
             ) STRICT;
             -- 时序分桶 / 总量汇总 / 过期清理：均以 ts 区间为主过滤条件。
             CREATE INDEX IF NOT EXISTS idx_request_stats_ts ON request_stats(ts);
@@ -192,6 +207,17 @@ mod imp {
                 "ALTER TABLE request_stats ADD COLUMN status_code INTEGER NOT NULL DEFAULT 0;",
             )?;
             tracing::info!("统计库已迁移：request_stats 新增 status_code 列");
+        }
+        // 迁移：老库补 token_unit 列。默认 0=本地口径——本列出现前远程计数尚未接入，
+        // 所有历史行必然是本地启发式，这个默认值是事实而非猜测。
+        let has_unit = conn
+            .prepare("SELECT 1 FROM pragma_table_info('request_stats') WHERE name = 'token_unit'")?
+            .exists([])?;
+        if !has_unit {
+            conn.execute_batch(
+                "ALTER TABLE request_stats ADD COLUMN token_unit INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            tracing::info!("统计库已迁移：request_stats 新增 token_unit 列（0=本地口径）");
         }
         // 迁移：删除已废弃的 truncated 列（kiro 不支持 max_tokens 截断，指标无意义）。
         let has_truncated = conn
@@ -286,8 +312,8 @@ mod imp {
                 "INSERT INTO request_stats
                     (ts, model, credential_id, actual_micro, official_micro, margin_micro,
                      input_tokens, cache_read, cache_creation, output_tokens,
-                     ttft_ms, elapsed_ms, status_code)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                     ttft_ms, elapsed_ms, status_code, token_unit)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             ) {
                 Ok(s) => s,
                 Err(e) => {
@@ -310,6 +336,7 @@ mod imp {
                     s.ttft_ms,
                     s.elapsed_ms,
                     s.status_code,
+                    s.token_unit,
                 ]);
             }
         }
