@@ -311,15 +311,21 @@ impl CacheUsage {
     /// `estimated_total <= 0` 或 `context_total <= 0` 时原样返回（无可用比例）。
     /// 计费用的三段：开了官方计数就直接采信，否则走 [`Self::billed_split`] 锚定上游。
     ///
-    /// 直接采信的前提是**两个条件同时成立**：
-    /// 1. `trust_inbound_count` 开启——计费口径就是入站计数，不该再按上游反推缩放；
-    /// 2. `segments_official`——三段确已由 `cache_tracker::recount_cache_segments` 用官方
-    ///    口径重算且自洽（read + creation + uncached == 官方 total）。
+    /// 判据只看 `segments_official`——三段是否**确已**由
+    /// `cache_tracker::recount_cache_segments` 用官方口径重算且自洽
+    /// （read + creation + uncached == 官方 total）。为 true 即直接采信。
     ///
-    /// 只看条件 1 是不够的：重算有失败分支（远程 429/超时 → `fallback_to_local`），此时
-    /// 三段退回**本地**口径。若仍短路，就是把本地数当官方数计费——实测低约 38%
-    /// （2250 vs 3616），与「采信入站计数」的语义正好相反。故失败时照常走 `billed_split`
-    /// 缩放，行为与开关关闭时一致。
+    /// **不再叠加 `trust_inbound_count()`**：那会引入 TOCTOU。开关在重算时（请求发出前）
+    /// 读一次决定要不要算，若此处再读一次，Admin 在整个上游调用期间把开关关掉，就会拿
+    /// 「已是官方口径的三段」去走 `billed_split`，而缩放基准 `estimated_total` 传的是
+    /// **本地** total——官方段被当本地段又缩放一次（实测 3602 会被放大到约 5691）。
+    ///
+    /// `segments_official` 是**事实**（三段的实际口径），开关只是「要不要重算」的**意图**。
+    /// 计费该认事实：请求在哪个口径下起算，就在哪个口径下收口，中途改开关不影响在途请求。
+    ///
+    /// 为 false 时照常走 `billed_split` 缩放——涵盖开关关闭（未重算）与重算失败
+    /// （`fallback_to_local` 已把三段退回本地口径）两种情况，二者的三段都是本地口径，
+    /// 与 `estimated_total` 同单位。
     pub(crate) fn billed_or_official(
         &self,
         estimated_total: i32,
@@ -327,7 +333,7 @@ impl CacheUsage {
         billed_read: Option<i32>,
         segments_official: bool,
     ) -> Self {
-        if segments_official && super::converter::trust_inbound_count() {
+        if segments_official {
             return *self;
         }
         self.billed_split(estimated_total, context_total, billed_read)
@@ -698,6 +704,13 @@ pub struct StreamContext {
     segments_official: bool,
     /// 本地口径 total，与三段同单位；`billed_split` 的缩放基准。
     local_total_input_tokens: i32,
+    /// [`Self::billing_cache_usage`] 的记忆化结果。
+    ///
+    /// 该函数在一次收口里被调两次（`generate_final_events` 与缓冲流的
+    /// `finish_and_get_all_events`），每次都重读 `trust_inbound_count()`——Admin 若在
+    /// 两次之间热切开关，message_start 回填的 usage 就会与 message_delta / 计费 / 回写
+    /// 来自不同分支。算一次存下来，同时消掉这个 TOCTOU 与重复计算。
+    billing_cache: Option<CacheUsage>,
     /// 计费完成后的回写句柄：(tracker, writeback)。收到 contextUsageEvent 时，
     /// 在 generate_final_events 里把缩放后的 billed 累计回写到缓存条目。
     billing_writeback: Option<(Arc<CacheTracker>, CacheWriteback)>,
@@ -775,6 +788,7 @@ impl StreamContext {
             cache_read_billed: None,
             segments_official: false,
             local_total_input_tokens: 0,
+            billing_cache: None,
             billing_writeback: None,
             upstream_credit: None,
             start: Instant::now(),
@@ -1509,7 +1523,17 @@ impl StreamContext {
     /// 使 cache_* 与 uncached 全部落在上游计量体系（见
     /// [`CacheUsage::scaled_to_upstream`]）；否则用 cache_tracker 基于请求估算
     /// 算出的本地拆分。
-    fn billing_cache_usage(&self) -> CacheUsage {
+    /// 计费口径的三段。首次计算后记忆化，见 [`Self::billing_cache`]。
+    fn billing_cache_usage(&mut self) -> CacheUsage {
+        if let Some(cached) = self.billing_cache {
+            return cached;
+        }
+        let computed = self.compute_billing_cache_usage();
+        self.billing_cache = Some(computed);
+        computed
+    }
+
+    fn compute_billing_cache_usage(&self) -> CacheUsage {
         match self.context_input_tokens {
             // 计费前先扣掉 Kiro 服务端注入的固定提示词基线（见 converter::strip_injected_prompt），
             // 使终端用户只按真实内容计费；注入恒落在 uncached，扣除即从 uncached 移除。
@@ -2808,6 +2832,53 @@ mod tests {
         assert_eq!(
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
+        );
+    }
+
+    /// billed_or_official 只认 segments_official 这个事实，不再叠加 trust 开关：
+    /// 开关在重算时（请求发出前）已读过一次，此处再读会引入 TOCTOU——Admin 在上游
+    /// 调用期间关掉开关，官方口径的三段就会被当本地段再缩放一次。
+    #[test]
+    fn billed_or_official_ignores_trust_flag_flipping_mid_request() {
+        let _guard = super::super::converter::INJECTED_BASELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // 三段已是官方口径（自洽：3602 + 0 + 14 = 3616）。
+        let official = CacheUsage {
+            cache_read_input_tokens: 3602,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+            uncached_input_tokens: 14,
+        };
+
+        // 开关在重算后被关掉：仍应原样采信，不得按本地基准（2259）缩放。
+        super::super::converter::set_trust_inbound_count(false);
+        let billed = official.billed_or_official(2259, 3573, None, true);
+        assert_eq!(billed.cache_read_input_tokens, 3602, "官方段不应被再次缩放");
+        assert_eq!(billed.uncached_input_tokens, 14);
+
+        // 三段是本地口径时照常缩放（scale = 3573/2259 ≈ 1.58）。
+        let local = CacheUsage {
+            cache_read_input_tokens: 2250,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+            uncached_input_tokens: 9,
+        };
+        let billed = local.billed_or_official(2259, 3573, None, false);
+        assert!(
+            billed.cache_read_input_tokens > 3500,
+            "本地段应被缩放到上游总量口径，实得 {}",
+            billed.cache_read_input_tokens
+        );
+        assert_eq!(
+            billed.cache_read_input_tokens
+                + billed.cache_creation_input_tokens
+                + billed.uncached_input_tokens,
+            3573,
+            "三段之和须恰为计费总量"
         );
     }
 

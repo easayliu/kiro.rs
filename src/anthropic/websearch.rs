@@ -312,7 +312,9 @@ fn create_websearch_json_response(
     let search_content = build_search_result_blocks(&search_results);
     let citations = build_citations(&search_results);
     let summary = generate_search_summary(query, &search_results);
-    let output_tokens = (summary.len() as i32 + 3) / 4;
+    // 与其余路径同一入口：配了远程走官方精确口径，否则回退本地启发式。
+    // 此前手写 (len+3)/4 复刻了本地公式，但绕开了统一入口，配了远程也不生效。
+    let output_tokens = crate::token::count_output_tokens(model, &summary) as i32;
 
     // 最终文本块带 citations（官方 web search 回答必有引用）；无结果时省略该字段
     let mut answer_block = json!({ "type": "text", "text": summary });
@@ -548,7 +550,8 @@ fn generate_websearch_events(
 
     // 10. message_delta
     // 官方 API 的 message_delta.delta 中没有 stop_sequence 字段
-    let output_tokens = (summary.len() as i32 + 3) / 4; // 简单估算
+    // 同上：走统一入口，别再手写本地公式。
+    let output_tokens = crate::token::count_output_tokens(model, &summary) as i32;
     events.push(SseEvent::new(
         "message_delta",
         json!({

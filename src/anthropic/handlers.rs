@@ -1152,7 +1152,10 @@ async fn handle_stream_request_early(
     // 回到瞬时下发）。延迟只推迟首字下发时刻，200 状态行仍即刻 flush（满足下游按状态码
     // 调度的契约）；代价是上游调用在延迟结束后才起跑，实际内容到达 = sim_delay + 上游延迟。
     let initial_events = ctx.generate_initial_events();
-    let sim_delay = early_first_token_delay(input_tokens);
+    // 用本地口径的 token 数：EFT_DELAY_PER_1K_MS 是按本地口径调出来的常数，而
+    // input_tokens 配了远程即官方口径（实测新分词器模型高约 1.6×），拿它换算会让
+    // 模拟延迟凭空拉长约六成，且远程一抖又缩回去——同样的请求延迟不稳定。
+    let sim_delay = early_first_token_delay(cache_profile.local_total_input_tokens());
     let initial_stream = stream::once(async move {
         if let Some(d) = sim_delay {
             tokio::time::sleep(d).await;

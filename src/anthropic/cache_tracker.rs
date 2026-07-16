@@ -521,9 +521,7 @@ impl CacheTracker {
                 CacheWriteback::default(),
             );
         };
-        let last_breakpoint_tokens = last_breakpoint
-            .cumulative_tokens
-            .min(profile.total_input_tokens);
+        let last_breakpoint_tokens = profile.clamp_local(last_breakpoint.cumulative_tokens);
 
         let now = Instant::now();
         let mut all_entries = self.entries.lock();
@@ -587,8 +585,7 @@ impl CacheTracker {
                     if entry.expires_at <= now {
                         continue;
                     }
-                    let candidate_tokens =
-                        block.cumulative_tokens.min(profile.total_input_tokens);
+                    let candidate_tokens = profile.clamp_local(block.cumulative_tokens);
                     // 同一 bp 内回扫 idx 递减，cumulative_tokens 单调递减，
                     // 第一个命中即该 bp 的最佳匹配；break 去跑下一个 bp。
                     match best {
@@ -622,7 +619,7 @@ impl CacheTracker {
         for breakpoint in profile.cacheable_breakpoints() {
             let block = &profile.blocks[breakpoint.block_index];
             let next_expiry = now + breakpoint.ttl;
-            let cum_local = block.cumulative_tokens.min(profile.total_input_tokens);
+            let cum_local = profile.clamp_local(block.cumulative_tokens);
             written.push((block.prefix_fingerprint, cum_local));
 
             match bucket.get_mut(&block.prefix_fingerprint) {
@@ -799,13 +796,13 @@ fn clamp_skip_rate(rate: f32) -> f32 {
 /// 按每个 cacheable breakpoint 的 TTL 分段累加 cache_creation。
 /// 每个 breakpoint 覆盖 [prev_cum, cum] 区间，已命中的 [0, matched] 部分扣除。
 fn compute_ttl_breakdown(profile: &CacheProfile, matched_tokens: i32) -> (i32, i32) {
-    let total_limit = profile.total_input_tokens;
+    // 上界用本地总量：bp.cumulative_tokens 是本地口径（见 CacheProfile::clamp_local）。
     let mut five_min = 0i32;
     let mut one_hour = 0i32;
     let mut prev_cum = 0i32;
 
     for bp in profile.cacheable_breakpoints() {
-        let cum = bp.cumulative_tokens.min(total_limit);
+        let cum = profile.clamp_local(bp.cumulative_tokens);
         if cum <= prev_cum {
             continue;
         }
@@ -825,6 +822,18 @@ fn compute_ttl_breakdown(profile: &CacheProfile, matched_tokens: i32) -> (i32, i
 }
 
 impl CacheProfile {
+    /// 把一个**本地口径**的累计 token 夹到本地总量之内。
+    ///
+    /// 各处 clamp 的本意是「不超过总量」，但上界必须与被夹的值同单位：`blocks` 的
+    /// `cumulative_tokens` 恒为本地口径，而 `total_input_tokens` 配了远程后是官方口径
+    /// （实测高约 1.6×，老分词器模型则约 0.98×）。用官方 total 去夹本地值，在本地口径
+    /// 偏高的内容上会咬合并削掉真实值 —— 被削过的 `cum_local` 会流进 `CacheWriteback`
+    /// 的 `written` / `matched_local` / `last_breakpoint_local`，让 `apply_billing_writeback`
+    /// 里本应纯本地的比例分母失真，进而污染下一轮的 `cache_read`。
+    fn clamp_local(&self, cumulative_tokens: i32) -> i32 {
+        cumulative_tokens.min(self.local_total_input_tokens.max(1))
+    }
+
     /// 本地口径 → 官方口径的实测换算系数。
     ///
     /// `min_cacheable_tokens` 是 Anthropic **官方口径**的门槛（4096/2048/1024/512），
@@ -2037,6 +2046,35 @@ mod tests {
     }
 
     /// 读写守恒核心：第一轮计费回写 billed_creation 后，第二轮命中时
+    /// clamp 的上界必须与被夹的值同单位：blocks 的 cumulative_tokens 是本地口径，
+    /// 而 total_input_tokens 配了远程即官方口径。用官方 total 夹本地值会削掉真实值，
+    /// 污染回写比例的分母（见 CacheProfile::clamp_local）。
+    #[test]
+    fn clamp_uses_local_total_not_official() {
+        // 本地口径高于官方的情形（老分词器模型，实测 scale≈0.98）：
+        // 官方 total 2000 < 本地累计 2500。若误用官方 total 夹，2500 会被削成 2000。
+        let profile = CacheProfile {
+            payload: std::sync::Arc::new(build_request("sys", vec![])),
+            total_input_tokens: 2000,
+            local_total_input_tokens: 3000,
+            min_cacheable_tokens: 1024,
+            blocks: vec![CacheBlock {
+                prefix_fingerprint: [1u8; 32],
+                cumulative_tokens: 2500,
+            }],
+            breakpoints: vec![],
+            identity_key: None,
+            binding_key: None,
+        };
+        assert_eq!(
+            profile.clamp_local(2500),
+            2500,
+            "本地值未超本地总量，不应被官方 total 削掉"
+        );
+        // 真正超出本地总量时才夹。
+        assert_eq!(profile.clamp_local(4000), 3000);
+    }
+
     /// 断点是否够格缓存，须按官方口径判断：`min_cacheable_tokens` 是官方门槛，
     /// 而 block 的 cumulative_tokens 是本地 ceil(字节/4)。实测同段文本 opus-4.8
     /// 官方/本地 ≈ 1.60、sonnet-4.6 ≈ 0.98，不换算会在 opus 系上把够格的前缀判死。
