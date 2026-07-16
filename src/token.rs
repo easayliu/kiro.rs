@@ -152,6 +152,73 @@ pub(crate) fn count_all_tokens(
     tokens
 }
 
+/// 把 messages 净化成 count_tokens 能接受的形状（仅用于计数，不影响真实请求）。
+///
+/// **thinking block → 同内容的 text block。**
+///
+/// history 里的 thinking block 是上游 Kiro 产生的，其 `signature` 由 Kiro 签发
+/// （见 `kiro::model::events::reasoning`）。Anthropic 会真的校验该签名，而它不可能通过
+/// ——实测伪签名、空签名、连 `signature` 字段都不带，三种全是
+/// 400 `Invalid signature in thinking block`；只有换成 text block 才被接受。
+/// 这不是签名值填错，是签发方就不对，无解。
+///
+/// 为何不直接删掉 thinking block：那部分内容**上游是照收 token 的**（thinking 计入
+/// contextUsage），删了会少算整段思考的量（agentic 会话里可达数千 token）。转成 text
+/// 保留了内容，只在 block 类型标记上有几 token 的出入，比整段漏掉准得多。
+///
+/// 只在开了 thinking 的会话里才有 thinking block，其余请求走这里零开销（不克隆）。
+fn sanitize_for_count(messages: &[Message]) -> Vec<Message> {
+    let needs_fix = messages.iter().any(|m| {
+        m.content
+            .as_array()
+            .is_some_and(|bs| bs.iter().any(|b| is_thinking_block(b)))
+    });
+    if !needs_fix {
+        return messages.to_vec();
+    }
+    messages
+        .iter()
+        .map(|m| {
+            let Some(blocks) = m.content.as_array() else {
+                return m.clone();
+            };
+            let converted: Vec<serde_json::Value> = blocks
+                .iter()
+                .map(|b| {
+                    if !is_thinking_block(b) {
+                        return b.clone();
+                    }
+                    // thinking 用 `thinking` 字段承载文本，redacted_thinking 用 `data`
+                    // （已加密，长度不代表 token 数，但保留总比丢弃接近）。
+                    let text = b
+                        .get("thinking")
+                        .or_else(|| b.get("data"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    serde_json::json!({ "type": "text", "text": text })
+                })
+                // 空 text block 会被 API 拒（同 system 那条约束），顺手滤掉。
+                .filter(|b| {
+                    b.get("text").and_then(|v| v.as_str()).is_none_or(|t| !t.is_empty())
+                })
+                .collect();
+            Message {
+                role: m.role.clone(),
+                content: serde_json::Value::Array(converted),
+            }
+        })
+        // 净化后内容为空的 message 会被 API 拒，滤掉。
+        .filter(|m| !m.content.as_array().is_some_and(|b| b.is_empty()))
+        .collect()
+}
+
+fn is_thinking_block(b: &serde_json::Value) -> bool {
+    matches!(
+        b.get("type").and_then(|v| v.as_str()),
+        Some("thinking") | Some("redacted_thinking")
+    )
+}
+
 /// 调用远程 count_tokens API
 async fn call_remote_count_tokens(
     api_url: &str,
@@ -163,10 +230,12 @@ async fn call_remote_count_tokens(
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let client = build_client(config.proxy.as_ref(), 300, config.tls_backend)?;
 
-    // 构建请求体
+    // 构建请求体。messages 需先净化：history 里的 thinking block 带的是**上游 Kiro 的
+    // 签名**，Anthropic 会真的去验它、必然不过（实测伪签名/空签名/不带 signature 字段
+    // 全部 400 `Invalid signature in thinking block`）。见 [`sanitize_for_count`]。
     let request = CountTokensRequest {
         model: model, // 模型名称用于 token 计算
-        messages: messages.clone(),
+        messages: sanitize_for_count(messages),
         system: system.clone(),
         tools: tools.clone(),
     };
@@ -535,6 +604,73 @@ pub(crate) fn count_message_content_tokens(value: &serde_json::Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// thinking block 带的是上游 Kiro 的签名，Anthropic 校验必然不过（实测伪签名/
+    /// 空签名/无 signature 字段全部 400）。计数前须转成同内容的 text block —— 不能删，
+    /// 因为那部分内容上游照收 token。
+    #[test]
+    fn sanitize_converts_thinking_to_text() {
+        let msg = |role: &str, c: serde_json::Value| Message {
+            role: role.to_string(),
+            content: c,
+        };
+        let out = sanitize_for_count(&[
+            msg("user", serde_json::json!("q")),
+            msg(
+                "assistant",
+                serde_json::json!([
+                    {"type":"thinking","thinking":"deep thought","signature":"kiro_sig_xyz"},
+                    {"type":"text","text":"answer"}
+                ]),
+            ),
+        ]);
+        // 纯字符串 content 原样保留。
+        assert_eq!(out[0].content, serde_json::json!("q"));
+        // thinking → text，内容保留、签名丢弃；原有 text 不动。
+        assert_eq!(
+            out[1].content,
+            serde_json::json!([
+                {"type":"text","text":"deep thought"},
+                {"type":"text","text":"answer"}
+            ])
+        );
+    }
+
+    /// redacted_thinking 的文本在 `data` 字段；空块会被 API 拒，须滤掉。
+    #[test]
+    fn sanitize_handles_redacted_and_empty() {
+        let msg = |role: &str, c: serde_json::Value| Message {
+            role: role.to_string(),
+            content: c,
+        };
+        let out = sanitize_for_count(&[
+            msg("user", serde_json::json!("q")),
+            msg(
+                "assistant",
+                serde_json::json!([
+                    {"type":"redacted_thinking","data":"encrypted_blob"},
+                    {"type":"thinking","thinking":"","signature":"s"},
+                ]),
+            ),
+        ]);
+        // 空 thinking 被滤掉，只剩 redacted 转出来的 text。
+        assert_eq!(
+            out[1].content,
+            serde_json::json!([{"type":"text","text":"encrypted_blob"}])
+        );
+    }
+
+    /// 无 thinking 的请求不应被改写（也不该白白重建）。
+    #[test]
+    fn sanitize_is_noop_without_thinking() {
+        let m = vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!([{"type":"text","text":"hi"}]),
+        }];
+        let out = sanitize_for_count(&m);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].content, m[0].content);
+    }
 
     #[test]
     fn count_tokens_empty_is_zero() {
