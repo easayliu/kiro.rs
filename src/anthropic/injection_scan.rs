@@ -247,6 +247,13 @@ const SECRET_TERMS_LOW: &[&str] = &[
     "密钥",
 ];
 
+/// harness 自身注入的可信「隐瞒」措辞标记。命中 `hide_from_user` 时，若邻近窗口内
+/// 出现其一，说明这是客户端 harness 的正常提示而非注入，降为低置信：
+/// - `already aware`：system-reminder（如"日期已变，不必特意告知用户，他们已知晓"）。
+/// - `internal id`：Agent/Task 工具返回的 agent id（"internal id - do not mention to
+///   user. use sendmessage with to: ..."）。
+const HIDE_BENIGN_MARKERS: &[&str] = &["already aware", "internal id"];
+
 /// 组合规则里「敏感词 ↔ 外发动作」判定共现的最大字节距离（约 60+ 字符）。
 /// 限定邻近窗口可滤掉「整文件 dump 里 `process.env` 与某处 `post` 隔很远」的误报。
 const PROXIMITY_WINDOW: usize = 200;
@@ -358,10 +365,12 @@ fn push_findings(
     // 1. 简单"任一关键词命中"规则。
     for (rule, severity, needles) in RULES {
         if let Some(pos) = needles.iter().find_map(|n| lower.find(n)) {
-            // Claude Code 等 harness 注入的 system-reminder（如 "do not mention
-            // this to the user … they are already aware"）是可信提醒、非注入；其
-            // 隐瞒措辞总伴随 "already aware"，据此降为低置信，避免刷 WARN。
-            let sev = if *rule == "hide_from_user" && lower.contains("already aware") {
+            // Claude Code 等 harness 自身注入的隐瞒措辞（system-reminder、Agent 工具
+            // 的 agent id 提示）是可信提醒、非注入；据邻近标记降为低置信避免刷 WARN。
+            // 要求标记落在命中点邻近窗口内，避免超长块里远处偶然出现标记就被降级。
+            let sev = if *rule == "hide_from_user"
+                && verb_in_window(&lower, pos, HIDE_BENIGN_MARKERS)
+            {
                 Severity::Low
             } else {
                 *severity
