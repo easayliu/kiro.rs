@@ -142,6 +142,7 @@ pub(crate) fn count_all_tokens(
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(call_remote_count_tokens(
                     &api_url, &config, model, &system, &messages, &tools,
+                    true, // 输入总量是单个独立数，可压平兜底
                 ))
             });
 
@@ -207,7 +208,8 @@ pub(crate) async fn count_all_tokens_remote_cached(
     }
 
     let messages = messages.to_vec();
-    match call_remote_count_tokens(&api_url, &config, model, system, &messages, tools).await {
+    // 输入总量是单个独立数，允许压平兜底（结构性 400 不至于退回本地启发式）。
+    match call_remote_count_tokens(&api_url, &config, model, system, &messages, tools, true).await {
         Ok(tokens) => {
             remote_count_cache_put(key, tokens);
             tracing::debug!(source = "remote", api_url = %api_url, tokens, "count_tokens(input) 走远程（延迟并发）");
@@ -452,6 +454,11 @@ async fn post_count_tokens(
 /// （count_tokens 按发消息规则拒收 thinking 签名/工具配对/加密 search_result/directive/
 /// 截断历史等，而真实 Kiro 请求不受限），自动用 [`flatten_messages_for_count`] 压平文本
 /// 兜底重算一次——一处根治所有结构性 400，无需逐条打补丁。
+///
+/// `allow_flatten`：**仅**用于「结果是单个独立数」的调用方（输入总量计数）。凡是要把
+/// 多个计数相减的调用方（recount 的 total/前缀相减、output 差分的 full−base）**必须传
+/// false**——否则一个走压平、另一个走原生就会**口径混用相减**，把缓存分段/输出量算错。
+/// 传 false 时遇结构性 4xx 照旧返回 Err，由调用方整体回退本地（三段同口径自洽）。
 async fn call_remote_count_tokens(
     api_url: &str,
     config: &CountTokensConfig,
@@ -459,6 +466,7 @@ async fn call_remote_count_tokens(
     system: &Option<Vec<SystemMessage>>,
     messages: &Vec<Message>,
     tools: &Option<Vec<Tool>>,
+    allow_flatten: bool,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let client = count_http_client(config)?;
 
@@ -471,9 +479,9 @@ async fn call_remote_count_tokens(
 
     match post_count_tokens(&client, api_url, config, &native).await {
         Ok(tokens) => Ok(tokens),
-        Err((true, first_err)) => {
-            // 结构性 4xx：压平成单条 user 文本重算（system/tools 保持不变——报错都在
-            // messages.N）。压平必过，退化只是丢每消息边界开销。
+        // 结构性 4xx 且允许压平：压成单条 user 文本重算（system/tools 不变——报错都在
+        // messages.N）。压平必过，退化只是丢每消息边界开销。相减类调用方不走这里。
+        Err((true, first_err)) if allow_flatten => {
             let flat = flatten_messages_for_count(messages);
             if flat.is_empty() {
                 return Err(first_err);
@@ -489,7 +497,7 @@ async fn call_remote_count_tokens(
                 .await
                 .map_err(|(_, e)| e)
         }
-        Err((false, e)) => Err(e),
+        Err((_, e)) => Err(e),
     }
 }
 
@@ -558,6 +566,9 @@ pub(crate) async fn count_payload_remote(payload: &crate::anthropic::types::Mess
         &payload.system,
         &payload.messages,
         &payload.tools,
+        // 不压平：recount 要把 total 与前缀相减，压平/原生混用会算错分段；
+        // 遇结构性 400 返回 None，由 recount 整体回退本地（三段同口径自洽）。
+        false,
     )
     .await
     {
@@ -601,8 +612,11 @@ async fn call_remote_count_tokens_cached(
     if let Some(hit) = remote_count_cache_get(key) {
         return Ok(hit);
     }
+    // 不压平：输出差分法要把 full 与 base 相减，口径必须一致；遇 400 返回 Err，
+    // 由 count_output_tokens 整体回退本地启发式。
     let tokens =
-        call_remote_count_tokens(api_url, config, model.to_string(), &None, messages, &None).await?;
+        call_remote_count_tokens(api_url, config, model.to_string(), &None, messages, &None, false)
+            .await?;
     remote_count_cache_put(key, tokens);
     Ok(tokens)
 }
