@@ -1569,8 +1569,12 @@ fn convert_tools(
             let mapped_name = map_tool_name(&t.name, tool_name_map);
 
             // web_search 是 Anthropic 服务端工具，客户端不带 input_schema。透传给 Kiro
-            // 当普通工具用时，必须补一个 {query} schema，否则模型看到空 object、不知道
-            // 要填 query（server-tool 的 pause_turn 路径由代理侧执行搜索，见 websearch.rs）。
+            // 当普通工具用时，必须补 {query} schema，否则模型看到空 object、不知道要填
+            // query（server-tool 的 pause_turn 路径由代理侧执行搜索，见 websearch.rs）。
+            //
+            // schema 照抄 Kiro MCP `tools/list` 自报的原文：query 有 200 字符硬上限，
+            // 实测 201 字符即被 MCP 以 -32602 Invalid tool parameters 拒绝。必须把这条
+            // 写进 description，否则模型会生成超长 query、搜索静默失败。
             let is_web_search = t
                 .tool_type
                 .as_deref()
@@ -1584,7 +1588,7 @@ fn convert_tools(
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "The search query to look up on the web"
+                            "description": "The search query to execute. Must be 200 characters or less."
                         }
                     },
                     "required": ["query"],

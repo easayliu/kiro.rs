@@ -810,6 +810,10 @@ pub struct StreamContext {
     /// web_search 服务端工具（pause_turn 路径）：仅当请求声明了 web_search 时为 Some。
     /// 为 None 时下述拦截/注入全不触发，对既有流程零影响。
     web_search: Option<WebSearchStreamState>,
+    /// 上一轮被延迟、本轮开头已补跑好的 web_search 结果块（官方 deferral：下一轮响应
+    /// 以该 result 块打头、server_tool_use 不重复）。由 handler 注入，在 message_start
+    /// 之后、模型内容之前发出。
+    deferred_web_search_blocks: Vec<serde_json::Value>,
 }
 
 /// 流式路径下 web_search 服务端工具的运行态（见 [`StreamContext::set_web_search`]）。
@@ -886,6 +890,7 @@ impl StreamContext {
             official_input_task: None,
             official_segments_task: None,
             web_search: None,
+            deferred_web_search_blocks: Vec::new(),
         }
     }
 
@@ -918,6 +923,11 @@ impl StreamContext {
             prior_uses,
             pending: Vec::new(),
         });
+    }
+
+    /// 注入上一轮被延迟、本轮开头补跑好的 web_search 结果块（官方 deferral 的续跑侧）。
+    pub fn set_deferred_web_search_blocks(&mut self, blocks: Vec<serde_json::Value>) {
+        self.deferred_web_search_blocks = blocks;
     }
 
     /// 当前 tool_use 是否应作为 web_search 服务端工具被扣下（而非透传给客户端）。
@@ -970,6 +980,14 @@ impl StreamContext {
         result_content: serde_json::Value,
         billed: i32,
     ) -> Vec<SseEvent> {
+        let mut events = self.emit_server_tool_use_block(tool_use_id, query);
+        events.extend(self.emit_web_search_result_block(tool_use_id, result_content, billed));
+        events
+    }
+
+    /// 只发 server_tool_use 块（不配 result）——官方 deferral：与客户端工具同轮时
+    /// server tool 不执行，靠「无配对 result 块」表达未完成，下一轮请求开头再补跑。
+    fn emit_server_tool_use_block(&mut self, tool_use_id: &str, query: &str) -> Vec<SseEvent> {
         // 先收尾当前打开的块（如决策文本块），再开始 server_tool_use。
         let mut events = self.state_manager.close_open_blocks();
 
@@ -1004,7 +1022,17 @@ impl StreamContext {
         if let Some(ev) = self.state_manager.handle_content_block_stop(stu_idx) {
             events.push(ev);
         }
+        events
+    }
 
+    /// 发 web_search_tool_result 块（按 tool_use_id 与 server_tool_use 配对）。
+    fn emit_web_search_result_block(
+        &mut self,
+        tool_use_id: &str,
+        result_content: serde_json::Value,
+        billed: i32,
+    ) -> Vec<SseEvent> {
+        let mut events = Vec::new();
         let res_idx = self.state_manager.next_block_index();
         events.extend(self.state_manager.handle_content_block_start(
             res_idx,
@@ -1053,25 +1081,37 @@ impl StreamContext {
         });
 
         if let Some((jobs, provider, preferred, max_uses, prior_uses)) = ctx {
-            let mut used = prior_uses;
-            for (tool_use_id, query) in jobs {
-                let exceeded = max_uses.is_some_and(|m| used >= m);
-                let (result_content, billed) = if exceeded {
-                    (super::websearch::max_uses_exceeded_content(), 0)
-                } else {
-                    super::websearch::run_agentic_search(&provider, &query, preferred).await
-                };
-                used += 1;
-                events.extend(self.emit_web_search_result_blocks(
-                    &tool_use_id,
-                    &query,
-                    result_content,
-                    billed,
-                ));
-            }
-            // 仅 web_search（无其它客户端 tool_use）→ pause_turn，客户端原样回传后续跑。
-            if used > prior_uses && !self.state_manager.has_tool_use() {
-                self.state_manager.set_stop_reason("pause_turn");
+            if self.state_manager.has_tool_use() {
+                // 官方 deferral：与客户端工具同组并行调用时 server tool 不执行——只发
+                // server_tool_use（无配对 result），stop_reason 保持 tool_use 让客户端先跑
+                // 自己的工具；被延迟的搜索在下一轮请求开头补跑（见
+                // websearch::resolve_deferred_web_searches）。
+                for (tool_use_id, query) in jobs {
+                    events.extend(self.emit_server_tool_use_block(&tool_use_id, &query));
+                }
+            } else {
+                let mut used = prior_uses;
+                let mut any = false;
+                for (tool_use_id, query) in jobs {
+                    let exceeded = max_uses.is_some_and(|m| used >= m);
+                    let (result_content, billed) = if exceeded {
+                        (super::websearch::max_uses_exceeded_content(), 0)
+                    } else {
+                        super::websearch::run_agentic_search(&provider, &query, preferred).await
+                    };
+                    used += 1;
+                    any = true;
+                    events.extend(self.emit_web_search_result_blocks(
+                        &tool_use_id,
+                        &query,
+                        result_content,
+                        billed,
+                    ));
+                }
+                // 仅 web_search → pause_turn，客户端原样回传后模型据结果续跑。
+                if any {
+                    self.state_manager.set_stop_reason("pause_turn");
+                }
             }
         }
 
@@ -1218,6 +1258,18 @@ impl StreamContext {
         let msg_start = self.create_message_start_event();
         if let Some(event) = self.state_manager.handle_message_start(msg_start) {
             events.push(event);
+        }
+
+        // 上一轮被延迟、已在本轮开头补跑好的 web_search 结果块：官方要求响应以其打头
+        // （在模型新内容之前）。计入 web_search_requests 供 message_delta 上报。
+        for block in std::mem::take(&mut self.deferred_web_search_blocks) {
+            let id = block
+                .get("tool_use_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let content = block.get("content").cloned().unwrap_or(json!([]));
+            events.extend(self.emit_web_search_result_block(&id, content, 1));
         }
 
         // 如果启用了 thinking，不在这里创建文本块
@@ -2169,6 +2221,11 @@ impl BufferedStreamContext {
     ) {
         self.inner
             .set_web_search(provider, preferred, max_uses, prior_uses);
+    }
+
+    /// 注入上一轮被延迟、本轮开头补跑好的 web_search 结果块（透传到内部 StreamContext）
+    pub fn set_deferred_web_search_blocks(&mut self, blocks: Vec<serde_json::Value>) {
+        self.inner.set_deferred_web_search_blocks(blocks);
     }
 
     /// 注入 prompt caching 结果（透传到内部 StreamContext）

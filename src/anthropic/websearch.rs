@@ -127,13 +127,6 @@ pub struct WebSearchState {
     pub prior_uses: i32,
 }
 
-impl WebSearchState {
-    /// 是否已达到 max_uses 上限（下一次搜索应返回 max_uses_exceeded 错误、不真正执行）。
-    pub fn exceeded(&self) -> bool {
-        self.max_uses.is_some_and(|m| self.prior_uses >= m)
-    }
-}
-
 /// 若请求声明了 web_search 工具，返回其服务端工具状态；否则 None。
 ///
 /// 不限制工具数量：单工具与多工具一致，都走「web_search 作为真 server tool」的
@@ -242,6 +235,114 @@ pub fn split_web_search_tool_results(
     Some(out)
 }
 
+/// 解析上一轮被**延迟**的 web_search（官方 deferral 语义）。
+///
+/// 官方规则：模型在同一组并行调用里同时叫了 server tool 和客户端工具时，API **不执行**
+/// server tool，直接以 `stop_reason=tool_use` 返回——`server_tool_use` 块在、但没有配对的
+/// result 块。客户端跑完自己的工具、只回客户端工具的 `tool_result` 后，API 才在下一轮
+/// 开头执行那个被延迟的 server tool，响应以其 result 块打头。
+///
+/// 这里实现"下一轮开头执行"：扫 assistant 轮里**没有配对 web_search_tool_result** 的
+/// `server_tool_use(web_search)`，现在把搜索补跑掉，并且
+/// 1. 把结果作为普通 `tool_result` 并入紧随的 user 轮（与客户端工具的 tool_result 同一条
+///    消息），使 Kiro 侧 tool_use/tool_result 正常配对；
+/// 2. 返回对应的 `web_search_tool_result` 块，由调用方**前置**到本次响应内容最前面
+///    （官方：`server_tool_use` 不重复，只补它的 result）。
+///
+/// 返回要前置到响应的块（空 = 没有待补的延迟搜索，整条零开销）。
+pub async fn resolve_deferred_web_searches(
+    payload: &mut MessagesRequest,
+    provider: &crate::kiro::provider::KiroProvider,
+    preferred: Option<u64>,
+) -> Vec<serde_json::Value> {
+    // 1. 收集所有已被 result 配对过的 tool_use_id（不论在哪条消息里）
+    let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for msg in &payload.messages {
+        if let serde_json::Value::Array(arr) = &msg.content {
+            for b in arr {
+                let ty = b.get("type").and_then(|v| v.as_str());
+                if ty == Some("web_search_tool_result") || ty == Some("tool_result") {
+                    if let Some(id) = b.get("tool_use_id").and_then(|v| v.as_str()) {
+                        resolved.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. 找出未配对的 server_tool_use(web_search)：(消息下标, id, query)
+    let mut deferred: Vec<(usize, String, String)> = Vec::new();
+    for (i, msg) in payload.messages.iter().enumerate() {
+        if msg.role != "assistant" {
+            continue;
+        }
+        if let serde_json::Value::Array(arr) = &msg.content {
+            for b in arr {
+                let is_ws = b.get("type").and_then(|v| v.as_str()) == Some("server_tool_use")
+                    && b.get("name").and_then(|v| v.as_str()) == Some("web_search");
+                if !is_ws {
+                    continue;
+                }
+                let Some(id) = b.get("id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if resolved.contains(id) {
+                    continue;
+                }
+                let query = b
+                    .get("input")
+                    .and_then(|i| i.get("query"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                deferred.push((i, id.to_string(), query));
+            }
+        }
+    }
+    if deferred.is_empty() {
+        return Vec::new();
+    }
+
+    // 3. 逐个补跑搜索：结果并入紧随的 user 轮喂 Kiro，同时产出前置到响应的 result 块
+    let mut prepend = Vec::with_capacity(deferred.len());
+    for (idx, id, query) in deferred {
+        tracing::info!(query = %query, "补跑上一轮被延迟的 web_search（官方 deferral）");
+        let (content, _billed) = run_agentic_search(provider, &query, preferred).await;
+        let (text, is_error) = decode_web_search_tool_result(&Some(content.clone()));
+
+        let tool_result = json!({
+            "type": "tool_result",
+            "tool_use_id": id,
+            "content": text,
+            "is_error": is_error
+        });
+        // 并入紧随的 user 轮（客户端工具结果所在那条）；没有就在其后新建一条
+        match payload.messages.get_mut(idx + 1) {
+            Some(next) if next.role == "user" => match &mut next.content {
+                serde_json::Value::Array(arr) => arr.push(tool_result),
+                other => {
+                    let text_block = json!({ "type": "text", "text": other.as_str().unwrap_or_default() });
+                    *other = serde_json::Value::Array(vec![text_block, tool_result]);
+                }
+            },
+            _ => payload.messages.insert(
+                idx + 1,
+                super::types::Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::Array(vec![tool_result]),
+                },
+            ),
+        }
+
+        prepend.push(json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": id,
+            "content": content
+        }));
+    }
+    prepend
+}
+
 /// 代理侧执行模型发起的一次 web_search 调用，产出要注入响应的两个 content block：
 /// `server_tool_use` + `web_search_tool_result`（server-tool / pause_turn 路径）。
 ///
@@ -287,6 +388,19 @@ pub async fn run_agentic_search(
     query: &str,
     preferred: Option<u64>,
 ) -> (serde_json::Value, i32) {
+    // Kiro MCP 的 web_search 对 query 有 200 字符硬上限（其 tools/list 自报，实测 201
+    // 字符即被 -32602 Invalid tool parameters 拒绝）。超限直接返回官方的 query_too_long
+    // 错误码，别让它变成"搜了但空结果"——模型看不出原因、无从重试；拿到错误码才会自己
+    // 裁短重搜。
+    if query.chars().count() > MAX_QUERY_CHARS {
+        tracing::info!(
+            len = query.chars().count(),
+            "web_search query 超过 {} 字符上限，返回 query_too_long",
+            MAX_QUERY_CHARS
+        );
+        return (error_content("query_too_long"), 0);
+    }
+
     tracing::info!(query = %query, "代理侧执行 web_search（server-tool/pause_turn 路径）");
     let (_mcp_tool_use_id, mcp_request) = create_mcp_request(query);
     match call_mcp_api(provider, &mcp_request, preferred).await {
@@ -296,18 +410,30 @@ pub async fn run_agentic_search(
         ),
         Err(e) => {
             tracing::warn!("agentic web_search MCP 调用失败: {}", e);
-            (serde_json::Value::Array(vec![]), 0)
+            (error_content("unavailable"), 0)
         }
     }
+}
+
+/// Kiro MCP web_search 的 query 字符上限（其 tools/list 自报「200 characters or less」，
+/// 实测 200 通过、201 被 -32602 拒绝）。
+const MAX_QUERY_CHARS: usize = 200;
+
+/// 构造官方 `web_search_tool_result_error` content。
+///
+/// 官方错误码：`too_many_requests` / `invalid_tool_input` / `max_uses_exceeded` /
+/// `query_too_long` / `request_too_large` / `unavailable`。出错一律不计费。
+fn error_content(error_code: &str) -> serde_json::Value {
+    json!({
+        "type": "web_search_tool_result_error",
+        "error_code": error_code
+    })
 }
 
 /// max_uses 超限时 web_search_tool_result 的错误 content。
 pub fn max_uses_exceeded_content() -> serde_json::Value {
     tracing::info!("web_search 达到 max_uses 上限，返回 max_uses_exceeded");
-    json!({
-        "type": "web_search_tool_result_error",
-        "error_code": "max_uses_exceeded"
-    })
+    error_content("max_uses_exceeded")
 }
 
 /// 生成22位大小写字母和数字的随机字符串
@@ -574,6 +700,26 @@ mod tests {
     }
 
     #[test]
+    fn test_error_content_codes_roundtrip() {
+        // 官方错误码经 error_content 产出、再被续跑侧解码回错误文本（模型据此重试）
+        for code in ["query_too_long", "unavailable", "max_uses_exceeded"] {
+            let c = error_content(code);
+            assert_eq!(c["type"], "web_search_tool_result_error");
+            assert_eq!(c["error_code"], code);
+            let (text, is_error) = decode_web_search_tool_result(&Some(c));
+            assert!(is_error, "{code} 应解码为错误");
+            assert!(text.contains(code), "错误文本应含错误码: {text}");
+        }
+    }
+
+    #[test]
+    fn test_max_query_chars_matches_upstream_limit() {
+        // Kiro MCP tools/list 自报「200 characters or less」，实测 200 通过 / 201 被
+        // -32602 拒绝。此常量是超限判定的依据，钉死避免被顺手改坏。
+        assert_eq!(MAX_QUERY_CHARS, 200);
+    }
+
+    #[test]
     fn test_web_search_state_and_max_uses() {
         use crate::anthropic::types::{Message, Tool};
 
@@ -612,10 +758,11 @@ mod tests {
         };
 
         let state = web_search_state(&req).expect("web_search 已声明，应有 state");
+        // 历史里 1 次 server_tool_use(web_search) → prior_uses=1；注入侧按
+        // used >= max_uses 逐次判超限，此处 1 >= 1 即下一次搜索应返回 max_uses_exceeded。
         assert_eq!(state.prior_uses, 1);
         assert_eq!(state.max_uses, Some(1));
-        // prior_uses(1) >= max_uses(1) → 已超限
-        assert!(state.exceeded());
+        assert!(state.max_uses.is_some_and(|m| state.prior_uses >= m));
     }
 
     #[test]

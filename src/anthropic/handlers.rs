@@ -687,7 +687,7 @@ pub async fn post_messages(
 pub(crate) async fn handle_messages(
     state: AppState,
     request_id: String,
-    payload: MessagesRequest,
+    mut payload: MessagesRequest,
 ) -> Response {
     // 关联 id 由 request_id_middleware 注入：优先沿用上游（newapi）带来的 request-id。
     tracing::debug!(
@@ -722,6 +722,14 @@ pub(crate) async fn handle_messages(
     // 工具透传给模型，由模型自主决定搜什么/搜几次，代理侧执行搜索并以 pause_turn
     // 让客户端续跑（见 websearch::execute_agentic_web_search / StreamContext::finalize_stream）。
     // 不再按 tools.len()==1 分流——单工具与多工具行为一致。
+    //
+    // 补跑上一轮被延迟的 web_search（与客户端工具同轮时按官方 deferral 不执行，见
+    // resolve_deferred_web_searches）。必须在 convert_request 前做：结果要并进 payload
+    // 才能随请求体喂给 Kiro；产出的 result 块随后前置到本次响应最前面。
+    // preferred 尚未解析（依赖 cache_profile），MCP 搜索传 None 由 provider 自选凭证——
+    // MCP 无 prefill 缓存，凭证粘性对它无收益。
+    let deferred_web_search_blocks =
+        super::websearch::resolve_deferred_web_searches(&mut payload, provider.as_ref(), None).await;
 
     // 转换请求
     let conversion_result = match convert_request(&payload, provider.origin(), provider.is_cli_mode()) {
@@ -856,6 +864,7 @@ pub(crate) async fn handle_messages(
             preferred,
             binding_src,
             super::websearch::web_search_state(&payload),
+            deferred_web_search_blocks,
         )
         .await
     } else {
@@ -883,6 +892,7 @@ pub(crate) async fn handle_messages(
             preferred,
             binding_src,
             super::websearch::web_search_state(&payload),
+            deferred_web_search_blocks,
         )
         .await
     }
@@ -995,6 +1005,7 @@ async fn handle_stream_request(
     preferred: Option<u64>,
     binding_src: &'static str,
     web_search: Option<super::websearch::WebSearchState>,
+    deferred_web_search_blocks: Vec<serde_json::Value>,
 ) -> Response {
     // 早响应模式：立即 200 + 初始事件，上游调用挪进流内（对齐官方时序）
     if early_first_token_enabled() {
@@ -1013,6 +1024,7 @@ async fn handle_stream_request(
             preferred,
             binding_src,
             web_search,
+            deferred_web_search_blocks,
         )
         .await;
     }
@@ -1072,6 +1084,7 @@ async fn handle_stream_request(
     if let Some(ws) = web_search {
         ctx.set_web_search(provider.clone(), preferred, ws.max_uses, ws.prior_uses);
     }
+    ctx.set_deferred_web_search_blocks(deferred_web_search_blocks);
     // TTFT 原点钉在「向上游发出请求」时刻，覆盖上游等首 token 的等待（见 ApiCallResult）。
     ctx.set_ttft_origin(api_result.upstream_request_at);
     ctx.set_cache_usage(cache_context);
@@ -1166,6 +1179,7 @@ async fn handle_stream_request_early(
     preferred: Option<u64>,
     binding_src: &'static str,
     web_search: Option<super::websearch::WebSearchState>,
+    deferred_web_search_blocks: Vec<serde_json::Value>,
 ) -> Response {
     // 期望凭据：粘性 preferred；无绑定时取顶档首个可用凭据（均衡模式下可能与实际
     // 选中不同，仅作缓存记账口径）。无可用凭据时记 0，随后的上游调用会以
@@ -1204,6 +1218,7 @@ async fn handle_stream_request_early(
     if let Some(ws) = web_search {
         ctx.set_web_search(provider.clone(), preferred, ws.max_uses, ws.prior_uses);
     }
+    ctx.set_deferred_web_search_blocks(deferred_web_search_blocks);
     // 官方计数任务随 ctx 进流（经 Waiting→Relaying 交接），收尾 join 并套用官方口径。
     if let Some(t) = official_input_task {
         ctx.set_official_input_task(t);
@@ -1668,6 +1683,7 @@ async fn handle_non_stream_request(
     preferred: Option<u64>,
     binding_src: &'static str,
     web_search: Option<super::websearch::WebSearchState>,
+    deferred_web_search_blocks: Vec<serde_json::Value>,
 ) -> Response {
     let request_start = Instant::now();
     // 调用 Kiro API 并缓冲完整响应体（支持多凭据故障转移；body 中途被上游 RST/EOF
@@ -1918,47 +1934,74 @@ async fn handle_non_stream_request(
     // web_search 未在请求 tools 中声明时 web_search=None，整段不触发、对既有流程零影响。
     let mut web_search_requests = 0i32;
     if let Some(ws) = &web_search {
+        // 官方 deferral：web_search 与客户端工具落在同一组并行调用里时，**不执行**
+        // server tool，只发 server_tool_use（无 result）并以 stop_reason=tool_use 返回，
+        // 让客户端先跑自己的工具；被延迟的搜索在下一轮请求开头补跑
+        // （见 websearch::resolve_deferred_web_searches）。
+        let has_client_tool_use = content.iter().any(|b| {
+            b.get("type").and_then(|v| v.as_str()) == Some("tool_use")
+                && b.get("name").and_then(|v| v.as_str()) != Some("web_search")
+        });
         let mut new_content: Vec<serde_json::Value> = Vec::with_capacity(content.len() + 1);
         let mut had_web_search = false;
-        let mut has_other_tool_use = false;
+        let mut used = ws.prior_uses;
         for block in std::mem::take(&mut content) {
             let is_ws = block.get("type").and_then(|v| v.as_str()) == Some("tool_use")
                 && block.get("name").and_then(|v| v.as_str()) == Some("web_search");
-            if is_ws {
-                had_web_search = true;
-                let tool_use_id = block
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let query = block
-                    .get("input")
-                    .and_then(|i| i.get("query"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let (blocks, billed) = super::websearch::execute_agentic_web_search(
-                    provider.as_ref(),
-                    &tool_use_id,
-                    &query,
-                    preferred,
-                    ws.exceeded(),
-                )
-                .await;
-                web_search_requests += billed;
-                new_content.extend(blocks);
-            } else {
-                if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                    has_other_tool_use = true;
-                }
+            if !is_ws {
                 new_content.push(block);
+                continue;
             }
+            had_web_search = true;
+            let tool_use_id = block
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let query = block
+                .get("input")
+                .and_then(|i| i.get("query"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+
+            if has_client_tool_use {
+                // 延迟：只发 server_tool_use，不配 result（官方靠"无配对 result"表达未完成）
+                new_content.push(json!({
+                    "type": "server_tool_use",
+                    "id": tool_use_id,
+                    "name": "web_search",
+                    "input": { "query": query }
+                }));
+                continue;
+            }
+
+            let (blocks, billed) = super::websearch::execute_agentic_web_search(
+                provider.as_ref(),
+                &tool_use_id,
+                &query,
+                preferred,
+                ws.max_uses.is_some_and(|m| used >= m),
+            )
+            .await;
+            used += 1;
+            web_search_requests += billed;
+            new_content.extend(blocks);
         }
         content = new_content;
-        if had_web_search && !has_other_tool_use {
+        if had_web_search && !has_client_tool_use {
             // 仅 web_search：以 pause_turn 收尾，客户端原样回传后模型据搜索结果续跑。
             stop_reason = "pause_turn".to_string();
         }
+    }
+
+    // 前置上一轮被延迟、本轮开头补跑的 web_search 结果块（官方：下一轮响应以该 result
+    // 块打头，server_tool_use 不重复）。
+    if !deferred_web_search_blocks.is_empty() {
+        web_search_requests += deferred_web_search_blocks.len() as i32;
+        let mut merged = deferred_web_search_blocks;
+        merged.extend(content);
+        content = merged;
     }
 
     // 估算输出 tokens：配了远程 count_tokens 则走精确口径，否则本地启发式。
@@ -2160,7 +2203,7 @@ pub async fn count_tokens(
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     Extension(RequestId(request_id)): Extension<RequestId>,
-    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
+    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     // 关联 id 由 request_id_middleware 注入：优先沿用上游（newapi）带来的 request-id。
     tracing::debug!(
@@ -2195,6 +2238,14 @@ pub async fn post_messages_cc(
     // 工具透传给模型，由模型自主决定搜什么/搜几次，代理侧执行搜索并以 pause_turn
     // 让客户端续跑（见 websearch::execute_agentic_web_search / StreamContext::finalize_stream）。
     // 不再按 tools.len()==1 分流——单工具与多工具行为一致。
+    //
+    // 补跑上一轮被延迟的 web_search（与客户端工具同轮时按官方 deferral 不执行，见
+    // resolve_deferred_web_searches）。必须在 convert_request 前做：结果要并进 payload
+    // 才能随请求体喂给 Kiro；产出的 result 块随后前置到本次响应最前面。
+    // preferred 尚未解析（依赖 cache_profile），MCP 搜索传 None 由 provider 自选凭证——
+    // MCP 无 prefill 缓存，凭证粘性对它无收益。
+    let deferred_web_search_blocks =
+        super::websearch::resolve_deferred_web_searches(&mut payload, provider.as_ref(), None).await;
 
     // 转换请求
     let conversion_result = match convert_request(&payload, provider.origin(), provider.is_cli_mode()) {
@@ -2328,6 +2379,7 @@ pub async fn post_messages_cc(
             preferred,
             binding_src,
             super::websearch::web_search_state(&payload),
+            deferred_web_search_blocks,
         )
         .await
     } else {
@@ -2355,6 +2407,7 @@ pub async fn post_messages_cc(
             preferred,
             binding_src,
             super::websearch::web_search_state(&payload),
+            deferred_web_search_blocks,
         )
         .await
     }
@@ -2379,6 +2432,7 @@ async fn handle_stream_request_buffered(
     preferred: Option<u64>,
     binding_src: &'static str,
     web_search: Option<super::websearch::WebSearchState>,
+    deferred_web_search_blocks: Vec<serde_json::Value>,
 ) -> Response {
     // 官方输入计数与上游调用 + 生成并发（首字不等这次跨洋计数），收尾 join 套用。
     let official_input_task = spawn_official_input_count(&cache_profile);
@@ -2435,6 +2489,7 @@ async fn handle_stream_request_buffered(
     if let Some(ws) = web_search {
         ctx.set_web_search(provider.clone(), preferred, ws.max_uses, ws.prior_uses);
     }
+    ctx.set_deferred_web_search_blocks(deferred_web_search_blocks);
     // TTFT 原点钉在「向上游发出请求」时刻，覆盖上游等首 token 的等待（见 ApiCallResult）。
     ctx.set_ttft_origin(api_result.upstream_request_at);
     ctx.set_cache_usage(cache_context);
