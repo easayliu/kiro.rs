@@ -123,6 +123,12 @@ impl CacheProfile {
         self.local_total_input_tokens
     }
 
+    /// 原始 payload 的共享句柄，供把官方计数挪到后台任务时零拷贝地移交给 `spawn`
+    /// （`Arc` clone 只加引用计数）。
+    pub(crate) fn payload_arc(&self) -> std::sync::Arc<MessagesRequest> {
+        self.payload.clone()
+    }
+
     /// 粘性绑定使用的用户身份 hash。
     ///
     /// 粒度比 `identity_key` 粗一档：只含 device_id + account_uuid，刻意不含
@@ -1123,13 +1129,18 @@ pub async fn recount_cache_segments(profile: &CacheProfile, result: &mut CacheRe
     };
     let total_input_tokens = total_official as i32;
 
-    // 退过边界的话，把「退掉的那几个 block」的本地 token 按 official_scale 折算补回。
+    // 退过边界的话，把「退掉的那几个 block」的本地 token 按官方/本地比例折算补回。
     //
     // 退边界只发生在切点落进 tool_use/tool_result 配对中间时（官方对止于 tool_use 的
     // 前缀一律 400——已验证 5 种变体，包括不定义 tools、tool_use 后再跟 text，全部拒绝）。
     // 此时有问题的只是断点处那一两个 block（一个 tool_use 通常几十 token），它前面的前缀
     // 仍精确。故只对残段做比例近似，误差比整段退回本地比例小一到两个数量级。
-    let scale = profile.official_scale();
+    //
+    // scale 用本函数自己数出的 `total_official / 本地 total`，**不复用 `profile.official_scale()`**：
+    // 官方 count 已挪出请求前置路径，`profile.total_input_tokens` 现在恒为本地口径
+    // （official_scale 会退化成 1.0）。这里 total_official 是刚数到的官方总量，据它折算才对。
+    let local_total = profile.local_total_input_tokens().max(1);
+    let scale = total_input_tokens as f64 / local_total as f64;
     let patch = |covered: usize, target: usize| -> i32 {
         if covered >= target {
             return 0;

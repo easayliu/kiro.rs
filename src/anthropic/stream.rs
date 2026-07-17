@@ -766,6 +766,13 @@ pub struct StreamContext {
     /// key 可能被切分在多个分片里，无法逐分片改名，须攒齐到 stop 再整体解析还原、
     /// 一次性下发。无映射的工具不缓冲，仍逐分片流式。
     deferred_tool_inputs: HashMap<i32, (String, String)>,
+    /// 官方口径输入计数的后台任务（与生成并发）。收尾时 join，用官方值替换
+    /// `input_tokens`。为 `None` 表示未启用远程或本路径不做延迟计数——收尾即 no-op。
+    /// 见 [`Self::resolve_deferred_counts`]。
+    official_input_task: Option<tokio::task::JoinHandle<Option<u64>>>,
+    /// 官方口径缓存分段重算（recount）的后台任务（与生成并发）。收尾时 join，用官方
+    /// 三段覆盖 `cache_usage` 并置 `segments_official`。`None` 表示不做（trust=off 等）。
+    official_segments_task: Option<tokio::task::JoinHandle<super::cache_tracker::CacheResult>>,
 }
 
 impl StreamContext {
@@ -811,7 +818,64 @@ impl StreamContext {
             tool_input_acc: HashMap::new(),
             tool_key_map: super::converter::ToolPropertyKeyMap::new(),
             deferred_tool_inputs: HashMap::new(),
+            official_input_task: None,
+            official_segments_task: None,
         }
+    }
+
+    /// 注入官方输入计数的后台任务句柄（与生成并发跑，收尾 join）。
+    pub fn set_official_input_task(&mut self, task: tokio::task::JoinHandle<Option<u64>>) {
+        self.official_input_task = Some(task);
+    }
+
+    /// 注入官方缓存分段重算（recount）的后台任务句柄。
+    pub fn set_official_segments_task(
+        &mut self,
+        task: tokio::task::JoinHandle<super::cache_tracker::CacheResult>,
+    ) {
+        self.official_segments_task = Some(task);
+    }
+
+    /// 收尾时把并发算好的官方计数取回并套用（把官方 count 从首字关键路径挪走的收口）。
+    ///
+    /// 两个任务在生成期间就已并发跑完（生成是秒级、count 是百毫秒级），此处 join 通常瞬时
+    /// 返回；即便生成极短、count 未完，也只延后 `message_delta`，**绝不影响首字（TTFT）**。
+    /// 用既有的 `block_in_place` + `block_on` 模式（`generate_final_events` 里 output 计数已在用），
+    /// 因 `generate_final_events` 是同步函数但跑在异步任务内。
+    ///
+    /// 任务未设置（`None`，如 trust=off 不做 recount、或裸构造的测试 ctx）时整体 no-op，
+    /// 结果与历史一致。
+    fn resolve_deferred_counts(&mut self) {
+        let input_task = self.official_input_task.take();
+        let segments_task = self.official_segments_task.take();
+        if input_task.is_none() && segments_task.is_none() {
+            return;
+        }
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                if let Some(t) = input_task {
+                    // 远程成功 → 官方值；失败/取消 → 保留本地预估（不混用口径）。
+                    if let Ok(Some(off)) = t.await {
+                        self.input_tokens = off as i32;
+                    }
+                }
+                if let Some(t) = segments_task {
+                    if let Ok(res) = t.await {
+                        // recount 只改三段与 segments_official；cache_read_billed /
+                        // local_total 不动（见 recount_cache_segments）。
+                        self.cache_usage.cache_read_input_tokens = res.cache_read_input_tokens;
+                        self.cache_usage.cache_creation_input_tokens =
+                            res.cache_creation_input_tokens;
+                        self.cache_usage.cache_creation_5m_input_tokens =
+                            res.cache_creation_5m_input_tokens;
+                        self.cache_usage.cache_creation_1h_input_tokens =
+                            res.cache_creation_1h_input_tokens;
+                        self.cache_usage.uncached_input_tokens = res.uncached_input_tokens;
+                        self.segments_official = res.segments_official;
+                    }
+                }
+            })
+        });
     }
 
     /// 注入工具属性名映射（属性名曾被净化的工具，出口还原入参顶层 key）
@@ -1563,6 +1627,10 @@ impl StreamContext {
     }
 
     pub fn generate_final_events(&mut self) -> Vec<SseEvent> {
+        // 首要：把与生成并发算好的官方计数取回并套用（必须早于任何 billing_cache_usage 读取
+        // 与 token-diag 日志，因 billing 结果会被记忆化）。任务未设置时 no-op。
+        self.resolve_deferred_counts();
+
         let mut events = Vec::new();
 
         // 兜底：属性名净化工具的入参缓冲若因流异常中断未随 stop 下发，收口前 flush。
@@ -1852,6 +1920,19 @@ impl BufferedStreamContext {
     /// 注入计费回写句柄（透传到内部 StreamContext）
     pub fn set_billing_writeback(&mut self, tracker: Arc<CacheTracker>, writeback: CacheWriteback) {
         self.inner.set_billing_writeback(tracker, writeback);
+    }
+
+    /// 注入官方输入计数后台任务（透传到内部 StreamContext）
+    pub fn set_official_input_task(&mut self, task: tokio::task::JoinHandle<Option<u64>>) {
+        self.inner.set_official_input_task(task);
+    }
+
+    /// 注入官方分段重算后台任务（透传到内部 StreamContext）
+    pub fn set_official_segments_task(
+        &mut self,
+        task: tokio::task::JoinHandle<super::cache_tracker::CacheResult>,
+    ) {
+        self.inner.set_official_segments_task(task);
     }
 
     /// 设置 TTFT 计时原点（透传到内部 StreamContext）
@@ -3199,5 +3280,89 @@ mod tests {
             delta.data["usage"]["cache_read_input_tokens"],
             expected.cache_read_input_tokens
         );
+    }
+
+    /// 官方计数从首字路径挪走后的收口：收尾 join 到的**官方分段**任务会覆盖预备的本地三段
+    /// 并置 `segments_official`，计费直接采信官方段（不再走 billed_split 缩放）。
+    /// trust 无关（billed_or_official 只认 segments_official 这个事实），故无需动全局开关。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_official_segments_applied_at_finalize() {
+        use super::super::handlers::CacheUsageContext;
+
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1000, false, HashMap::new());
+        // 预备：本地口径三段（与官方值刻意不同），segments_official=false。
+        ctx.set_cache_usage(CacheUsageContext {
+            cache_creation_input_tokens: 100,
+            cache_read_input_tokens: 100,
+            cache_creation_5m_input_tokens: 100,
+            uncached_input_tokens: 100,
+            local_total_input_tokens: 300,
+            segments_official: false,
+            ..Default::default()
+        });
+        ctx.context_input_tokens = Some(2000);
+
+        // 与生成并发的 recount 任务：返回官方口径三段。
+        ctx.set_official_segments_task(tokio::spawn(async {
+            super::super::cache_tracker::CacheResult {
+                cache_read_input_tokens: 400,
+                cache_creation_input_tokens: 600,
+                cache_creation_5m_input_tokens: 600,
+                cache_creation_1h_input_tokens: 0,
+                uncached_input_tokens: 1000,
+                segments_official: true,
+                ..Default::default()
+            }
+        }));
+
+        let _ = ctx.generate_initial_events();
+        let events = ctx.generate_final_events();
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta");
+        // 直接采信官方三段（若未套用/未置 official，会被 billed_split 缩放成别的值）。
+        assert_eq!(delta.data["usage"]["input_tokens"], 1000);
+        assert_eq!(delta.data["usage"]["cache_read_input_tokens"], 400);
+        assert_eq!(delta.data["usage"]["cache_creation_input_tokens"], 600);
+    }
+
+    /// trust=on 时，收尾 join 到的**官方输入计数**会替换预备的本地 `input_tokens`，
+    /// 并成为计费总量（strip 在 trust=on 直接返回该计数）。这里不设分段任务，让计费走
+    /// billed_split 以观测总量：官方 3000 → uncached 缩放到 3000；若未套用则约等于本地 999。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_official_input_replaces_local_at_finalize() {
+        use super::super::converter::{set_injected_prompt_tokens, set_trust_inbound_count};
+        use super::super::handlers::CacheUsageContext;
+
+        let _guard = super::super::converter::INJECTED_BASELINE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_injected_prompt_tokens(0);
+        set_trust_inbound_count(true);
+
+        // 本地预备 input=999；三段全落 uncached、segments_official=false（走 billed_split）。
+        let mut ctx = StreamContext::new_with_thinking("claude-opus-4-8", 999, false, HashMap::new());
+        ctx.set_cache_usage(CacheUsageContext {
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            uncached_input_tokens: 1000,
+            local_total_input_tokens: 1000,
+            segments_official: false,
+            ..Default::default()
+        });
+        ctx.context_input_tokens = Some(2000);
+        ctx.set_official_input_task(tokio::spawn(async { Some(3000u64) }));
+
+        let _ = ctx.generate_initial_events();
+        let events = ctx.generate_final_events();
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta");
+        // trust=on：content_total = 官方 input = 3000；billed_split(1000,3000) → uncached=3000。
+        assert_eq!(delta.data["usage"]["input_tokens"], 3000);
+
+        set_trust_inbound_count(false);
     }
 }

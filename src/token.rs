@@ -13,6 +13,7 @@ use crate::anthropic::types::{
 use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
 use parking_lot::RwLock;
+use reqwest::Client;
 
 /// Count Tokens API 配置
 #[derive(Clone, Default)]
@@ -43,6 +44,26 @@ static COUNT_TOKENS_CONFIG: RwLock<Option<CountTokensConfig>> = RwLock::new(None
 /// 初始化 count_tokens 配置（启动时调用）
 pub fn init_config(config: CountTokensConfig) {
     *COUNT_TOKENS_CONFIG.write() = Some(config);
+    // proxy / tls_backend 只在此处设定，重置缓存的 client 让下次按新配置重建。
+    *COUNT_CLIENT.write() = None;
+}
+
+/// count_tokens 专用 HTTP client 缓存。
+///
+/// 每次 count 都 `build_client` 会另建连接池、重做 TLS 握手（跨洋握手是 2–3 个 RTT），
+/// 400 RPM 下这些握手既压端点又烧本地 CPU。client 只依赖 `proxy` + `tls_backend`——二者仅在
+/// [`init_config`] 设定、`update_config` 不动（只改 url/key/auth_type），故整进程复用一个即可。
+/// `reqwest::Client` 内部 Arc 共享连接池，clone 便宜。首建竞态无害（后写者胜，两者都是合法 client）。
+static COUNT_CLIENT: RwLock<Option<Client>> = RwLock::new(None);
+
+/// 取（或懒建）count 专用 client。构建失败不缓存，下次重试。
+fn count_http_client(config: &CountTokensConfig) -> anyhow::Result<Client> {
+    if let Some(c) = COUNT_CLIENT.read().clone() {
+        return Ok(c);
+    }
+    let client = build_client(config.proxy.as_ref(), 300, config.tls_backend)?;
+    *COUNT_CLIENT.write() = Some(client.clone());
+    Ok(client)
 }
 
 /// 运行时更新 count_tokens 配置（Admin API 调用，即时生效）
@@ -152,6 +173,58 @@ pub(crate) fn count_all_tokens(
     tokens
 }
 
+/// 官方口径输入计数的**异步、带缓存、带 sanitize** 版本。
+///
+/// 供把官方 count 从首字关键路径挪到「与生成并发、收尾取回」的调用方使用（见
+/// `anthropic::handlers`）。与同步的 [`count_all_tokens`] 远程分支口径完全一致：
+/// - 走 [`call_remote_count_tokens`]，因此对历史 thinking block 做了同样的 `sanitize_for_count`
+///   （不 sanitize 会撞上 Anthropic 校验 Kiro 签名的 400，见 [`sanitize_for_count`]）——
+///   这也是**不能**改用 [`count_payload_remote`] 的原因（后者不 sanitize）。
+/// - 结果按内容 hash 进 [`REMOTE_COUNT_CACHE`]，相同前缀不重复跨洋。
+///
+/// 未启用远程或调用失败返回 `None`；调用方应保留本地预估作预备值，不要混用口径。
+pub(crate) async fn count_all_tokens_remote_cached(
+    model: String,
+    system: &Option<Vec<SystemMessage>>,
+    messages: &[Message],
+    tools: &Option<Vec<Tool>>,
+) -> Option<u64> {
+    let config = get_config()?;
+    let api_url = resolve_remote(&config)?;
+
+    // 缓存 key 要与 call_remote_count_tokens 实际发出的请求同形（含 sanitize），否则命中错位。
+    let request = CountTokensRequest {
+        model: model.clone(),
+        messages: sanitize_for_count(messages),
+        system: system.clone(),
+        tools: tools.clone(),
+    };
+    let body = serde_json::to_value(&request).ok()?;
+    let key = remote_count_cache_key(&model, &body);
+    if let Some(hit) = remote_count_cache_get(key) {
+        tracing::debug!(source = "remote_cached", tokens = hit, "count_tokens(input) 命中本地缓存（延迟并发）");
+        return Some(hit);
+    }
+
+    let messages = messages.to_vec();
+    match call_remote_count_tokens(&api_url, &config, model, system, &messages, tools).await {
+        Ok(tokens) => {
+            remote_count_cache_put(key, tokens);
+            tracing::debug!(source = "remote", api_url = %api_url, tokens, "count_tokens(input) 走远程（延迟并发）");
+            Some(tokens)
+        }
+        Err(e) => {
+            tracing::warn!(
+                source = "local_fallback",
+                api_url = %api_url,
+                error = %e,
+                "count_tokens(input) 远程失败（延迟并发），调用方保留本地预估"
+            );
+            None
+        }
+    }
+}
+
 /// 把 messages 净化成 count_tokens 能接受的形状（仅用于计数，不影响真实请求）。
 ///
 /// **thinking block → 同内容的 text block。**
@@ -228,7 +301,7 @@ async fn call_remote_count_tokens(
     messages: &Vec<Message>,
     tools: &Option<Vec<Tool>>,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    let client = build_client(config.proxy.as_ref(), 300, config.tls_backend)?;
+    let client = count_http_client(config)?;
 
     // 构建请求体。messages 需先净化：history 里的 thinking block 带的是**上游 Kiro 的
     // 签名**，Anthropic 会真的去验它、必然不过（实测伪签名/空签名/不带 signature 字段

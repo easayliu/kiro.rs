@@ -822,9 +822,9 @@ pub(crate) async fn handle_messages(
         return resp;
     }
 
-    // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
+    // 首字前只用本地估算（瞬时）：供 build_profile 与粘性绑定。官方口径计数已从关键
+    // 路径挪走——流式路径改为与生成并发计算、收尾取回（见 handle_stream_request*）。
+    let local_input_tokens = token::count_all_tokens_local(
         payload.system.clone(),
         payload.messages.clone(),
         payload.tools.clone(),
@@ -832,7 +832,7 @@ pub(crate) async fn handle_messages(
 
     // 构建 cache profile（基于原始请求：含 cache_control 等元数据）
     let cache_tracker = state.cache_tracker.clone();
-    let cache_profile = cache_tracker.build_profile(&payload, input_tokens);
+    let cache_profile = cache_tracker.build_profile(&payload, local_input_tokens);
 
     // 粘性绑定：解析 user_id → preferred 凭证；无 user_id 时回退到前缀指纹，
     // 让相同前缀的请求也钉在同一凭证上以复用上游 prefix cache。
@@ -864,7 +864,7 @@ pub(crate) async fn handle_messages(
             provider,
             &request_body,
             &payload.model,
-            input_tokens,
+            local_input_tokens,
             thinking_enabled,
             tool_name_map,
             tool_key_map,
@@ -877,7 +877,14 @@ pub(crate) async fn handle_messages(
         )
         .await
     } else {
-        // 非流式响应：仅在配置开启时提取 thinking 块
+        // 非流式无首字概念：官方口径计数仍同步取（保持计费口径与历史一致）。
+        let input_tokens = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+        // 仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
         handle_non_stream_request(
             provider,
@@ -946,6 +953,49 @@ async fn call_api_buffered_with_signature_fallback(
     }
 }
 
+/// spawn 一个与生成并发的**官方输入计数**任务（把官方 count 移出首字关键路径的一半）。
+///
+/// 未配远程 count 时返回 `None`（调用方保留本地预估作预备值）。任务用带 sanitize 的缓存版
+/// 计数（口径与历史同步路径一致），生成期间跑完，收尾 `join`——见
+/// [`StreamContext::resolve_deferred_counts`]。
+fn spawn_official_input_count(
+    profile: &CacheProfile,
+) -> Option<tokio::task::JoinHandle<Option<u64>>> {
+    if !token::remote_enabled() {
+        return None;
+    }
+    let payload = profile.payload_arc();
+    Some(tokio::spawn(async move {
+        token::count_all_tokens_remote_cached(
+            payload.model.clone(),
+            &payload.system,
+            &payload.messages,
+            &payload.tools,
+        )
+        .await
+    }))
+}
+
+/// spawn 一个与生成并发的**官方缓存分段重算（recount）**任务（另一半）。
+///
+/// 仅在 trust=on 且远程可用时 spawn（等价 `recount_cache_segments` 自身的守卫，避免无谓 spawn）。
+/// 任务基于**本地口径**的 `cache_result`（compute_and_update 的即时结果）跑 recount，返回
+/// 官方化后的 `CacheResult`；收尾套用（覆盖三段 + `segments_official`）。
+fn spawn_official_segments(
+    profile: &CacheProfile,
+    result: &super::cache_tracker::CacheResult,
+) -> Option<tokio::task::JoinHandle<super::cache_tracker::CacheResult>> {
+    if !(super::converter::trust_inbound_count() && token::remote_enabled()) {
+        return None;
+    }
+    let profile = profile.clone();
+    let mut result = *result;
+    Some(tokio::spawn(async move {
+        super::cache_tracker::recount_cache_segments(&profile, &mut result).await;
+        result
+    }))
+}
+
 /// 处理流式请求
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -982,6 +1032,9 @@ async fn handle_stream_request(
         .await;
     }
 
+    // 官方输入计数与上游调用 + 生成并发（首字不等这次跨洋计数），收尾 join 套用。
+    let official_input_task = spawn_official_input_count(&cache_profile);
+
     // 调用 Kiro API（支持多凭据故障转移；思考签名失效时剥离历史思考块重试一次）
     let api_result = match call_api_stream_with_signature_fallback(provider.as_ref(), request_body, preferred).await {
         Ok(resp) => resp,
@@ -1009,11 +1062,12 @@ async fn handle_stream_request(
     );
 
     // 原子地计算缓存命中并更新 checkpoint 表
-    let (mut cache_result, cache_writeback) =
+    let (cache_result, cache_writeback) =
         cache_tracker.compute_and_update(api_result.credential_id, &cache_profile);
     // 分段由 block 累加（本地口径），total 配了远程后是官方口径——直接相减会混用单位。
-    // 用官方口径重算三段；远程不可用时保持本地口径原样返回。
-    super::cache_tracker::recount_cache_segments(&cache_profile, &mut cache_result).await;
+    // 官方口径三段重算挪到与生成并发（收尾 join 套用）：cache_context 先用本地口径作预备，
+    // 收尾 resolve_deferred_counts 再覆盖为官方三段。
+    let official_segments_task = spawn_official_segments(&cache_profile, &cache_result);
     let cache_context = CacheUsageContext {
         cache_creation_input_tokens: cache_result.cache_creation_input_tokens,
         cache_read_input_tokens: cache_result.cache_read_input_tokens,
@@ -1039,6 +1093,13 @@ async fn handle_stream_request(
     );
     // 计费完成后（流末尾 contextUsageEvent）把缩放后的 billed 累计回写缓存，供下次命中守恒。
     ctx.set_billing_writeback(cache_tracker.clone(), cache_writeback);
+    // 官方计数任务随 ctx 进流，收尾（generate_final_events）join 并套用官方口径。
+    if let Some(t) = official_input_task {
+        ctx.set_official_input_task(t);
+    }
+    if let Some(t) = official_segments_task {
+        ctx.set_official_segments_task(t);
+    }
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1123,11 +1184,14 @@ async fn handle_stream_request_early(
         .or_else(|| provider.top_priority_credential_ids(Some(model)).first().copied())
         .unwrap_or(0);
 
+    // 官方输入计数入口即 spawn：与 sim_delay + 上游等待 + 生成全程并发（重叠最充分）。
+    let official_input_task = spawn_official_input_count(&cache_profile);
+
     // 原子地计算缓存命中并更新 checkpoint 表（按期望凭据先行记账）
-    let (mut cache_result, cache_writeback) =
+    let (cache_result, cache_writeback) =
         cache_tracker.compute_and_update(expected_cred, &cache_profile);
-    // 同上：把缓存分段换算成与 total 同源的官方口径。
-    super::cache_tracker::recount_cache_segments(&cache_profile, &mut cache_result).await;
+    // 官方口径三段重算挪到与生成并发：cache_context 先用本地口径作预备，收尾套用官方三段。
+    let official_segments_task = spawn_official_segments(&cache_profile, &cache_result);
     let cache_context = CacheUsageContext {
         cache_creation_input_tokens: cache_result.cache_creation_input_tokens,
         cache_read_input_tokens: cache_result.cache_read_input_tokens,
@@ -1146,6 +1210,13 @@ async fn handle_stream_request_early(
     ctx.set_cache_usage(cache_context);
     ctx.set_credential_id(expected_cred as i64);
     ctx.set_billing_writeback(cache_tracker.clone(), cache_writeback);
+    // 官方计数任务随 ctx 进流（经 Waiting→Relaying 交接），收尾 join 并套用官方口径。
+    if let Some(t) = official_input_task {
+        ctx.set_official_input_task(t);
+    }
+    if let Some(t) = official_segments_task {
+        ctx.set_official_segments_task(t);
+    }
 
     // 初始事件（message_start + 文本块 start）。默认瞬时下发会让 TTFT≈0 显得不真实，
     // 故在发出前注入一段按输入 token 缩放 + 抖动的模拟延迟（配置关闭时 sim_delay=None，
@@ -2170,9 +2241,8 @@ pub async fn post_messages_cc(
         return resp;
     }
 
-    // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
-        payload.model.clone(),
+    // 首字前只用本地估算（瞬时）：官方口径计数流式路径改为与生成并发（见 handle_stream_request_buffered）。
+    let local_input_tokens = token::count_all_tokens_local(
         payload.system.clone(),
         payload.messages.clone(),
         payload.tools.clone(),
@@ -2180,7 +2250,7 @@ pub async fn post_messages_cc(
 
     // 构建 cache profile（基于原始请求）
     let cache_tracker = state.cache_tracker.clone();
-    let cache_profile = cache_tracker.build_profile(&payload, input_tokens);
+    let cache_profile = cache_tracker.build_profile(&payload, local_input_tokens);
 
     // 粘性绑定：解析 user_id → preferred 凭证；无 user_id 时回退到前缀指纹，
     // 让相同前缀的请求也钉在同一凭证上以复用上游 prefix cache。
@@ -2212,7 +2282,7 @@ pub async fn post_messages_cc(
             provider,
             &request_body,
             &payload.model,
-            input_tokens,
+            local_input_tokens,
             thinking_enabled,
             tool_name_map,
             tool_key_map,
@@ -2225,7 +2295,14 @@ pub async fn post_messages_cc(
         )
         .await
     } else {
-        // 非流式响应：仅在配置开启时提取 thinking 块
+        // 非流式无首字概念：官方口径计数仍同步取（保持计费口径与历史一致）。
+        let input_tokens = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+        // 仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
         handle_non_stream_request(
             provider,
@@ -2265,6 +2342,9 @@ async fn handle_stream_request_buffered(
     preferred: Option<u64>,
     binding_src: &'static str,
 ) -> Response {
+    // 官方输入计数与上游调用 + 生成并发（首字不等这次跨洋计数），收尾 join 套用。
+    let official_input_task = spawn_official_input_count(&cache_profile);
+
     // 调用 Kiro API（支持多凭据故障转移；思考签名失效时剥离历史思考块重试一次）
     let api_result = match call_api_stream_with_signature_fallback(provider.as_ref(), request_body, preferred).await {
         Ok(resp) => resp,
@@ -2292,11 +2372,12 @@ async fn handle_stream_request_buffered(
     );
 
     // 原子地计算缓存命中并更新 checkpoint 表
-    let (mut cache_result, cache_writeback) =
+    let (cache_result, cache_writeback) =
         cache_tracker.compute_and_update(api_result.credential_id, &cache_profile);
     // 分段由 block 累加（本地口径），total 配了远程后是官方口径——直接相减会混用单位。
-    // 用官方口径重算三段；远程不可用时保持本地口径原样返回。
-    super::cache_tracker::recount_cache_segments(&cache_profile, &mut cache_result).await;
+    // 官方口径三段重算挪到与生成并发（收尾 join 套用）：cache_context 先用本地口径作预备，
+    // 收尾 resolve_deferred_counts 再覆盖为官方三段。
+    let official_segments_task = spawn_official_segments(&cache_profile, &cache_result);
     let cache_context = CacheUsageContext {
         cache_creation_input_tokens: cache_result.cache_creation_input_tokens,
         cache_read_input_tokens: cache_result.cache_read_input_tokens,
@@ -2322,6 +2403,13 @@ async fn handle_stream_request_buffered(
     );
     // 计费完成后（流末尾 contextUsageEvent）把缩放后的 billed 累计回写缓存，供下次命中守恒。
     ctx.set_billing_writeback(cache_tracker.clone(), cache_writeback);
+    // 官方计数任务随 ctx 进流，收尾（inner.generate_final_events）join 并套用官方口径。
+    if let Some(t) = official_input_task {
+        ctx.set_official_input_task(t);
+    }
+    if let Some(t) = official_segments_task {
+        ctx.set_official_segments_task(t);
+    }
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(api_result.response, ctx);
