@@ -239,21 +239,21 @@ pub(crate) async fn count_all_tokens_remote_cached(
 /// contextUsage），删了会少算整段思考的量（agentic 会话里可达数千 token）。转成 text
 /// 保留了内容，只在 block 类型标记上有几 token 的出入，比整段漏掉准得多。
 ///
-/// 只在开了 thinking 的会话里才有 thinking block，其余请求走这里零开销（不克隆）。
+/// 始终执行（count 本就是网络重活，多一次 messages clone 可忽略）：
+/// - **thinking/redacted_thinking → 同内容 text block**（Kiro 签名过不了 Anthropic 校验，见上）。
+/// - **丢弃空 text block（`text==""`）与净化后为空的 message**（否则 400
+///   `text content blocks must be non-empty`；客户端历史里的空块、以及下方 trim 裁空的块都在此滤掉）。
+/// - **裁掉末条 assistant 的尾随空白**（否则 400 `final assistant content cannot end with
+///   trailing whitespace`——Anthropic 把末条 assistant 当待续写 prefill）。
+///
+/// 内容本就干净时输出与输入等价（无块被改/删）。
 fn sanitize_for_count(messages: &[Message]) -> Vec<Message> {
-    let needs_fix = messages.iter().any(|m| {
-        m.content
-            .as_array()
-            .is_some_and(|bs| bs.iter().any(|b| is_thinking_block(b)))
-    });
-    if !needs_fix {
-        return messages.to_vec();
-    }
-    messages
+    let mut out: Vec<Message> = messages
         .iter()
-        .map(|m| {
+        .filter_map(|m| {
             let Some(blocks) = m.content.as_array() else {
-                return m.clone();
+                // 字符串 content 原样保留（空串极少见，交由端点/回退处理）。
+                return Some(m.clone());
             };
             let converted: Vec<serde_json::Value> = blocks
                 .iter()
@@ -270,19 +270,67 @@ fn sanitize_for_count(messages: &[Message]) -> Vec<Message> {
                         .unwrap_or_default();
                     serde_json::json!({ "type": "text", "text": text })
                 })
-                // 空 text block 会被 API 拒（同 system 那条约束），顺手滤掉。
+                // 空 text block 会被 API 拒，滤掉（非 text 块如 tool_use 保留）。
                 .filter(|b| {
                     b.get("text").and_then(|v| v.as_str()).is_none_or(|t| !t.is_empty())
                 })
                 .collect();
-            Message {
+            // 净化后内容为空的 message 会被 API 拒，丢掉整条。
+            if converted.is_empty() {
+                return None;
+            }
+            Some(Message {
                 role: m.role.clone(),
                 content: serde_json::Value::Array(converted),
-            }
+            })
         })
-        // 净化后内容为空的 message 会被 API 拒，滤掉。
-        .filter(|m| !m.content.as_array().is_some_and(|b| b.is_empty()))
-        .collect()
+        .collect();
+    trim_trailing_assistant_whitespace(&mut out);
+    out
+}
+
+/// 去掉**末条 assistant 消息**内容的尾随空白（仅用于计数，不影响真实请求）。
+///
+/// Anthropic 把最后一条 assistant 消息当作待续写的 prefill，`messages` 与
+/// `count_tokens` 端点都拒绝其内容以空白结尾（400 `final assistant content cannot
+/// end with trailing whitespace`）。这在两种 count payload 上会撞到：客户端带
+/// assistant prefill、以及 recount 把前缀切在 assistant/tool 边界上时。真实上游请求
+/// 走 Kiro 不受此限，故只在送去计数前就地裁掉尾随空白。
+///
+/// content 为字符串则整体 `trim_end`；为块数组则裁最后一个含 `text` 的块，**裁成空则删掉
+/// 该块**（否则留下空 text block 反而触发另一条 400）。末条 assistant 恰为纯空白这种
+/// 极端情形（删空块后 message 可能空）不再特殊处理——极罕见，交由调用方回退本地。
+fn trim_trailing_assistant_whitespace(messages: &mut [Message]) {
+    let Some(last) = messages.last_mut() else {
+        return;
+    };
+    if last.role != "assistant" {
+        return;
+    }
+    match &mut last.content {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim_end();
+            if trimmed.len() != s.len() {
+                *s = trimmed.to_string();
+            }
+        }
+        serde_json::Value::Array(blocks) => {
+            if let Some(idx) = blocks
+                .iter()
+                .rposition(|b| b.get("text").and_then(|v| v.as_str()).is_some())
+            {
+                if let Some(t) = blocks[idx].get("text").and_then(|v| v.as_str()) {
+                    let trimmed = t.trim_end().to_string();
+                    if trimmed.is_empty() {
+                        blocks.remove(idx);
+                    } else if trimmed.len() != t.len() {
+                        blocks[idx]["text"] = serde_json::Value::String(trimmed);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn is_thinking_block(b: &serde_json::Value) -> bool {
@@ -306,8 +354,10 @@ async fn call_remote_count_tokens(
     // 构建请求体。messages 需先净化：history 里的 thinking block 带的是**上游 Kiro 的
     // 签名**，Anthropic 会真的去验它、必然不过（实测伪签名/空签名/不带 signature 字段
     // 全部 400 `Invalid signature in thinking block`）。见 [`sanitize_for_count`]。
+    // messages 净化：thinking→text、丢空块/空 message、裁末条 assistant 尾随空白，
+    // 全部满足官方 count_tokens 约束（见 [`sanitize_for_count`]）。只影响计数，不动真实请求。
     let request = CountTokensRequest {
-        model: model, // 模型名称用于 token 计算
+        model, // 模型名称用于 token 计算
         messages: sanitize_for_count(messages),
         system: system.clone(),
         tools: tools.clone(),
@@ -743,6 +793,98 @@ mod tests {
         let out = sanitize_for_count(&m);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].content, m[0].content);
+    }
+
+    /// 末条 assistant 的尾随空白会让官方 count_tokens 400，需在计数前裁掉。
+    #[test]
+    fn trim_trailing_assistant_whitespace_cases() {
+        let msg = |role: &str, c: serde_json::Value| Message {
+            role: role.to_string(),
+            content: c,
+        };
+
+        // 字符串 content：整体 trim_end。
+        let mut m = vec![msg("user", serde_json::json!("q")), msg("assistant", serde_json::json!("answer \n"))];
+        trim_trailing_assistant_whitespace(&mut m);
+        assert_eq!(m[1].content, serde_json::json!("answer"));
+
+        // 块数组：裁最后一个含 text 的块，其余块不动。
+        let mut m = vec![msg(
+            "assistant",
+            serde_json::json!([
+                {"type": "text", "text": "keep"},
+                {"type": "text", "text": "tail  "}
+            ]),
+        )];
+        trim_trailing_assistant_whitespace(&mut m);
+        assert_eq!(
+            m[0].content,
+            serde_json::json!([
+                {"type": "text", "text": "keep"},
+                {"type": "text", "text": "tail"}
+            ])
+        );
+
+        // 末条是 user：不动（约束只针对末条 assistant）。
+        let mut m = vec![msg("assistant", serde_json::json!("a ")), msg("user", serde_json::json!("u "))];
+        trim_trailing_assistant_whitespace(&mut m);
+        assert_eq!(m[1].content, serde_json::json!("u "));
+        // 前面的 assistant 也不动（只看末条）。
+        assert_eq!(m[0].content, serde_json::json!("a "));
+
+        // 无尾随空白：原样。
+        let mut m = vec![msg("assistant", serde_json::json!("clean"))];
+        trim_trailing_assistant_whitespace(&mut m);
+        assert_eq!(m[0].content, serde_json::json!("clean"));
+    }
+
+    /// 空 text block（客户端历史里带的，或 trim 裁空的）会被官方 count_tokens 400，
+    /// sanitize 需滤掉；净化后为空的 message 整条丢弃；非 text 块（tool_use）保留。
+    #[test]
+    fn sanitize_drops_empty_text_blocks_and_messages() {
+        let msg = |role: &str, c: serde_json::Value| Message {
+            role: role.to_string(),
+            content: c,
+        };
+        let out = sanitize_for_count(&[
+            msg("user", serde_json::json!("q")),
+            msg(
+                "assistant",
+                serde_json::json!([
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "real"},
+                    {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
+                ]),
+            ),
+            // 全空块 → 整条 message 丢弃。
+            msg("user", serde_json::json!([{"type": "text", "text": ""}])),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content, serde_json::json!("q"));
+        assert_eq!(
+            out[1].content,
+            serde_json::json!([
+                {"type": "text", "text": "real"},
+                {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
+            ])
+        );
+    }
+
+    /// 末条 assistant 的 text 块若整块是空白，trim 应删掉该块而非留下空块。
+    #[test]
+    fn sanitize_removes_whitespace_only_trailing_assistant_block() {
+        let msg = |role: &str, c: serde_json::Value| Message {
+            role: role.to_string(),
+            content: c,
+        };
+        let out = sanitize_for_count(&[msg(
+            "assistant",
+            serde_json::json!([
+                {"type": "text", "text": "kept"},
+                {"type": "text", "text": "   "}
+            ]),
+        )]);
+        assert_eq!(out[0].content, serde_json::json!([{"type": "text", "text": "kept"}]));
     }
 
     #[test]
