@@ -340,7 +340,118 @@ fn is_thinking_block(b: &serde_json::Value) -> bool {
     )
 }
 
-/// 调用远程 count_tokens API
+/// 把任意内容 Value 里的**文本信号**追加进 buf（用于 count 结构性失败后的压平兜底）。
+///
+/// 与 [`count_message_content_tokens`] 同构地取 text / thinking / tool_use 入参 / 嵌套
+/// content / redacted data，**天然跳过** count_tokens 会拒的结构字段（thinking 签名、
+/// tool_use_id、search_result 的 encrypted_content、图片 base64 等）——正是这些字段触发
+/// 各类 400，压平后一并甩掉。
+fn append_content_text(buf: &mut String, value: &serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => {
+            buf.push_str(s);
+            buf.push(' ');
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                append_content_text(buf, v);
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
+                buf.push_str(t);
+                buf.push(' ');
+            } else if let Some(t) = obj.get("thinking").and_then(|v| v.as_str()) {
+                buf.push_str(t);
+                buf.push(' ');
+            } else if let Some(input) = obj.get("input") {
+                buf.push_str(&serde_json::to_string(input).unwrap_or_default());
+                buf.push(' ');
+            } else if let Some(content) = obj.get("content") {
+                append_content_text(buf, content);
+            } else if let Some(t) = obj.get("data").and_then(|v| v.as_str()) {
+                buf.push_str(t);
+                buf.push(' ');
+            }
+        }
+        _ => {}
+    }
+}
+
+/// count_tokens 结构性 400 的兜底 payload：把整段对话的文本压进**单条 user 消息**。
+///
+/// count_tokens 按发消息规则严格校验（工具配对、加密 search_result、directive 消息、
+/// 截断历史的孤儿 tool_result……），而真实请求走 Kiro 不受这些限制。逐条去满足是打地鼠；
+/// 压成一条纯文本 user 消息则**必过**（无任何结构约束），仍由真实分词器计数——丢的是
+/// 每消息边界/角色开销（几 token/条），远好过退回 `ceil(字节/4)` 本地启发式。仅在原生
+/// payload 被拒后兜底，干净 payload 仍走原生、精度不受影响。空内容返回空（交回退本地）。
+fn flatten_messages_for_count(messages: &[Message]) -> Vec<Message> {
+    let mut buf = String::new();
+    for m in messages {
+        append_content_text(&mut buf, &m.content);
+    }
+    let text = buf.trim().to_string();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    vec![Message {
+        role: "user".to_string(),
+        content: serde_json::Value::String(text),
+    }]
+}
+
+/// 发一次 count_tokens 请求。错误里带 `is_client_error`（4xx）标志，供调用方判断
+/// 是否值得压平兜底重试（4xx=请求体不合法，可救；5xx/网络=重试同样内容无益）。
+async fn post_count_tokens(
+    client: &Client,
+    api_url: &str,
+    config: &CountTokensConfig,
+    request: &CountTokensRequest,
+) -> Result<u64, (bool, Box<dyn std::error::Error + Send + Sync>)> {
+    let mut req_builder = client.post(api_url);
+    if let Some(api_key) = &config.api_key {
+        if config.auth_type == "bearer" {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+        } else {
+            req_builder = req_builder.header("x-api-key", api_key);
+        }
+    }
+    // anthropic-version 为官方 API 必填头，缺失一律 400。
+    let response = req_builder
+        .header("Content-Type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .json(request)
+        .send()
+        .await
+        .map_err(|e| (false, Box::new(e) as Box<dyn std::error::Error + Send + Sync>))?;
+
+    if !response.status().is_success() {
+        // 带上响应体：官方把真正的原因放在 body 里（余额不足 / org 停用 / 请求体不合法
+        // 各自的 message 完全不同），只报状态码等于把诊断信息丢掉，排查时只能靠猜。
+        let status = response.status();
+        let is_client_error = status.is_client_error();
+        let body = response.text().await.unwrap_or_default();
+        // 截断防止超长 body 灌爆日志。
+        let brief: String = body.trim().chars().take(300).collect();
+        return Err((
+            is_client_error,
+            format!("API 返回错误状态: {} — {}", status, brief).into(),
+        ));
+    }
+
+    let result: CountTokensResponse = response
+        .json()
+        .await
+        .map_err(|e| (false, Box::new(e) as Box<dyn std::error::Error + Send + Sync>))?;
+    Ok(result.input_tokens as u64)
+}
+
+/// 调用远程 count_tokens API。
+///
+/// 先用净化后的原生 payload 计数（见 [`sanitize_for_count`]）；若遭遇**结构性 4xx**
+/// （count_tokens 按发消息规则拒收 thinking 签名/工具配对/加密 search_result/directive/
+/// 截断历史等，而真实 Kiro 请求不受限），自动用 [`flatten_messages_for_count`] 压平文本
+/// 兜底重算一次——一处根治所有结构性 400，无需逐条打补丁。
 async fn call_remote_count_tokens(
     api_url: &str,
     config: &CountTokensConfig,
@@ -351,51 +462,35 @@ async fn call_remote_count_tokens(
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     let client = count_http_client(config)?;
 
-    // 构建请求体。messages 需先净化：history 里的 thinking block 带的是**上游 Kiro 的
-    // 签名**，Anthropic 会真的去验它、必然不过（实测伪签名/空签名/不带 signature 字段
-    // 全部 400 `Invalid signature in thinking block`）。见 [`sanitize_for_count`]。
-    // messages 净化：thinking→text、丢空块/空 message、裁末条 assistant 尾随空白，
-    // 全部满足官方 count_tokens 约束（见 [`sanitize_for_count`]）。只影响计数，不动真实请求。
-    let request = CountTokensRequest {
-        model, // 模型名称用于 token 计算
+    let native = CountTokensRequest {
+        model: model.clone(),
         messages: sanitize_for_count(messages),
         system: system.clone(),
         tools: tools.clone(),
     };
 
-    // 构建请求
-    let mut req_builder = client.post(api_url);
-
-    // 设置认证头
-    if let Some(api_key) = &config.api_key {
-        if config.auth_type == "bearer" {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
-        } else {
-            req_builder = req_builder.header("x-api-key", api_key);
+    match post_count_tokens(&client, api_url, config, &native).await {
+        Ok(tokens) => Ok(tokens),
+        Err((true, first_err)) => {
+            // 结构性 4xx：压平成单条 user 文本重算（system/tools 保持不变——报错都在
+            // messages.N）。压平必过，退化只是丢每消息边界开销。
+            let flat = flatten_messages_for_count(messages);
+            if flat.is_empty() {
+                return Err(first_err);
+            }
+            tracing::debug!(error = %first_err, "count_tokens 原生结构被拒，改用压平文本兜底重算");
+            let flat_req = CountTokensRequest {
+                model,
+                messages: flat,
+                system: system.clone(),
+                tools: tools.clone(),
+            };
+            post_count_tokens(&client, api_url, config, &flat_req)
+                .await
+                .map_err(|(_, e)| e)
         }
+        Err((false, e)) => Err(e),
     }
-
-    // 发送请求。anthropic-version 为官方 API 必填头，缺失一律 400。
-    let response = req_builder
-        .header("Content-Type", "application/json")
-        .header("anthropic-version", "2023-06-01")
-        .json(&request)
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        // 带上响应体：官方把真正的原因放在 body 里（余额不足 / org 停用 / 请求体不合法
-        // 各自的 message 完全不同），只报状态码等于把诊断信息丢掉，排查时只能靠猜。
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        let body = body.trim();
-        // 截断防止超长 body 灌爆日志。
-        let brief: String = body.chars().take(300).collect();
-        return Err(format!("API 返回错误状态: {} — {}", status, brief).into());
-    }
-
-    let result: CountTokensResponse = response.json().await?;
-    Ok(result.input_tokens as u64)
 }
 
 /// 远程计数结果的本地缓存：内容 hash → 官方 token 数。
@@ -885,6 +980,62 @@ mod tests {
             ]),
         )]);
         assert_eq!(out[0].content, serde_json::json!([{"type": "text", "text": "kept"}]));
+    }
+
+    /// 压平兜底：抽取各类块的文本（text/thinking/tool_use 入参/tool_result 内容），
+    /// 跳过 count_tokens 会拒的结构字段（encrypted_content、tool_use_id、签名），压成
+    /// 单条 user 文本。用于原生 payload 结构性 400 后必过重算。
+    #[test]
+    fn flatten_messages_extracts_text_and_skips_structural_fields() {
+        let msg = |role: &str, c: serde_json::Value| Message {
+            role: role.to_string(),
+            content: c,
+        };
+        let out = flatten_messages_for_count(&[
+            msg("user", serde_json::json!("hello")),
+            msg(
+                "assistant",
+                serde_json::json!([
+                    {"type": "thinking", "thinking": "ponder", "signature": "kiro_sig"},
+                    {"type": "tool_use", "id": "t1", "name": "search", "input": {"q": "rust"}}
+                ]),
+            ),
+            // 孤儿 tool_result + 加密 search_result：结构字段应被跳过、只留文本。
+            msg(
+                "user",
+                serde_json::json!([
+                    {"type": "tool_result", "tool_use_id": "t1", "content": [
+                        {"type": "search_result", "title": "T",
+                         "content": [{"type": "text", "text": "found it"}],
+                         "encrypted_content": "OPAQUE_BLOB_DO_NOT_COUNT"}
+                    ]}
+                ]),
+            ),
+        ]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, "user");
+        let text = out[0].content.as_str().unwrap();
+        assert!(text.contains("hello"));
+        assert!(text.contains("ponder"));
+        assert!(text.contains("rust")); // tool_use 入参
+        assert!(text.contains("found it")); // search_result 内嵌 text
+        // 结构字段一律不进文本（正是它们触发 400）。
+        assert!(!text.contains("kiro_sig"));
+        assert!(!text.contains("OPAQUE_BLOB"));
+        assert!(!text.contains("t1"));
+    }
+
+    /// 空/无文本内容压平后为空，交由调用方回退本地。
+    #[test]
+    fn flatten_messages_empty_is_empty() {
+        assert!(flatten_messages_for_count(&[]).is_empty());
+        let m = vec![Message {
+            role: "assistant".to_string(),
+            content: serde_json::json!([{"type": "image", "source": {"data": ""}}]),
+        }];
+        // image 块无文本信号（source 非 text/thinking/input/content/data 顶层键）→ 空。
+        assert!(flatten_messages_for_count(&m).is_empty());
     }
 
     #[test]
