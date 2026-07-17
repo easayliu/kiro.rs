@@ -36,7 +36,6 @@ use super::injection_scan;
 use super::middleware::{AppState, RequestId};
 use super::stream::{BufferedStreamContext, CacheUsage, SseEvent, StreamContext};
 use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse};
-use super::websearch;
 use crate::kiro::binding::BindingTable;
 use crate::kiro::provider::KiroProvider;
 
@@ -719,28 +718,10 @@ pub(crate) async fn handle_messages(
         }
     };
 
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
-
-        let binding_key = super::cache_tracker::extract_binding_key(&payload);
-        return websearch::handle_websearch_request(
-            provider,
-            &payload,
-            input_tokens,
-            state.binding_table.clone(),
-            binding_key,
-        )
-        .await;
-    }
+    // web_search 一律走官方 server-tool 语义（拦截式单发伪造路径已退休）：
+    // 工具透传给模型，由模型自主决定搜什么/搜几次，代理侧执行搜索并以 pause_turn
+    // 让客户端续跑（见 websearch::execute_agentic_web_search / StreamContext::finalize_stream）。
+    // 不再按 tools.len()==1 分流——单工具与多工具行为一致。
 
     // 转换请求
     let conversion_result = match convert_request(&payload, provider.origin(), provider.is_cli_mode()) {
@@ -874,6 +855,7 @@ pub(crate) async fn handle_messages(
             binding_key,
             preferred,
             binding_src,
+            super::websearch::web_search_state(&payload),
         )
         .await
     } else {
@@ -900,6 +882,7 @@ pub(crate) async fn handle_messages(
             binding_key,
             preferred,
             binding_src,
+            super::websearch::web_search_state(&payload),
         )
         .await
     }
@@ -1011,6 +994,7 @@ async fn handle_stream_request(
     binding_key: Option<u64>,
     preferred: Option<u64>,
     binding_src: &'static str,
+    web_search: Option<super::websearch::WebSearchState>,
 ) -> Response {
     // 早响应模式：立即 200 + 初始事件，上游调用挪进流内（对齐官方时序）
     if early_first_token_enabled() {
@@ -1028,6 +1012,7 @@ async fn handle_stream_request(
             binding_key,
             preferred,
             binding_src,
+            web_search,
         )
         .await;
     }
@@ -1083,6 +1068,10 @@ async fn handle_stream_request(
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
     ctx.set_tool_key_map(tool_key_map);
+    // web_search 服务端工具（pause_turn 路径）：声明了 web_search 才启用拦截+注入。
+    if let Some(ws) = web_search {
+        ctx.set_web_search(provider.clone(), preferred, ws.max_uses, ws.prior_uses);
+    }
     // TTFT 原点钉在「向上游发出请求」时刻，覆盖上游等首 token 的等待（见 ApiCallResult）。
     ctx.set_ttft_origin(api_result.upstream_request_at);
     ctx.set_cache_usage(cache_context);
@@ -1176,6 +1165,7 @@ async fn handle_stream_request_early(
     binding_key: Option<u64>,
     preferred: Option<u64>,
     binding_src: &'static str,
+    web_search: Option<super::websearch::WebSearchState>,
 ) -> Response {
     // 期望凭据：粘性 preferred；无绑定时取顶档首个可用凭据（均衡模式下可能与实际
     // 选中不同，仅作缓存记账口径）。无可用凭据时记 0，随后的上游调用会以
@@ -1210,6 +1200,10 @@ async fn handle_stream_request_early(
     ctx.set_cache_usage(cache_context);
     ctx.set_credential_id(expected_cred as i64);
     ctx.set_billing_writeback(cache_tracker.clone(), cache_writeback);
+    // web_search 服务端工具（pause_turn 路径）：声明了 web_search 才启用拦截+注入。
+    if let Some(ws) = web_search {
+        ctx.set_web_search(provider.clone(), preferred, ws.max_uses, ws.prior_uses);
+    }
     // 官方计数任务随 ctx 进流（经 Waiting→Relaying 交接），收尾 join 并套用官方口径。
     if let Some(t) = official_input_task {
         ctx.set_official_input_task(t);
@@ -1541,7 +1535,8 @@ fn create_sse_stream(
                             // likely_complete=false（真截断）：只发 error 事件，不补 message_stop——
                             //   否则客户端会把半截回复当成正常 end_turn 收下、不重试。
                             let bytes: Vec<Result<Bytes, Infallible>> = if likely_complete {
-                                ctx.generate_final_events()
+                                ctx.finalize_stream()
+                                    .await
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect()
@@ -1631,7 +1626,8 @@ fn create_sse_stream(
                             let bytes: Vec<Result<Bytes, Infallible>> = if pending > 0 {
                                 vec![Ok(create_truncation_error_sse())]
                             } else {
-                                ctx.generate_final_events()
+                                ctx.finalize_stream()
+                                    .await
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect()
@@ -1671,6 +1667,7 @@ async fn handle_non_stream_request(
     binding_key: Option<u64>,
     preferred: Option<u64>,
     binding_src: &'static str,
+    web_search: Option<super::websearch::WebSearchState>,
 ) -> Response {
     let request_start = Instant::now();
     // 调用 Kiro API 并缓冲完整响应体（支持多凭据故障转移；body 中途被上游 RST/EOF
@@ -1914,6 +1911,56 @@ async fn handle_non_stream_request(
 
     content.extend(tool_uses);
 
+    // web_search 服务端工具（pause_turn 路径）：模型若发起 web_search 调用，代理侧执行
+    // 搜索、把该 tool_use 块替换为 server_tool_use + web_search_tool_result。仅 web_search
+    // 单独触发（无其它待执行客户端工具）时以 pause_turn 收尾、由客户端原样回传续跑；与
+    // 客户端工具混合时保持 tool_use（web_search 已就地解析，客户端仍需执行其工具）。
+    // web_search 未在请求 tools 中声明时 web_search=None，整段不触发、对既有流程零影响。
+    let mut web_search_requests = 0i32;
+    if let Some(ws) = &web_search {
+        let mut new_content: Vec<serde_json::Value> = Vec::with_capacity(content.len() + 1);
+        let mut had_web_search = false;
+        let mut has_other_tool_use = false;
+        for block in std::mem::take(&mut content) {
+            let is_ws = block.get("type").and_then(|v| v.as_str()) == Some("tool_use")
+                && block.get("name").and_then(|v| v.as_str()) == Some("web_search");
+            if is_ws {
+                had_web_search = true;
+                let tool_use_id = block
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let query = block
+                    .get("input")
+                    .and_then(|i| i.get("query"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let (blocks, billed) = super::websearch::execute_agentic_web_search(
+                    provider.as_ref(),
+                    &tool_use_id,
+                    &query,
+                    preferred,
+                    ws.exceeded(),
+                )
+                .await;
+                web_search_requests += billed;
+                new_content.extend(blocks);
+            } else {
+                if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                    has_other_tool_use = true;
+                }
+                new_content.push(block);
+            }
+        }
+        content = new_content;
+        if had_web_search && !has_other_tool_use {
+            // 仅 web_search：以 pause_turn 收尾，客户端原样回传后模型据搜索结果续跑。
+            stop_reason = "pause_turn".to_string();
+        }
+    }
+
     // 估算输出 tokens：配了远程 count_tokens 则走精确口径，否则本地启发式。
     // output 无上游真值兜底，此处算出的即计费值。与流式 count_tokens 口径一致。
     let true_output_tokens = token::estimate_output_tokens(model, &content);
@@ -2052,6 +2099,21 @@ async fn handle_non_stream_request(
     );
 
     // 构建 Anthropic 响应（上报上游返回的真实 token 计数）
+    let mut usage = json!({
+        "input_tokens": billed_input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": billing.cache_creation_input_tokens,
+        "cache_read_input_tokens": billing.cache_read_input_tokens,
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": billing.cache_creation_5m_input_tokens,
+            "ephemeral_1h_input_tokens": billing.cache_creation_1h_input_tokens,
+        }
+    });
+    // web_search 计数仅作兼容性上报（客户端可见搜索次数）；token 计费口径不变，
+    // 续跑各轮仍按普通 Kiro 调用单次计费。
+    if web_search_requests > 0 {
+        usage["server_tool_use"] = json!({ "web_search_requests": web_search_requests });
+    }
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
         "type": "message",
@@ -2060,16 +2122,7 @@ async fn handle_non_stream_request(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": billed_input_tokens,
-            "output_tokens": output_tokens,
-            "cache_creation_input_tokens": billing.cache_creation_input_tokens,
-            "cache_read_input_tokens": billing.cache_read_input_tokens,
-            "cache_creation": {
-                "ephemeral_5m_input_tokens": billing.cache_creation_5m_input_tokens,
-                "ephemeral_1h_input_tokens": billing.cache_creation_1h_input_tokens,
-            }
-        }
+        "usage": usage
     });
 
     (StatusCode::OK, Json(response_body)).into_response()
@@ -2138,28 +2191,10 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
-
-        let binding_key = super::cache_tracker::extract_binding_key(&payload);
-        return websearch::handle_websearch_request(
-            provider,
-            &payload,
-            input_tokens,
-            state.binding_table.clone(),
-            binding_key,
-        )
-        .await;
-    }
+    // web_search 一律走官方 server-tool 语义（拦截式单发伪造路径已退休）：
+    // 工具透传给模型，由模型自主决定搜什么/搜几次，代理侧执行搜索并以 pause_turn
+    // 让客户端续跑（见 websearch::execute_agentic_web_search / StreamContext::finalize_stream）。
+    // 不再按 tools.len()==1 分流——单工具与多工具行为一致。
 
     // 转换请求
     let conversion_result = match convert_request(&payload, provider.origin(), provider.is_cli_mode()) {
@@ -2292,6 +2327,7 @@ pub async fn post_messages_cc(
             binding_key,
             preferred,
             binding_src,
+            super::websearch::web_search_state(&payload),
         )
         .await
     } else {
@@ -2318,6 +2354,7 @@ pub async fn post_messages_cc(
             binding_key,
             preferred,
             binding_src,
+            super::websearch::web_search_state(&payload),
         )
         .await
     }
@@ -2341,6 +2378,7 @@ async fn handle_stream_request_buffered(
     binding_key: Option<u64>,
     preferred: Option<u64>,
     binding_src: &'static str,
+    web_search: Option<super::websearch::WebSearchState>,
 ) -> Response {
     // 官方输入计数与上游调用 + 生成并发（首字不等这次跨洋计数），收尾 join 套用。
     let official_input_task = spawn_official_input_count(&cache_profile);
@@ -2393,6 +2431,10 @@ async fn handle_stream_request_buffered(
     // 创建缓冲流处理上下文
     let mut ctx = BufferedStreamContext::new(model, estimated_input_tokens, thinking_enabled, tool_name_map);
     ctx.set_tool_key_map(tool_key_map);
+    // web_search 服务端工具（pause_turn 路径）：声明了 web_search 才启用拦截+注入。
+    if let Some(ws) = web_search {
+        ctx.set_web_search(provider.clone(), preferred, ws.max_uses, ws.prior_uses);
+    }
     // TTFT 原点钉在「向上游发出请求」时刻，覆盖上游等首 token 的等待（见 ApiCallResult）。
     ctx.set_ttft_origin(api_result.upstream_request_at);
     ctx.set_cache_usage(cache_context);
@@ -2527,6 +2569,7 @@ fn create_buffered_sse_stream(
                                 //   尚未向客户端发过任何内容，error 事件可作为首个事件直接交付。
                                 let bytes: Vec<Result<Bytes, Infallible>> = if likely_complete {
                                     ctx.finish_and_get_all_events()
+                                        .await
                                         .into_iter()
                                         .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                         .collect()
@@ -2591,6 +2634,7 @@ fn create_buffered_sse_stream(
                                     vec![Ok(create_truncation_error_sse())]
                                 } else {
                                     ctx.finish_and_get_all_events()
+                                        .await
                                         .into_iter()
                                         .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                         .collect()

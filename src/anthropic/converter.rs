@@ -651,7 +651,11 @@ pub fn convert_request(req: &MessagesRequest, origin: &str, inject_env_state: bo
     // 2.5. prefill：末尾是 assistant 时不再静默丢弃，直接透传。
     // Kiro 无原生 prefill（currentMessage 必须是 userInputMessage），故末尾 assistant 的
     // 内容会作为 currentMessage 发出；这里只负责不丢弃，具体上游表现按实测观察。
-    let messages: &[_] = &req.messages;
+    //
+    // web_search 续跑预处理：assistant 轮里内联的 web_search_tool_result 拆成独立 user
+    // 轮的 tool_result，落入 Kiro tool loop（无 web_search 结果时返回 None、零克隆）。
+    let split_messages = super::websearch::split_web_search_tool_results(&req.messages);
+    let messages: &[_] = split_messages.as_deref().unwrap_or(&req.messages);
 
     // 3. 生成会话 ID 和代理 ID
     // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
@@ -910,6 +914,26 @@ fn process_message_content(
                         }
                         "tool_use" => {
                             // tool_use 在 assistant 消息中处理，这里忽略
+                        }
+                        // web_search_tool_result：续跑回传的搜索结果。还原成普通 tool_result
+                        // 喂回 Kiro——文本从各 web_search_result 块的 title/url + base64 解码后的
+                        // encrypted_content(snippet) 重建，与配对的 server_tool_use(见 assistant
+                        // 侧)按 tool_use_id 配对（map_tool_use_id 两端一致）。
+                        "web_search_tool_result" => {
+                            if let Some(tool_use_id) = block.tool_use_id {
+                                let mapped_id = map_tool_use_id(&tool_use_id);
+                                let (text, is_error) =
+                                    super::websearch::decode_web_search_tool_result(&block.content);
+                                let mut result = if is_error {
+                                    ToolResult::error(&mapped_id, text)
+                                } else {
+                                    ToolResult::success(&mapped_id, text)
+                                };
+                                result.status = Some(
+                                    if is_error { "error" } else { "success" }.to_string(),
+                                );
+                                tool_results.push(result);
+                            }
                         }
                         _ => {}
                     }
@@ -1544,8 +1568,31 @@ fn convert_tools(
 
             let mapped_name = map_tool_name(&t.name, tool_name_map);
 
+            // web_search 是 Anthropic 服务端工具，客户端不带 input_schema。透传给 Kiro
+            // 当普通工具用时，必须补一个 {query} schema，否则模型看到空 object、不知道
+            // 要填 query（server-tool 的 pause_turn 路径由代理侧执行搜索，见 websearch.rs）。
+            let is_web_search = t
+                .tool_type
+                .as_deref()
+                .is_some_and(|s| s.starts_with("web_search"))
+                || (t.name == "web_search" && t.input_schema.is_empty());
+
             // 净化顶层违规属性名（上游 400 TOOL_SCHEMA_INVALID），记录映射供出口还原
-            let mut schema = normalize_json_schema(serde_json::json!(t.input_schema));
+            let mut schema = if is_web_search {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query to look up on the web"
+                        }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                })
+            } else {
+                normalize_json_schema(serde_json::json!(t.input_schema))
+            };
             let key_map = sanitize_schema_property_keys(&mut schema);
             if !key_map.is_empty() {
                 tracing::warn!(
@@ -2021,7 +2068,11 @@ fn convert_assistant_message(
                                 text_content.push_str(&text);
                             }
                         }
-                        "tool_use" => {
+                        // server_tool_use：web_search 等服务端工具的续跑回传。客户端按
+                        // pause_turn 协议原样带回 assistant 内容，这里还原成普通 tool_use
+                        // 喂回 Kiro 常规 tool loop（其配对的 web_search_tool_result 在下一条
+                        // user 消息里被还原为 tool_result，见 process_message_content）。
+                        "tool_use" | "server_tool_use" => {
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 // Kiro 要求 input 必须是 JSON object；客户端偶发传 ""/null/字符串化 JSON，
                                 // 非 object 一律归一为 {}，避免上游 REQUEST_BODY_INVALID
@@ -3195,6 +3246,91 @@ mod tests {
         assert_eq!(map_tool_name("Read", &mut map), "Read");
         assert_eq!(map_tool_name("my-tool_2", &mut map), "my-tool_2");
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_web_search_pause_turn_continuation_pairs() {
+        // pause_turn 续跑：assistant 轮内联 server_tool_use + web_search_tool_result，
+        // 经预处理拆分后应在 Kiro 侧成为「history: assistant(tool_use) + currentMessage:
+        // user(tool_result)」的配对，不产生 orphan（否则上游 400）。
+        use super::super::types::{Message as AnthropicMessage, Tool};
+        use base64::Engine as _;
+
+        let enc = base64::engine::general_purpose::STANDARD.encode("Rust 1.99 released");
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 64,
+            stream: false,
+            system: None,
+            tools: Some(vec![Tool {
+                tool_type: Some("web_search_20250305".to_string()),
+                name: "web_search".to_string(),
+                description: String::new(),
+                input_schema: Default::default(),
+                max_uses: Some(5),
+                cache_control: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("what's the latest rust version"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "Let me search."},
+                        {"type": "server_tool_use", "id": "toolu_ws1", "name": "web_search", "input": {"query": "latest rust version"}},
+                        {"type": "web_search_tool_result", "tool_use_id": "toolu_ws1", "content": [
+                            {"type": "web_search_result", "title": "Rust Releases", "url": "https://rust-lang.org", "encrypted_content": enc}
+                        ]}
+                    ]),
+                },
+            ],
+        };
+
+        let result = convert_request(&req, "AI_EDITOR", false).unwrap();
+        let cs = &result.conversation_state;
+
+        // history 里应有 assistant 的 web_search tool_use（id 经 map_tool_use_id → toolu_ws1）
+        let history_use_ids: std::collections::HashSet<String> = cs
+            .history
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant(a) => a.assistant_response_message.tool_uses.as_ref(),
+                _ => None,
+            })
+            .flatten()
+            .map(|t| t.tool_use_id.clone())
+            .collect();
+        assert!(
+            history_use_ids.contains("toolu_ws1"),
+            "history 缺 web_search tool_use，得到 {:?}",
+            history_use_ids
+        );
+
+        // currentMessage 是拆出来的 user(tool_result)，与 history tool_use 配对、无 orphan
+        let current_results =
+            &cs.current_message.user_input_message.user_input_message_context.tool_results;
+        assert_eq!(current_results.len(), 1, "应有 1 个 tool_result");
+        assert_eq!(current_results[0].tool_use_id, "toolu_ws1");
+        assert!(
+            history_use_ids.contains(&current_results[0].tool_use_id),
+            "tool_result 无配对 tool_use（orphan，会触发上游 400）"
+        );
+
+        // tool_result 文本应含 base64 解码后的 snippet 与 url（喂回模型可读、可引用）
+        let text = current_results[0]
+            .content
+            .iter()
+            .filter_map(|c| c.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(text.contains("Rust 1.99 released"), "tool_result 文本缺 snippet: {}", text);
+        assert!(text.contains("https://rust-lang.org"), "tool_result 文本缺 url: {}", text);
     }
 
     #[test]

@@ -420,6 +420,8 @@ pub struct SseStateManager {
     has_tool_use: bool,
     /// message_delta/final 阶段透传的缓存使用细分
     final_usage: Option<CacheUsage>,
+    /// 本轮 web_search 服务端工具的搜索次数（>0 时 message_delta.usage 带 server_tool_use）。
+    web_search_requests: i32,
 }
 
 impl Default for SseStateManager {
@@ -440,12 +442,39 @@ impl SseStateManager {
             upstream_stop_reason: None,
             has_tool_use: false,
             final_usage: None,
+            web_search_requests: 0,
         }
     }
 
     /// 设置最终 usage（含 prompt caching 细分）
     pub fn set_final_usage(&mut self, usage: CacheUsage) {
         self.final_usage = Some(usage);
+    }
+
+    /// 累计 web_search 搜索次数（server-tool/pause_turn 路径注入结果时调用）。
+    pub fn add_web_search_requests(&mut self, n: i32) {
+        self.web_search_requests += n;
+    }
+
+    /// 是否已记录 tool_use（用于区分「仅 web_search(pause_turn)」与「混合客户端工具」）。
+    pub fn has_tool_use(&self) -> bool {
+        self.has_tool_use
+    }
+
+    /// 关闭所有仍打开的内容块，返回对应的 content_block_stop 事件。
+    /// 用于在流中途注入新块前先收尾当前（如 web_search 结果注入前关掉决策文本块）。
+    pub fn close_open_blocks(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        for (index, block) in self.active_blocks.iter_mut() {
+            if block.started && !block.stopped {
+                events.push(SseEvent::new(
+                    "content_block_stop",
+                    json!({ "type": "content_block_stop", "index": index }),
+                ));
+                block.stopped = true;
+            }
+        }
+        events
     }
 
     /// 判断指定块是否处于可接收 delta 的打开状态
@@ -646,6 +675,11 @@ impl SseStateManager {
                     })
                 },
             );
+            let mut usage_json = usage_json;
+            if self.web_search_requests > 0 {
+                usage_json["server_tool_use"] =
+                    json!({ "web_search_requests": self.web_search_requests });
+            }
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
@@ -773,6 +807,37 @@ pub struct StreamContext {
     /// 官方口径缓存分段重算（recount）的后台任务（与生成并发）。收尾时 join，用官方
     /// 三段覆盖 `cache_usage` 并置 `segments_official`。`None` 表示不做（trust=off 等）。
     official_segments_task: Option<tokio::task::JoinHandle<super::cache_tracker::CacheResult>>,
+    /// web_search 服务端工具（pause_turn 路径）：仅当请求声明了 web_search 时为 Some。
+    /// 为 None 时下述拦截/注入全不触发，对既有流程零影响。
+    web_search: Option<WebSearchStreamState>,
+}
+
+/// 流式路径下 web_search 服务端工具的运行态（见 [`StreamContext::set_web_search`]）。
+struct WebSearchStreamState {
+    /// 执行 MCP 搜索所需的 provider（收尾时异步调用）。
+    provider: Arc<crate::kiro::provider::KiroProvider>,
+    /// 粘性凭证偏好，透传给 MCP 调用。
+    preferred: Option<u64>,
+    /// max_uses 上限（超限则注入 max_uses_exceeded、不真正搜索）。
+    max_uses: Option<i32>,
+    /// 历史里已发生的 web_search 次数。
+    prior_uses: i32,
+    /// 捕获到的、待代理执行的 web_search 调用（模型发起、被扣下不转发的 tool_use）。
+    ///
+    /// 是 Vec 而非单个：模型会在**一轮里并行发多个 web_search**（实测 sonnet-5 比较类
+    /// 问题一次发 2 个）。必须按 tool_use_id 分别累积入参分片，否则多路分片会串进同一个
+    /// 缓冲、JSON 损坏 → query 解析为空 → 搜不到东西。
+    pending: Vec<PendingWebSearch>,
+}
+
+/// 被扣下的一次 web_search 调用（流式）：累积入参分片，stop 时标记完成。
+struct PendingWebSearch {
+    /// 复用模型 tool_use 的客户端规范化 id（续跑配对用）。
+    tool_use_id: String,
+    /// 入参 JSON 分片累积（含 query）。
+    input_acc: String,
+    /// 是否已收到 stop（入参完整）。
+    complete: bool,
 }
 
 impl StreamContext {
@@ -820,6 +885,7 @@ impl StreamContext {
             deferred_tool_inputs: HashMap::new(),
             official_input_task: None,
             official_segments_task: None,
+            web_search: None,
         }
     }
 
@@ -834,6 +900,183 @@ impl StreamContext {
         task: tokio::task::JoinHandle<super::cache_tracker::CacheResult>,
     ) {
         self.official_segments_task = Some(task);
+    }
+
+    /// 启用 web_search 服务端工具处理（pause_turn 路径）。仅当请求声明了 web_search 时调用；
+    /// 未调用时 `web_search=None`，拦截/注入全不触发。
+    pub fn set_web_search(
+        &mut self,
+        provider: Arc<crate::kiro::provider::KiroProvider>,
+        preferred: Option<u64>,
+        max_uses: Option<i32>,
+        prior_uses: i32,
+    ) {
+        self.web_search = Some(WebSearchStreamState {
+            provider,
+            preferred,
+            max_uses,
+            prior_uses,
+            pending: Vec::new(),
+        });
+    }
+
+    /// 当前 tool_use 是否应作为 web_search 服务端工具被扣下（而非透传给客户端）。
+    fn is_web_search_tool_use(&self, tool_use: &crate::kiro::model::events::ToolUseEvent) -> bool {
+        if self.web_search.is_none() {
+            return false;
+        }
+        let resolved = self
+            .tool_name_map
+            .get(&tool_use.name)
+            .map(|s| s.as_str())
+            .unwrap_or(tool_use.name.as_str());
+        resolved == "web_search"
+    }
+
+    /// 扣下模型发起的 web_search 调用：累积入参、stop 时标记完成，不产出任何 SSE 事件
+    /// （结果在收尾时由 [`Self::finalize_stream`] 异步执行搜索后注入）。
+    fn capture_web_search_tool_use(
+        &mut self,
+        tool_use: &crate::kiro::model::events::ToolUseEvent,
+    ) -> Vec<SseEvent> {
+        let client_id = super::converter::normalize_tool_use_id_for_client(&tool_use.tool_use_id);
+        if let Some(ws) = self.web_search.as_mut() {
+            // 按 tool_use_id 归位：一轮里可能并行有多个 web_search，分片必须各归各的。
+            let pending = match ws.pending.iter_mut().position(|p| p.tool_use_id == client_id) {
+                Some(i) => &mut ws.pending[i],
+                None => {
+                    ws.pending.push(PendingWebSearch {
+                        tool_use_id: client_id,
+                        input_acc: String::new(),
+                        complete: false,
+                    });
+                    ws.pending.last_mut().expect("刚 push 过")
+                }
+            };
+            pending.input_acc.push_str(&tool_use.input);
+            if tool_use.stop {
+                pending.complete = true;
+            }
+        }
+        Vec::new()
+    }
+
+    /// 注入 server_tool_use + web_search_tool_result 两个内容块的 SSE 事件（流式）。
+    /// `result_content` 为 web_search_tool_result.content（正常结果数组或错误对象）。
+    fn emit_web_search_result_blocks(
+        &mut self,
+        tool_use_id: &str,
+        query: &str,
+        result_content: serde_json::Value,
+        billed: i32,
+    ) -> Vec<SseEvent> {
+        // 先收尾当前打开的块（如决策文本块），再开始 server_tool_use。
+        let mut events = self.state_manager.close_open_blocks();
+
+        let stu_idx = self.state_manager.next_block_index();
+        events.extend(self.state_manager.handle_content_block_start(
+            stu_idx,
+            "server_tool_use",
+            json!({
+                "type": "content_block_start",
+                "index": stu_idx,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": tool_use_id,
+                    "name": "web_search",
+                    "input": {}
+                }
+            }),
+        ));
+        if let Some(ev) = self.state_manager.handle_content_block_delta(
+            stu_idx,
+            json!({
+                "type": "content_block_delta",
+                "index": stu_idx,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": json!({ "query": query }).to_string()
+                }
+            }),
+        ) {
+            events.push(ev);
+        }
+        if let Some(ev) = self.state_manager.handle_content_block_stop(stu_idx) {
+            events.push(ev);
+        }
+
+        let res_idx = self.state_manager.next_block_index();
+        events.extend(self.state_manager.handle_content_block_start(
+            res_idx,
+            "web_search_tool_result",
+            json!({
+                "type": "content_block_start",
+                "index": res_idx,
+                "content_block": {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": result_content
+                }
+            }),
+        ));
+        if let Some(ev) = self.state_manager.handle_content_block_stop(res_idx) {
+            events.push(ev);
+        }
+
+        self.state_manager.add_web_search_requests(billed);
+        events
+    }
+
+    /// 流式收尾：若扣下了 web_search 调用，异步执行搜索并注入结果块 + 以 pause_turn 收尾
+    /// （无其它客户端 tool_use 时），随后走常规 [`Self::generate_final_events`]。
+    ///
+    /// 与 `generate_final_events` 的区别：本方法是 async（要 await MCP 搜索）。非 web_search
+    /// 请求（`web_search=None` 或无 pending）直接等价于 `generate_final_events`。
+    pub async fn finalize_stream(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+
+        // 取出全部待执行的 web_search（入参完整的），一轮可能并行多个。
+        let ctx = self.web_search.as_mut().map(|ws| {
+            let jobs: Vec<(String, String)> = ws
+                .pending
+                .drain(..)
+                .filter(|p| p.complete)
+                .map(|p| {
+                    let query = serde_json::from_str::<serde_json::Value>(&p.input_acc)
+                        .ok()
+                        .and_then(|v| v.get("query").and_then(|q| q.as_str()).map(String::from))
+                        .unwrap_or_default();
+                    (p.tool_use_id, query)
+                })
+                .collect();
+            (jobs, ws.provider.clone(), ws.preferred, ws.max_uses, ws.prior_uses)
+        });
+
+        if let Some((jobs, provider, preferred, max_uses, prior_uses)) = ctx {
+            let mut used = prior_uses;
+            for (tool_use_id, query) in jobs {
+                let exceeded = max_uses.is_some_and(|m| used >= m);
+                let (result_content, billed) = if exceeded {
+                    (super::websearch::max_uses_exceeded_content(), 0)
+                } else {
+                    super::websearch::run_agentic_search(&provider, &query, preferred).await
+                };
+                used += 1;
+                events.extend(self.emit_web_search_result_blocks(
+                    &tool_use_id,
+                    &query,
+                    result_content,
+                    billed,
+                ));
+            }
+            // 仅 web_search（无其它客户端 tool_use）→ pause_turn，客户端原样回传后续跑。
+            if used > prior_uses && !self.state_manager.has_tool_use() {
+                self.state_manager.set_stop_reason("pause_turn");
+            }
+        }
+
+        events.extend(self.generate_final_events());
+        events
     }
 
     /// 收尾时把并发算好的官方计数取回并套用（把官方 count 从首字关键路径挪走的收口）。
@@ -1008,6 +1251,10 @@ impl StreamContext {
         match event {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ReasoningContent(reasoning) => self.process_reasoning_content(reasoning),
+            Event::ToolUse(tool_use) if self.is_web_search_tool_use(tool_use) => {
+                // web_search 服务端工具：扣下不转发，收尾时代理侧执行搜索并注入结果。
+                self.capture_web_search_tool_use(tool_use)
+            }
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比反推实际 input_tokens。
@@ -1912,6 +2159,18 @@ impl BufferedStreamContext {
         self.inner.set_tool_key_map(map);
     }
 
+    /// 启用 web_search 服务端工具处理（透传到内部 StreamContext）
+    pub fn set_web_search(
+        &mut self,
+        provider: Arc<crate::kiro::provider::KiroProvider>,
+        preferred: Option<u64>,
+        max_uses: Option<i32>,
+        prior_uses: i32,
+    ) {
+        self.inner
+            .set_web_search(provider, preferred, max_uses, prior_uses);
+    }
+
     /// 注入 prompt caching 结果（透传到内部 StreamContext）
     pub fn set_cache_usage(&mut self, ctx: CacheUsageContext) {
         self.inner.set_cache_usage(ctx);
@@ -1987,7 +2246,7 @@ impl BufferedStreamContext {
     /// 1. 生成最终事件（message_delta, message_stop）
     /// 2. 用正确的 input_tokens 更正 message_start 事件
     /// 3. 返回所有缓冲的事件
-    pub fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
+    pub async fn finish_and_get_all_events(&mut self) -> Vec<SseEvent> {
         // 如果从未处理过事件，也要生成初始事件
         if !self.initial_events_generated {
             let initial_events = self.inner.generate_initial_events();
@@ -1995,8 +2254,8 @@ impl BufferedStreamContext {
             self.initial_events_generated = true;
         }
 
-        // 生成最终事件（message_delta 已在内部用计费值生成）
-        let final_events = self.inner.generate_final_events();
+        // 生成最终事件（含 web_search 注入 + message_delta，message_delta 用计费值）
+        let final_events = self.inner.finalize_stream().await;
         self.event_buffer.extend(final_events);
 
         // message_start 是流开始时用本地估算口径缓冲的；若收到 contextUsageEvent，
@@ -2045,6 +2304,66 @@ mod tests {
         assert!(sse_str.starts_with("event: message_start\n"));
         assert!(sse_str.contains("data: "));
         assert!(sse_str.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn web_search_injection_emits_server_tool_use_result_and_usage() {
+        // 流式注入：emit_web_search_result_blocks 应产出 server_tool_use(start/delta/stop)
+        // + web_search_tool_result(start/stop)，且 message_delta.usage 带 server_tool_use。
+        let mut ctx = StreamContext::new_with_thinking("test-model", 10, false, HashMap::new());
+        let content = json!([{
+            "type": "web_search_result",
+            "title": "Rust", "url": "https://rust-lang.org",
+            "encrypted_content": "", "page_age": null
+        }]);
+        let events = ctx.emit_web_search_result_blocks("toolu_x", "rust", content, 1);
+
+        let cb_type = |e: &SseEvent| {
+            e.data
+                .get("content_block")
+                .and_then(|c| c.get("type"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        };
+        assert!(
+            events.iter().any(|e| cb_type(e).as_deref() == Some("server_tool_use")),
+            "缺 server_tool_use 块"
+        );
+        assert!(
+            events.iter().any(|e| cb_type(e).as_deref() == Some("web_search_tool_result")),
+            "缺 web_search_tool_result 块"
+        );
+        // input_json_delta 携带 query
+        assert!(events.iter().any(|e| {
+            e.data.get("delta").and_then(|d| d.get("partial_json")).and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("rust"))
+        }));
+
+        // server_tool_use.id / web_search_tool_result.tool_use_id 一致（续跑配对前提）
+        let stu_id = events
+            .iter()
+            .find(|e| cb_type(e).as_deref() == Some("server_tool_use"))
+            .and_then(|e| e.data["content_block"]["id"].as_str().map(String::from));
+        let res_id = events
+            .iter()
+            .find(|e| cb_type(e).as_deref() == Some("web_search_tool_result"))
+            .and_then(|e| e.data["content_block"]["tool_use_id"].as_str().map(String::from));
+        assert_eq!(stu_id.as_deref(), Some("toolu_x"));
+        assert_eq!(res_id.as_deref(), Some("toolu_x"));
+
+        // 收尾 usage 带 server_tool_use.web_search_requests=1
+        let finals = ctx.generate_final_events();
+        let delta = finals.iter().find(|e| e.event == "message_delta").expect("message_delta");
+        assert_eq!(delta.data["usage"]["server_tool_use"]["web_search_requests"], 1);
+    }
+
+    #[test]
+    fn no_web_search_means_no_server_tool_use_in_usage() {
+        // 未注入 web_search：usage 不应出现 server_tool_use（对既有流程零影响）。
+        let mut ctx = StreamContext::new_with_thinking("test-model", 10, false, HashMap::new());
+        let finals = ctx.generate_final_events();
+        let delta = finals.iter().find(|e| e.event == "message_delta").expect("message_delta");
+        assert!(delta.data["usage"].get("server_tool_use").is_none());
     }
 
     #[test]
@@ -3251,7 +3570,7 @@ mod tests {
         }
         .billed_split(estimated_total, context_total, None);
 
-        let events = ctx.finish_and_get_all_events();
+        let events = futures::executor::block_on(ctx.finish_and_get_all_events());
         let start = events
             .iter()
             .find(|e| e.event == "message_start")
