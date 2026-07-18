@@ -12,7 +12,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::http_client::{ProxyConfig, build_client, build_client_with_resolve};
-use crate::kiro::errors::{UpstreamBodyError, UpstreamHttpError};
+use crate::kiro::errors::{LocalRateLimitedError, UpstreamBodyError, UpstreamHttpError};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
@@ -25,6 +25,12 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
+
+/// 单个客户端请求内允许撞上游 429 的最大次数。命中即停止换号重试、短路成本地
+/// 429 + Retry-After。用于防止账号级限流时"仍有鲜活凭据→无退避换号"把整轮 9 个
+/// 凭据依次打到上游（短冷却错峰会让全员冷却闸门难触发）。合法的单号偶发 429→换号
+/// 成功只产生 1 次 429，不触发此上限。
+const MAX_UPSTREAM_429_PER_REQUEST: usize = 2;
 
 /// 成功调用 Kiro API 的结果
 ///
@@ -420,6 +426,11 @@ impl KiroProvider {
         self.token_manager.credential_rpm_loads(ids)
     }
 
+    /// 早响应模式入口的 429 背压判定，见 [`MultiTokenManager::throttle_backpressure_retry_after`]。
+    pub fn throttle_backpressure_retry_after(&self, model: Option<&str>) -> Option<u64> {
+        self.token_manager.throttle_backpressure_retry_after(model)
+    }
+
     /// 发送流式 API 请求
     ///
     /// 支持多凭据故障转移：
@@ -777,6 +788,8 @@ impl KiroProvider {
         let api_type = if is_stream { "流式" } else { "非流式" };
         // 中继降级标志：一旦中继连接失败，本次请求后续轮次改走公网直连。
         let mut relay_degraded = false;
+        // 本请求内累计撞上游 429 的次数，达 MAX_UPSTREAM_429_PER_REQUEST 即止血短路。
+        let mut upstream_429_hits = 0usize;
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
@@ -1170,6 +1183,25 @@ impl KiroProvider {
                         self.token_manager.report_throttled_for(ctx.id, 3600);
                     } else {
                         self.token_manager.report_throttled(ctx.id);
+                    }
+
+                    // 单请求内连续撞 429：多个凭据都被限流 = 账号级限流，继续换号只会持续
+                    // 锤上游，且短冷却错峰使"全员冷却闸门"难触发。命中上限即停止换号重试，
+                    // 短路成本地 429 + Retry-After（取最早解冻剩余），护住上游、并给客户端
+                    // 明确退避信号（避免裸 429 立即空转重试）。合法的单号偶发 429→换号成功
+                    // 只产生 1 次 429，不会触发此上限。
+                    upstream_429_hits += 1;
+                    if upstream_429_hits >= MAX_UPSTREAM_429_PER_REQUEST {
+                        let retry_after_secs =
+                            self.token_manager.min_throttle_retry_after(model.as_deref());
+                        tracing::warn!(
+                            cred_id = ctx.id,
+                            upstream_429_hits,
+                            retry_after_secs,
+                            "单请求内连续撞 {} 次上游 429（账号级限流），停止换号重试，本地回 429 + Retry-After 护上游",
+                            upstream_429_hits
+                        );
+                        anyhow::bail!(LocalRateLimitedError { retry_after_secs });
                     }
                 }
                 // 退避决策：退避只在"没有其它鲜活凭据、只能等同一账号恢复"时才付出。

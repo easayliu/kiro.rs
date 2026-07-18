@@ -1784,6 +1784,72 @@ impl MultiTokenManager {
         Some(secs.max(1))
     }
 
+    /// 返回所有 eligible 凭据中"最早一个 429 冷却解冻"的剩余秒数（下限 1s）。
+    ///
+    /// 供 `call_api_with_retry` 在单请求内连续撞 429（账号级限流）时短路退避用：
+    /// 客户端据此在最早一个凭据解冻后再重试。若当前无任何凭据处于冷却（罕见，
+    /// 通常调用前刚 `report_throttled` 过当前凭据），退回首档冷却时长 `THROTTLE_BACKOFF_SECS[0]`。
+    pub fn min_throttle_retry_after(&self, model: Option<&str>) -> u64 {
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+        let now = Utc::now();
+        let entries = self.entries.lock();
+        let fctx = self.capture_freshness(is_opus, now);
+
+        let mut earliest: Option<DateTime<Utc>> = None;
+        for e in entries.iter() {
+            if !fctx.is_eligible(e) {
+                continue;
+            }
+            if let Some(until) = e.throttled_until {
+                if until > now {
+                    earliest = Some(earliest.map_or(until, |cur| cur.min(until)));
+                }
+            }
+        }
+        match earliest {
+            Some(until) => ((until - now).num_seconds().max(0) as u64).max(1),
+            None => THROTTLE_BACKOFF_SECS[0] as u64,
+        }
+    }
+
+    /// 早响应模式入口的「429 背压」判定：**当前无鲜活凭据、且至少一个 eligible 凭据
+    /// 处于 429 冷却**时，返回建议退避秒数（最早解冻剩余，下限 1s）；否则 `None`。
+    ///
+    /// 用途：早响应模式一旦提交 200、上游调用挪进流内，之后撞 429 只能以流内 error
+    /// 事件收尾（无法带 HTTP `Retry-After`）。故在提交 200 前用本判定拦截——命中即改
+    /// 回真正的 429 + `Retry-After`，让客户端按秒退避，而非 200 后裸流内 error 诱发立即重试。
+    ///
+    /// 有鲜活凭据（可正常服务）返回 `None`；无鲜活但也无 429 冷却（如仅 RPM/并发满，
+    /// 属另类背压，交回 RPM 闸门/正常流程）同样返回 `None`。
+    pub fn throttle_backpressure_retry_after(&self, model: Option<&str>) -> Option<u64> {
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+        let now = Utc::now();
+        let entries = self.entries.lock();
+        let fctx = self.capture_freshness(is_opus, now);
+
+        // 有鲜活号 → 正常服务，不拦截
+        if entries.iter().any(|e| fctx.is_fresh(e)) {
+            return None;
+        }
+        // 无鲜活号：取最早解冻的 throttled 凭据的剩余时长
+        let mut earliest: Option<DateTime<Utc>> = None;
+        for e in entries.iter() {
+            if !fctx.is_eligible(e) {
+                continue;
+            }
+            if let Some(until) = e.throttled_until {
+                if until > now {
+                    earliest = Some(earliest.map_or(until, |cur| cur.min(until)));
+                }
+            }
+        }
+        earliest.map(|until| ((until - now).num_seconds().max(0) as u64).max(1))
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -4984,6 +5050,77 @@ mod tests {
             .select_next_credential(None)
             .expect("全员冷却时应回退选择，而不是返回 None");
         assert_eq!(id, 1, "应选到最早被限流的凭据 1（其 last_used_at 最早）");
+    }
+
+    #[test]
+    fn test_throttle_backpressure_retry_after() {
+        // 有鲜活号 → None（正常服务）;无鲜活但有冷却号 → Some(最早解冻剩余);
+        // 无冷却号(如全鲜活) → None。
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut a = KiroCredentials::default();
+        a.priority = 0;
+        a.refresh_token = Some("a".to_string());
+        let mut b = KiroCredentials::default();
+        b.priority = 0;
+        b.refresh_token = Some("b".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![a, b], None, None, None).unwrap();
+
+        // 全鲜活：不拦截
+        assert_eq!(manager.throttle_backpressure_retry_after(None), None);
+
+        // 冷却 1：仍有鲜活凭据 2 → 不拦截
+        manager.report_throttled(1);
+        assert_eq!(
+            manager.throttle_backpressure_retry_after(None),
+            None,
+            "仍有鲜活号时早响应不应被拦截"
+        );
+
+        // 全员冷却：无鲜活号且有冷却 → 返回最早解冻剩余（约 10s）
+        manager.report_throttled(2);
+        let secs = manager
+            .throttle_backpressure_retry_after(None)
+            .expect("无鲜活号且有冷却时应返回退避秒数");
+        assert!(
+            (1..=12).contains(&secs),
+            "退避秒应约等于最早解冻剩余（~10s），实际 {}s",
+            secs
+        );
+    }
+
+    #[test]
+    fn test_min_throttle_retry_after() {
+        // 取所有 eligible 凭据中最早解冻的剩余秒；无冷却时退回首档 THROTTLE_BACKOFF_SECS[0]。
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut a = KiroCredentials::default();
+        a.priority = 0;
+        a.refresh_token = Some("a".to_string());
+        let mut b = KiroCredentials::default();
+        b.priority = 0;
+        b.refresh_token = Some("b".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![a, b], None, None, None).unwrap();
+
+        // 无冷却：退回首档 10s
+        assert_eq!(
+            manager.min_throttle_retry_after(None),
+            THROTTLE_BACKOFF_SECS[0] as u64,
+            "无冷却时应退回首档冷却时长"
+        );
+
+        // 冷却凭据 1（首次 → 10s 档）：min ≈ 10s
+        manager.report_throttled(1);
+        let secs = manager.min_throttle_retry_after(None);
+        assert!(
+            (1..=12).contains(&secs),
+            "冷却 1 后最早解冻剩余应约 10s，实际 {}s",
+            secs
+        );
     }
 
     #[test]

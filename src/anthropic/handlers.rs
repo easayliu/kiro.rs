@@ -316,15 +316,16 @@ fn classify_provider_error(err: &Error, model: &str) -> ProviderErrorInfo {
         };
     }
 
-    // 本地 RPM 硬闸门限流：请求未发到上游，429 + rate_limit_error，让客户端退避。
+    // 本地限流（RPM 硬闸门 / 429 风暴护上游）：请求未（继续）转发上游，
+    // 429 + rate_limit_error，让客户端退避。
     // Retry-After 头由 map_provider_error 从错误里取 retry_after_secs 补上。
     if let Some(rl) = err.downcast_ref::<LocalRateLimitedError>() {
-        tracing::warn!(retry_after_secs = rl.retry_after_secs, "本地 RPM 硬闸门限流，回 429");
+        tracing::warn!(retry_after_secs = rl.retry_after_secs, "本地限流，回 429 + Retry-After");
         return ProviderErrorInfo {
             status: StatusCode::TOO_MANY_REQUESTS,
             err_type: "rate_limit_error",
             message: format!(
-                "Rate limited by local RPM gate; all credentials are at their per-minute limit. Retry after {}s.",
+                "Rate limited; all credentials are currently throttled or at their limit. Retry after {}s.",
                 rl.retry_after_secs
             ),
         };
@@ -1181,6 +1182,21 @@ async fn handle_stream_request_early(
     web_search: Option<super::websearch::WebSearchState>,
     deferred_web_search_blocks: Vec<serde_json::Value>,
 ) -> Response {
+    // 429 背压预检：早响应模式会先提交 200、上游调用挪进流内，之后撞 429 只能以流内
+    // error 事件收尾（无法带 HTTP Retry-After）。故在提交 200 前先判：当前无鲜活凭据
+    // 且有凭据处于 429 冷却时，直接回真正的 429 + Retry-After，让客户端按秒退避——而非
+    // 200 后撞 throttled 凭据、以裸流内 error 诱发客户端立即重试。有鲜活号则照常走早响应。
+    if let Some(retry_after_secs) = provider.throttle_backpressure_retry_after(Some(model)) {
+        tracing::warn!(
+            retry_after_secs,
+            "早响应模式入口检测到 429 背压（无鲜活凭据且有凭据冷却中），回真正的 429 + Retry-After"
+        );
+        return map_provider_error(
+            anyhow::Error::new(crate::kiro::errors::LocalRateLimitedError { retry_after_secs }),
+            model,
+        );
+    }
+
     // 期望凭据：粘性 preferred；无绑定时取顶档首个可用凭据（均衡模式下可能与实际
     // 选中不同，仅作缓存记账口径）。无可用凭据时记 0，随后的上游调用会以
     // NoAvailableCredentials 失败并走流内 error 事件收尾。
