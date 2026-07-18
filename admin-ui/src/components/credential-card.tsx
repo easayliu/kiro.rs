@@ -441,6 +441,7 @@ export function CredentialCard({
     InvalidRefreshToken: 'Token 失效',
     InvalidConfig: '配置无效',
     FreeSubscription: 'Free 订阅（自动禁用）',
+    AccountSuspended: '账号被封禁/锁定',
   }
 
   // 副标题状态：只在异常态显示（禁用/限流/失败）。「活跃」是常态、且已由卡片高亮边框

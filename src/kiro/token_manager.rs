@@ -823,6 +823,9 @@ enum DisabledReason {
     /// 订阅等级为 Free（确认 subscription_title 含 FREE）后自动禁用；
     /// 升级到 PRO+ 等非 Free 等级时会自动解除（自愈），也可手动重新启用。
     FreeSubscription,
+    /// 账号被上游封禁/锁定（403 "account suspended / locked"），需人工联系支持
+    /// 恢复；在该凭据上重试无意义，命中即禁用并故障转移。
+    AccountSuspended,
 }
 
 impl DisabledReason {
@@ -836,6 +839,7 @@ impl DisabledReason {
             DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
             DisabledReason::InvalidConfig => "InvalidConfig",
             DisabledReason::FreeSubscription => "FreeSubscription",
+            DisabledReason::AccountSuspended => "AccountSuspended",
         }
     }
 
@@ -849,6 +853,7 @@ impl DisabledReason {
             "InvalidRefreshToken" => DisabledReason::InvalidRefreshToken,
             "InvalidConfig" => DisabledReason::InvalidConfig,
             "FreeSubscription" => DisabledReason::FreeSubscription,
+            "AccountSuspended" => DisabledReason::AccountSuspended,
             _ => return None,
         })
     }
@@ -1735,6 +1740,50 @@ impl MultiTokenManager {
         e.throttled_until.is_some_and(|until| until > now)
     }
 
+    /// 全员 429 冷却闸门判定：当**存在 eligible 凭据、且所有 eligible 凭据都处于 429
+    /// 冷却窗口内**时，返回距最早一个凭据解冻的秒数（下限 1s），供上层短路成本地
+    /// 429 + Retry-After。
+    ///
+    /// 背景：`select_next_credential` 的 `best_fallback` 在无鲜活号时会回退到一个仍在
+    /// 冷却中的凭据（`throttled_until` 未到期），据此硬发只会持续锤正在限流的上游、且
+    /// 客户端拿到的是不带 Retry-After 的裸 429、立刻重试形成空转。全员冷却时改为本地
+    /// 短路，把冷却剩余时长作为 Retry-After 交给客户端退避——既不锤上游也给出明确退避
+    /// 信号（与 RPM 硬闸门 `rpm_gate_wait` 的短路语义一致）。
+    ///
+    /// 有任一 eligible 凭据未冷却（鲜活 / 仅 RPM 满 / 仅并发满）时返回 `None`，交回正常
+    /// 选号与 RPM 闸门处理（RPM 满由 `rpm_gate_wait` 限时等位；并发满走原 fallback）。
+    fn all_throttled_retry_after(&self, model: Option<&str>) -> Option<u64> {
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+        let now = Utc::now();
+        let entries = self.entries.lock();
+        let fctx = self.capture_freshness(is_opus, now);
+
+        let mut earliest: Option<DateTime<Utc>> = None;
+        let mut had_eligible = false;
+        for e in entries.iter() {
+            if !fctx.is_eligible(e) {
+                continue;
+            }
+            had_eligible = true;
+            match e.throttled_until {
+                // 冷却中：记录最早解冻时刻
+                Some(until) if until > now => {
+                    earliest = Some(earliest.map_or(until, |cur| cur.min(until)));
+                }
+                // 有 eligible 凭据未冷却 → 非"全员冷却"，不短路，交回正常路径
+                _ => return None,
+            }
+        }
+        if !had_eligible {
+            return None;
+        }
+        let until = earliest?;
+        let secs = (until - now).num_seconds().max(0) as u64;
+        Some(secs.max(1))
+    }
+
     /// 获取 API 调用上下文
     ///
     /// 返回绑定了 id、credentials 和 token 的调用上下文
@@ -1802,6 +1851,18 @@ impl MultiTokenManager {
                 tokio::time::sleep(nap).await;
                 gate_waited += nap;
                 continue;
+            }
+
+            // 全员 429 冷却闸门：无鲜活号、且所有 eligible 凭据都在 429 冷却窗口内时，
+            // 不 fallback 硬发正在限流的上游（会持续锤上游、且客户端拿到裸 429 立刻重试
+            // 空转），直接短路本地 429 + Retry-After（取最早解冻剩余时长），让客户端按
+            // 冷却退避。有任一凭据未冷却（鲜活/仅 RPM 满/仅并发满）则返回 None，走正常选号。
+            if let Some(retry_after_secs) = self.all_throttled_retry_after(model) {
+                tracing::warn!(
+                    retry_after_secs,
+                    "全员 429 冷却：所有 eligible 凭据均在冷却窗口内，本地回 429 + Retry-After（不 fallback 锤上游）"
+                );
+                anyhow::bail!(LocalRateLimitedError { retry_after_secs });
             }
 
             let (id, credentials, inflight, spilled) = {
@@ -2543,6 +2604,57 @@ impl MultiTokenManager {
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
 
             tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
+
+            // 切换到优先级最高的可用凭据
+            if let Some(next) = entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .min_by_key(|e| e.credentials.priority)
+            {
+                *current_id = next.id;
+                tracing::info!(
+                    "已切换到凭据 #{}（优先级 {}）",
+                    next.id,
+                    next.credentials.priority
+                );
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        self.save_stats_debounced(id);
+        // 走到这里必然刚刚禁用（已禁用 / 不存在的分支都已提前 return），落库。
+        self.persist_auto_disabled(id);
+        result
+    }
+
+    /// 报告指定凭据被上游封禁/锁定（403 "account suspended / locked"）。
+    ///
+    /// 该凭据需人工联系上游支持验证身份后才能恢复，在其上重试无意义，故命中即
+    /// 立即禁用（不等连续失败阈值）并切换到下一个可用凭据继续。返回是否还有可用凭据。
+    /// 行为与 [`report_quota_exhausted`] 一致，仅禁用原因不同（便于管理面板区分）。
+    pub fn report_account_suspended(&self, id: u64) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return entries.iter().any(|e| !e.disabled),
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::AccountSuspended);
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            // 设为阈值，便于在管理面板中直观看到该凭据已不可用
+            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+
+            tracing::error!("凭据 #{} 被上游封禁/锁定（account suspended/locked），已被禁用", id);
 
             // 切换到优先级最高的可用凭据
             if let Some(next) = entries
@@ -4872,6 +4984,97 @@ mod tests {
             .select_next_credential(None)
             .expect("全员冷却时应回退选择，而不是返回 None");
         assert_eq!(id, 1, "应选到最早被限流的凭据 1（其 last_used_at 最早）");
+    }
+
+    #[test]
+    fn test_report_account_suspended_disables_immediately_and_failover() {
+        // 封禁 403：命中即立即禁用（不等失败阈值）并切到其它凭据；全部禁用后返回 false。
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut a = KiroCredentials::default();
+        a.priority = 0;
+        a.refresh_token = Some("a".to_string());
+        let mut b = KiroCredentials::default();
+        b.priority = 0;
+        b.refresh_token = Some("b".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![a, b], None, None, None).unwrap();
+
+        // 封禁凭据 1：立即禁用（一次即禁，非累计），仍有凭据 2 → true
+        assert!(manager.report_account_suspended(1), "封禁 1 后仍有可用凭据 2");
+        let snap = manager.snapshot();
+        let e1 = snap.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(e1.disabled, "封禁 403 应立即禁用凭据 1");
+        assert_eq!(
+            e1.disabled_reason.as_deref(),
+            Some("AccountSuspended"),
+            "禁用原因应为 AccountSuspended"
+        );
+
+        // 后续选号只落到凭据 2
+        for _ in 0..5 {
+            let (id, _, _) = manager.select_next_credential(None).expect("凭据 2 应可用");
+            assert_eq!(id, 2, "凭据 1 已被封禁禁用，只应选凭据 2");
+        }
+
+        // 再封禁 2：全部禁用 → false
+        assert!(
+            !manager.report_account_suspended(2),
+            "两个凭据都被封禁后应无可用凭据"
+        );
+        assert!(manager.select_next_credential(None).is_none(), "全禁用后选号应为 None");
+    }
+
+    #[test]
+    fn test_all_throttled_retry_after_gates_when_everyone_cooling() {
+        // 全员 429 冷却时 all_throttled_retry_after 返回"最早解冻剩余时长"（供上层短路
+        // 本地 429 + Retry-After）；只要有一个凭据未冷却就返回 None（交回正常选号）。
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut a = KiroCredentials::default();
+        a.priority = 0;
+        a.refresh_token = Some("a".to_string());
+        let mut b = KiroCredentials::default();
+        b.priority = 0;
+        b.refresh_token = Some("b".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![a, b], None, None, None).unwrap();
+
+        // 无冷却：不短路
+        assert_eq!(
+            manager.all_throttled_retry_after(None),
+            None,
+            "无凭据冷却时不应短路"
+        );
+
+        // 只冷却 1：仍有鲜活凭据 2，不短路
+        manager.report_throttled(1);
+        assert_eq!(
+            manager.all_throttled_retry_after(None),
+            None,
+            "仍有未冷却凭据时不应短路"
+        );
+
+        // 全员冷却：短路，Retry-After 取最早解冻（1 先冷却，剩余更短，约 10s）
+        manager.report_throttled(2);
+        let secs = manager
+            .all_throttled_retry_after(None)
+            .expect("全员冷却时应短路并返回 Retry-After 秒数");
+        assert!(
+            (1..=12).contains(&secs),
+            "Retry-After 应约等于最早解冻剩余（~10s），实际 {}s",
+            secs
+        );
+
+        // 一个凭据成功清零冷却后：重新有鲜活凭据，不再短路
+        manager.report_success(1);
+        assert_eq!(
+            manager.all_throttled_retry_after(None),
+            None,
+            "有凭据恢复鲜活后不应再短路"
+        );
     }
 
     #[test]

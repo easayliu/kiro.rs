@@ -686,6 +686,22 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
+                // 账号被上游封禁/锁定：立即禁用并故障转移（与 API 路径口径一致）。
+                if status.as_u16() == 403 && Self::is_account_suspended(&body) {
+                    tracing::error!(
+                        cred_id = ctx.id,
+                        "凭据 #{} 被上游封禁/锁定（account suspended/locked），立即禁用并故障转移: {}",
+                        ctx.id,
+                        body
+                    );
+                    let has_available = self.token_manager.report_account_suspended(ctx.id);
+                    if !has_available {
+                        anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    }
+                    last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                    continue;
+                }
+
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if Self::is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
@@ -1075,6 +1091,34 @@ impl KiroProvider {
 
             // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
             if matches!(status.as_u16(), 401 | 403) {
+                // 账号被上游封禁/锁定（403 "account suspended / locked"）：需人工联系
+                // 支持验证身份恢复，在该凭据上重试无意义。立即禁用并故障转移到其它凭据
+                // 继续（不透传 403 给客户端；全部禁用时才 bail）。
+                if status.as_u16() == 403 && Self::is_account_suspended(&body) {
+                    tracing::error!(
+                        cred_id = ctx.id,
+                        "凭据 #{} 被上游封禁/锁定（account suspended/locked），立即禁用并故障转移: {}",
+                        ctx.id,
+                        body
+                    );
+                    let has_available = self.token_manager.report_account_suspended(ctx.id);
+                    if !has_available {
+                        anyhow::bail!(UpstreamHttpError {
+                            status: status.as_u16(),
+                            body,
+                            api_type: api_type.to_string(),
+                            credential_id: Some(ctx.id),
+                        });
+                    }
+                    last_error = Some(anyhow::Error::new(UpstreamHttpError {
+                        status: status.as_u16(),
+                        body,
+                        api_type: api_type.to_string(),
+                        credential_id: Some(ctx.id),
+                    }));
+                    continue;
+                }
+
                 tracing::warn!(
                     "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -1305,6 +1349,21 @@ impl KiroProvider {
         body.contains("The bearer token included in the request is invalid")
     }
 
+    /// 检查 403 响应体是否为"账号被上游封禁/锁定"特征：
+    /// 形如 `Your User ID (...) temporarily is suspended. We've locked your account
+    /// as a security precaution. To restore access, please contact our support team
+    /// to verify your identity`。
+    ///
+    /// 这类 403 需人工联系上游支持验证身份后才能恢复，在该凭据上重试无意义，命中即
+    /// 禁用该凭据并故障转移（区别于普通权限 403 的累计失败）。匹配几个高区分度短语，
+    /// 避免误伤普通 `permission` 类 403。
+    fn is_account_suspended(body: &str) -> bool {
+        let b = body.to_ascii_lowercase();
+        b.contains("locked your account")
+            || b.contains("security precaution")
+            || (b.contains("suspended") && b.contains("verify your identity"))
+    }
+
     /// 判断 400 响应是否为"我们发出去的请求格式有问题"：
     /// 形如 `{"message":"Improperly formed request.","reason":null}`，
     /// 这种才需要 dump 出 outbound payload 离线复现；其他 400（如用户输入超长）不 dump。
@@ -1439,6 +1498,27 @@ mod tests {
     fn test_is_invalid_model_id_false() {
         let body = r#"{"message":"bad","reason":"VALIDATION_ERROR"}"#;
         assert!(!KiroProvider::is_invalid_model_id(body));
+    }
+
+    #[test]
+    fn test_is_account_suspended_detects_lock_message() {
+        // 上游账号封禁/锁定 403 的真实 body：应被识别，用于立即禁用 + 故障转移。
+        let body = "Your User ID (502610743677) temporarily is suspended. We've locked your account as a security precaution. To restore access, please contact our support team to verify your identity";
+        assert!(KiroProvider::is_account_suspended(body));
+        // 单独命中任一强特征短语即可
+        assert!(KiroProvider::is_account_suspended("We've locked your account"));
+        assert!(KiroProvider::is_account_suspended("as a security precaution"));
+    }
+
+    #[test]
+    fn test_is_account_suspended_false_on_generic_403() {
+        // 普通权限 403 不应被误判为封禁（否则会误禁健康凭据）。
+        assert!(!KiroProvider::is_account_suspended(
+            r#"{"message":"User is not authorized to perform this action","reason":null}"#
+        ));
+        assert!(!KiroProvider::is_account_suspended("Access denied"));
+        // "suspended" 单独出现但无身份验证语境，不判封禁
+        assert!(!KiroProvider::is_account_suspended("request was suspended by policy"));
     }
 
     #[test]
