@@ -39,15 +39,29 @@ function maskApiKey(key: string): string {
   return isAscii && key.length > 16 ? `${key.slice(0, 4)}...${key.slice(-4)}` : '***'
 }
 
-// 从多行文本解析出 ksk_ key 列表：按行拆分、去空白、去空行、去重（保留首次出现）。
-function parseApiKeys(raw: string): string[] {
+// 单条解析结果：key 为 API Key 本体，region 为可选的凭据级 API region。
+interface ParsedApiKey {
+  key: string
+  region?: string
+}
+
+// 从多行文本解析出 API Key 列表：按行拆分、去空白、去空行、按 key 去重（保留首次出现）。
+// 每行支持 `ksk_xxx | region` 格式：`|` 后为该 key 走的 API region（如 eu-central-1），
+// 省略 `|` 段时不带 region（后端回退默认 us-east-1）。region 只影响该凭据的请求落地区域，
+// 无需在表单里另填，也不改动全局配置。
+function parseApiKeys(raw: string): ParsedApiKey[] {
   const seen = new Set<string>()
-  const keys: string[] = []
+  const keys: ParsedApiKey[] = []
   for (const line of raw.split(/\r?\n/)) {
-    const key = line.trim()
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    // 仅按首个 `|` 切分，key 里不含 `|`，多余的 `|` 归入 region 段一并 trim。
+    const sep = trimmed.indexOf('|')
+    const key = (sep === -1 ? trimmed : trimmed.slice(0, sep)).trim()
+    const region = sep === -1 ? '' : trimmed.slice(sep + 1).trim()
     if (!key || seen.has(key)) continue
     seen.add(key)
-    keys.push(key)
+    keys.push(region ? { key, region } : { key })
   }
   return keys
 }
@@ -105,7 +119,7 @@ export function BatchApiKeyImportDialog({ open, onOpenChange }: BatchApiKeyImpor
     const keys = parseApiKeys(textInput)
     return {
       parsedKeys: keys,
-      invalidCount: keys.filter(k => !k.startsWith('ksk_')).length,
+      invalidCount: keys.filter(k => !k.key.startsWith('ksk_')).length,
     }
   }, [textInput])
 
@@ -120,7 +134,7 @@ export function BatchApiKeyImportDialog({ open, onOpenChange }: BatchApiKeyImpor
       setImporting(true)
       setProgress({ current: 0, total: keys.length })
 
-      const initialResults: VerificationResult[] = keys.map((key, i) => ({
+      const initialResults: VerificationResult[] = keys.map(({ key }, i) => ({
         index: i + 1,
         status: 'pending',
         maskedKey: maskApiKey(key),
@@ -139,7 +153,7 @@ export function BatchApiKeyImportDialog({ open, onOpenChange }: BatchApiKeyImpor
       let failCount = 0
 
       for (let i = 0; i < keys.length; i++) {
-        const key = keys[i]
+        const { key, region } = keys[i]
         const masked = maskApiKey(key)
 
         setCurrentProcessing(`正在处理 ${masked}`)
@@ -185,6 +199,7 @@ export function BatchApiKeyImportDialog({ open, onOpenChange }: BatchApiKeyImpor
           const addedCred = await addCredential({
             kiroApiKey: key,
             authMethod: 'api_key',
+            ...(region ? { apiRegion: region } : {}),
           })
 
           addedCredId = addedCred.credentialId
@@ -323,7 +338,7 @@ export function BatchApiKeyImportDialog({ open, onOpenChange }: BatchApiKeyImpor
               </Button>
             </div>
             <Textarea
-              placeholder={'每行粘贴一个 Kiro API Key，例如：\nksk_xxxxxxxxxxxxxxxx\nksk_yyyyyyyyyyyyyyyy'}
+              placeholder={'每行粘贴一个 Kiro API Key，例如：\nksk_xxxxxxxxxxxxxxxx\nksk_yyyyyyyyyyyyyyyy | eu-central-1'}
               value={textInput}
               onChange={(e) => setTextInput(e.target.value)}
               disabled={importing}
@@ -332,12 +347,18 @@ export function BatchApiKeyImportDialog({ open, onOpenChange }: BatchApiKeyImpor
             <p className="text-xs text-muted-foreground">
               💡 导入时逐条验活并拉取额度，失败的凭据会被自动排除
             </p>
+            <p className="text-xs text-muted-foreground">
+              🌍 指定区域：<code>ksk_xxx | eu-central-1</code>（`|` 后为该 key 的 API region，省略则默认 us-east-1）
+            </p>
           </div>
 
           {/* 解析预览 */}
           {parsedKeys.length > 0 && !importing && results.length === 0 && (
             <div className="text-sm text-muted-foreground">
               识别到 {parsedKeys.length} 个 Key（已按行去重）
+              {parsedKeys.some(k => k.region) && (
+                <span>，其中 {parsedKeys.filter(k => k.region).length} 个指定了区域</span>
+              )}
               {invalidCount > 0 && (
                 <span className="text-warn">，其中 {invalidCount} 个不以 ksk_ 开头，将被标记失败</span>
               )}
