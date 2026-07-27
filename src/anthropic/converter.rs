@@ -134,6 +134,7 @@ fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
 /// - sonnet 5 → claude-sonnet-5（2026-07-01 上游上线，支持 adaptive thinking + effort 到 xhigh/max）
 /// - sonnet 4.6/4-6 → claude-sonnet-4.6
 /// - 其他 sonnet → claude-sonnet-4.5
+/// - opus 5 → claude-opus-5（2026-07-27 上游上线，透传上游 id 不兜底）
 /// - opus 4.8/4-8 → claude-opus-4.8（透传，不兜底）
 /// - opus 4.7/4-7 → claude-opus-4.7（透传，不兜底）
 /// - opus 4.5/4-5 → claude-opus-4.5
@@ -165,7 +166,9 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-sonnet-4.5".to_string())
         }
     } else if model_lower.contains("opus") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
+        if model_lower.contains("opus-5") || model_lower.contains("opus5") {
+            Some("claude-opus-5".to_string())
+        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
             Some("claude-opus-4.8".to_string())
         } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
             Some("claude-opus-4.7".to_string())
@@ -287,12 +290,16 @@ pub fn apply_output_token_multiplier(true_output: i32) -> i32 {
 /// 由 [`effective_injected_floor`] 回退到全局配置基线。
 ///
 /// 用 `map_model` 归一化后匹配，与 [`get_context_window_size`] 同套 id。实测来源：
+/// opus-5 = 6768（2026-07-27 裸请求实测，3 样本恒定；同批次同法复测 opus-4.8=6485 /
+/// sonnet-5=6483，与历史值吻合，故该法无系统偏差）、
 /// opus-4.8 / sonnet-5 = 6485（sonnet-5 于 2026-07-03 裸请求实测：空内容 contextUsage
 /// 0.648% × 1M）、opus-4.7 = 5975、opus-4.6 = 4170、sonnet-4.6 = 4109、
 /// opus-4.5 / sonnet-4.5 / haiku-4.5 ≈ 4100（均 2026-06-30 实测）。表用精确值不留余量，
 /// 追求 `context_total - floor` 精确等于上游真实内容。
 fn injected_floor_hardcoded(model: &str) -> Option<i32> {
     match map_model(model).as_deref() {
+        // opus-5 的注入地板高于全局兜底基线（6500），不进表就会少扣 ~268 token/请求。
+        Some("claude-opus-5") => Some(6768),
         Some("claude-opus-4.8") | Some("claude-sonnet-5") => Some(6485),
         Some("claude-opus-4.7") => Some(5975),
         Some("claude-opus-4.6") => Some(4170),
@@ -423,7 +430,8 @@ pub fn credit_to_usd(credit: f64) -> f64 {
 /// 1M 上下文为标准价无溢价。未知模型按 Sonnet 兜底。
 fn model_price_per_mtok(model: &str) -> (f64, f64) {
     match map_model(model).as_deref() {
-        Some("claude-opus-4.8")
+        Some("claude-opus-5")
+        | Some("claude-opus-4.8")
         | Some("claude-opus-4.7")
         | Some("claude-opus-4.6")
         | Some("claude-opus-4.5") => (5.0, 25.0),
@@ -476,7 +484,8 @@ fn window_size_for(model: &str, dynamic: &HashMap<String, i32>) -> i32 {
     }
     // 回退：硬编码常量
     match mapped.as_deref() {
-        Some("claude-sonnet-5")
+        Some("claude-opus-5")
+        | Some("claude-sonnet-5")
         | Some("claude-sonnet-4.6")
         | Some("claude-opus-4.6")
         | Some("claude-opus-4.7")
@@ -1635,10 +1644,12 @@ fn convert_tools(
 /// for this model` 400；haiku 不在新端点提供。不支持的模型直接不发该字段（thinking 静默
 /// 降级为普通响应），避免带 thinking 的请求整体失败。
 /// sonnet-5：2026-07-01 裸请求实测 adaptive thinking + effort(high/xhigh/max) 均 200。
+/// opus-5：2026-07-27 上线，与 sonnet-5 同代，按同 schema 下发（待裸请求复测确认 effort 上限）。
 fn model_supports_thinking(model: &str) -> bool {
     matches!(
         map_model(model).as_deref(),
-        Some("claude-opus-4.6")
+        Some("claude-opus-5")
+            | Some("claude-opus-4.6")
             | Some("claude-opus-4.7")
             | Some("claude-opus-4.8")
             | Some("claude-sonnet-4.6")
@@ -2672,6 +2683,27 @@ mod tests {
         // 支持 thinking + effort，且窗口 1M
         assert!(model_supports_thinking("claude-sonnet-5"));
         assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
+    }
+
+    #[test]
+    fn test_map_model_opus_5() {
+        // opus-5 透传上游 claude-opus-5，且不被 4.x 分支误吞、也不落到 4.6 兜底
+        assert_eq!(map_model("claude-opus-5").as_deref(), Some("claude-opus-5"));
+        assert_eq!(map_model("claude-opus-5[1m]").as_deref(), Some("claude-opus-5"));
+        assert_eq!(
+            map_model("claude-opus-5-20260727").as_deref(),
+            Some("claude-opus-5")
+        );
+        // 邻近版本不受影响
+        assert_eq!(map_model("claude-opus-4-8").as_deref(), Some("claude-opus-4.8"));
+        assert_eq!(map_model("claude-opus-4-5").as_deref(), Some("claude-opus-4.5"));
+        assert_eq!(map_model("claude-opus-4-20250514").as_deref(), Some("claude-opus-4.6"));
+        // 支持 thinking + effort，窗口 1M，opus 档价
+        assert!(model_supports_thinking("claude-opus-5"));
+        assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
+        assert_eq!(model_price_per_mtok("claude-opus-5"), (5.0, 25.0));
+        // 注入地板高于全局兜底基线（实测 6768 > 6500），必须走 per-model 表
+        assert_eq!(injected_floor_hardcoded("claude-opus-5"), Some(6768));
     }
 
     #[test]
