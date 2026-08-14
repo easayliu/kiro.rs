@@ -384,8 +384,11 @@ pub fn map_finish_reason(stop_reason: &str) -> &'static str {
 /// 由 Anthropic usage 计算 OpenAI usage（含缓存细分）。
 ///
 /// OpenAI 的 `prompt_tokens` 含缓存部分；Anthropic 的 `input_tokens` 仅未缓存。
-/// 故 prompt_tokens = 未缓存 + cache_read + cache_creation；
-/// `cached_tokens`=cache_read，`cache_write_tokens`=cache_creation（GPT-5.6+）。
+/// 故 prompt_tokens = 未缓存 + cache_read + cache_creation。
+///
+/// OpenAI 官方口径只有「缓存读」：缓存写是请求的隐式副作用、不加价也不上报，
+/// `prompt_tokens_details` 中仅有 `cached_tokens`（= cache_read），没有任何写字段。
+/// 因此 cache_creation 不单列，直接留在 `prompt_tokens - cached_tokens` 里按 1× input 计。
 pub fn map_usage(anthropic_usage: &Value) -> Value {
     let inp = anthropic_usage
         .get("input_tokens")
@@ -404,14 +407,12 @@ pub fn map_usage(anthropic_usage: &Value) -> Value {
         .and_then(Value::as_i64)
         .unwrap_or(0);
     let prompt_tokens = inp + cache_read + cache_write;
-    // cache_write_tokens 置于 prompt_tokens_details 内，对齐 OpenAI Chat Completions 官方结构。
     json!({
         "prompt_tokens": prompt_tokens,
         "completion_tokens": out,
         "total_tokens": prompt_tokens + out,
         "prompt_tokens_details": {
             "cached_tokens": cache_read,
-            "cache_write_tokens": cache_write,
         },
     })
 }
@@ -509,8 +510,11 @@ mod tests {
         assert_eq!(u["completion_tokens"], 5);
         assert_eq!(u["total_tokens"], 134);
         assert_eq!(u["prompt_tokens_details"]["cached_tokens"], 100);
-        assert_eq!(u["prompt_tokens_details"]["cache_write_tokens"], 20);
-        assert!(u.get("cache_write_tokens").is_none(), "不应再有顶层 cache_write_tokens");
+        // OpenAI 官方无缓存写字段：cache_creation(20) 融进 prompt_tokens 的未缓存部分。
+        assert!(
+            u["prompt_tokens_details"].get("cache_write_tokens").is_none(),
+            "OpenAI 官方 prompt_tokens_details 不含缓存写字段"
+        );
     }
 
     #[test]

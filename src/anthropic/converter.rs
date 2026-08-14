@@ -448,8 +448,10 @@ fn model_price_per_mtok(model: &str) -> (f64, f64) {
 
 /// 按 Anthropic 官方价折算本次请求的 USD 成本（用于和上游 credit 对比）。
 ///
-/// 各计费类目套用官方倍率：uncached input = 1×、cache 读 = 0.1×、5m 写 = 1.25×、
-/// 1h 写 = 2×（均相对 base input），output 用 output 价。结果四舍五入到 6 位小数（微美元）。
+/// 各计费类目套用官方倍率：uncached input = 1×、cache 读 = 0.1×。缓存写的倍率分两套：
+/// Claude 显式写缓存要加价（5m = 1.25×、1h = 2×）；OpenAI 的缓存写是隐式副作用、
+/// 官方不加价，故 GPT 两档写均为 1×（等同普通 input）。output 用 output 价。
+/// 结果四舍五入到 6 位小数（微美元）。
 pub fn official_price_usd(
     model: &str,
     uncached_input: i32,
@@ -459,12 +461,12 @@ pub fn official_price_usd(
     output: i32,
 ) -> f64 {
     let (input_rate, output_rate) = model_price_per_mtok(model);
-    // GPT-5.6 官方缓存写统一 1.25×（无 1h/2× 概念，仅 30m 保底档）；Claude 1h 写为 2×。
-    let cache_1h_mult = if model_is_gpt(model) { 1.25 } else { 2.0 };
+    let is_gpt = model_is_gpt(model);
+    let (write_5m_mult, write_1h_mult) = if is_gpt { (1.0, 1.0) } else { (1.25, 2.0) };
     let cost = uncached_input.max(0) as f64 * input_rate
         + cache_read.max(0) as f64 * input_rate * 0.1
-        + cache_creation_5m.max(0) as f64 * input_rate * 1.25
-        + cache_creation_1h.max(0) as f64 * input_rate * cache_1h_mult
+        + cache_creation_5m.max(0) as f64 * input_rate * write_5m_mult
+        + cache_creation_1h.max(0) as f64 * input_rate * write_1h_mult
         + output.max(0) as f64 * output_rate;
     let usd = cost / 1_000_000.0;
     (usd * 1_000_000.0).round() / 1_000_000.0
@@ -2911,12 +2913,13 @@ mod tests {
         assert!((official_price_usd("gpt-5.6-terra", 0, 0, 0, 0, 1_000_000) - 15.0).abs() < 1e-9);
         assert!((official_price_usd("gpt-5.6-luna", 1_000_000, 0, 0, 0, 0) - 1.0).abs() < 1e-9);
         assert!((official_price_usd("gpt-5.6-luna", 0, 0, 0, 0, 1_000_000) - 6.0).abs() < 1e-9);
-        // 缓存：Sol cached input = 0.1 × $5 = $0.50；cache write(5m) = 1.25 × $5 = $6.25。
+        // 缓存读：Sol cached input = 0.1 × $5 = $0.50。
         assert!((official_price_usd("gpt-5.6-sol", 0, 1_000_000, 0, 0, 0) - 0.50).abs() < 1e-9);
-        assert!((official_price_usd("gpt-5.6-sol", 0, 0, 1_000_000, 0, 0) - 6.25).abs() < 1e-9);
-        // GPT 1h 缓存写也按 1.25×（非 Claude 的 2×）：Terra 1h 写 = 1.25 × $2.5 = $3.125。
-        assert!((official_price_usd("gpt-5.6-terra", 0, 0, 0, 1_000_000, 0) - 3.125).abs() < 1e-9);
-        // 对照：Claude 1h 写仍为 2×（$5 → $10）。
+        // OpenAI 缓存写不加价：两档写均 1× input，Sol = $5、Terra = $2.5。
+        assert!((official_price_usd("gpt-5.6-sol", 0, 0, 1_000_000, 0, 0) - 5.0).abs() < 1e-9);
+        assert!((official_price_usd("gpt-5.6-terra", 0, 0, 0, 1_000_000, 0) - 2.5).abs() < 1e-9);
+        // 对照：Claude 显式写缓存仍加价（5m 1.25×、1h 2×）。
+        assert!((official_price_usd("claude-opus-4-8", 0, 0, 1_000_000, 0, 0) - 6.25).abs() < 1e-9);
         assert!((official_price_usd("claude-opus-4-8", 0, 0, 0, 1_000_000, 0) - 10.0).abs() < 1e-9);
     }
 

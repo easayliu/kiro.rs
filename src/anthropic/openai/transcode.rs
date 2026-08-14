@@ -97,11 +97,12 @@ pub async fn responses_nonstream(resp: Response, id: String, model: String, crea
         "model": model,
         "status": "completed",
         "output": output_items,
+        // OpenAI 官方 input_tokens_details 只有 cached_tokens（缓存写不上报、不加价），
+        // cache_creation 留在 input_tokens 的未缓存部分里。
         "usage": {
             "input_tokens": input_total,
             "input_tokens_details": {
                 "cached_tokens": cache_read,
-                "cache_write_tokens": cache_write,
             },
             "output_tokens": out_tok,
             "total_tokens": input_total + out_tok,
@@ -513,11 +514,11 @@ impl RespStreamState {
                 "response": {
                     "id": self.id, "object": "response", "created_at": self.created,
                     "model": self.model, "status": "completed", "output": output,
+                    // 同 responses 非流式：官方只有 cached_tokens，无缓存写字段。
                     "usage": {
                         "input_tokens": input_total,
                         "input_tokens_details": {
-                            "cached_tokens": cache_read,
-                            "cache_write_tokens": cache_write
+                            "cached_tokens": cache_read
                         },
                         "output_tokens": out_tok,
                         "total_tokens": input_total + out_tok
