@@ -1335,8 +1335,9 @@ impl StreamContext {
                 Vec::new()
             }
             Event::Metadata(metadata) => {
-                // 上游权威收笔信号：每次都打印 stopReason，便于观察是否有响应漏发此事件。
-                tracing::info!(
+                // 上游权威收笔信号：正常流每次都有，info 级别只是噪音；
+                // 排查「漏发 metadataEvent」时开 debug 即可（请求完成行已带 stop_reason）。
+                tracing::debug!(
                     model = %self.model,
                     stop_reason = ?metadata.stop_reason,
                     "收到 metadataEvent（上游收笔信号）"

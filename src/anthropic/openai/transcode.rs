@@ -302,8 +302,13 @@ impl ChatStreamState {
 }
 
 /// 流式：Anthropic SSE → OpenAI Responses 事件协议
-/// （`response.created` / `response.output_text.delta` /
-///  `response.function_call_arguments.delta` / `response.completed`）。
+/// （`response.created` / `response.output_item.added` / `response.output_text.delta` /
+///  `response.output_item.done` / `response.completed`）。
+///
+/// **`response.output_item.done` 是必发项**：Responses 客户端（如 codex CLI）只从
+/// `output_item.done` 收集本轮产出，`response.completed` 里的 `output` 数组不读、
+/// `output_text.delta` 只用于实时显示、`function_call_arguments.delta` 直接忽略。
+/// 少发 `output_item.done` 的表现就是「请求成功但回复为空、工具永不执行」。
 ///
 /// 调用方须保证 `resp` 为 200（非 200 请走 `responses_nonstream`）。
 pub fn responses_stream(resp: Response, id: String, model: String, created: i64) -> Response {
@@ -314,10 +319,10 @@ pub fn responses_stream(resp: Response, id: String, model: String, created: i64)
         created,
         buffer: Vec::new(),
         created_sent: false,
-        text: String::new(),
-        tool_added: HashMap::new(),
-        tool_calls: Vec::new(),
-        next_output_index: 1, // 0 预留给 message
+        text_blocks: HashMap::new(),
+        tool_blocks: HashMap::new(),
+        output_items: Vec::new(),
+        next_output_index: 0,
         usage: None,
         done: false,
     };
@@ -360,17 +365,35 @@ pub fn responses_stream(resp: Response, id: String, model: String, created: i64)
         .unwrap()
 }
 
+/// 流中一个 anthropic text 块 → Responses 的 message item。
+struct TextBlock {
+    output_index: i64,
+    item_id: String,
+    text: String,
+}
+
+/// 流中一个 anthropic tool_use 块 → Responses 的 function_call item。
+struct ToolBlock {
+    output_index: i64,
+    item_id: String,
+    call_id: String,
+    name: String,
+    /// 累积的 `input_json_delta`，收尾时作为 `arguments` 整串下发。
+    arguments: String,
+}
+
 struct RespStreamState {
     id: String,
     model: String,
     created: i64,
     buffer: Vec<u8>,
     created_sent: bool,
-    text: String,
-    /// anthropic tool_use block index → (output_index, call_id, name)
-    tool_added: HashMap<i64, (i64, String, String)>,
-    /// 累积的 tool_calls（用于 completed 事件的 output 数组）
-    tool_calls: Vec<Value>,
+    /// anthropic text block index → 该块的 message item 状态
+    text_blocks: HashMap<i64, TextBlock>,
+    /// anthropic tool_use block index → 该块的 function_call item 状态
+    tool_blocks: HashMap<i64, ToolBlock>,
+    /// 已 `output_item.done` 的 item（按下发顺序），供 completed 的 output 数组复述
+    output_items: Vec<Value>,
     next_output_index: i64,
     usage: Option<Value>,
     done: bool,
@@ -397,38 +420,133 @@ impl RespStreamState {
         }
     }
 
+    /// 开一个 message item（text 块），下发 `output_item.added`。
+    ///
+    /// anthropic 的 `content_block_start` 有时不带 text 块（或被上游省略），
+    /// 故 `text_delta` 也会兜底调用本函数，保证 item 一定被开出来。
+    fn open_text_block(&mut self, idx: i64, out: &mut String) {
+        if self.text_blocks.contains_key(&idx) {
+            return;
+        }
+        self.ensure_created(out);
+        let oi = self.next_output_index;
+        self.next_output_index += 1;
+        let item_id = format!("msg_{oi}");
+        out.push_str(&self.event(
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "output_index": oi,
+                "item": {
+                    "id": item_id, "type": "message", "role": "assistant",
+                    "status": "in_progress", "content": []
+                }
+            }),
+        ));
+        self.text_blocks.insert(idx, TextBlock { output_index: oi, item_id, text: String::new() });
+    }
+
+    /// text 块收尾：`output_text.done` + `output_item.done`（message）。
+    ///
+    /// 空文本不下发 item：只出工具调用的那一轮不该往对话里塞一条空 assistant 消息。
+    fn close_text_block(&mut self, idx: i64, out: &mut String) {
+        let Some(blk) = self.text_blocks.remove(&idx) else { return };
+        if blk.text.is_empty() {
+            return;
+        }
+        out.push_str(&self.event(
+            "response.output_text.done",
+            json!({
+                "type": "response.output_text.done",
+                "item_id": blk.item_id, "output_index": blk.output_index,
+                "content_index": 0, "text": blk.text
+            }),
+        ));
+        let item = json!({
+            "id": blk.item_id, "type": "message", "role": "assistant", "status": "completed",
+            "content": [{ "type": "output_text", "text": blk.text }]
+        });
+        out.push_str(&self.event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": blk.output_index, "item": item
+            }),
+        ));
+        self.output_items.push(item);
+    }
+
+    /// tool_use 块收尾：`function_call_arguments.done` + `output_item.done`（function_call）。
+    fn close_tool_block(&mut self, idx: i64, out: &mut String) {
+        let Some(blk) = self.tool_blocks.remove(&idx) else { return };
+        // 空 arguments 补成 `{}`：Responses 侧 arguments 是必填 JSON 字符串。
+        let args = if blk.arguments.is_empty() { "{}".to_string() } else { blk.arguments };
+        out.push_str(&self.event(
+            "response.function_call_arguments.done",
+            json!({
+                "type": "response.function_call_arguments.done",
+                "item_id": blk.item_id, "output_index": blk.output_index, "arguments": args
+            }),
+        ));
+        let item = json!({
+            "id": blk.item_id, "type": "function_call", "status": "completed",
+            "call_id": blk.call_id, "name": blk.name, "arguments": args
+        });
+        out.push_str(&self.event(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": blk.output_index, "item": item
+            }),
+        ));
+        self.output_items.push(item);
+    }
+
     fn handle_event(&mut self, event: &str, data: &Value, out: &mut String) {
         match event {
             "content_block_start" => {
                 let idx = data.get("index").and_then(Value::as_i64).unwrap_or(0);
                 let block = data.get("content_block");
-                if block.and_then(|b| b.get("type")).and_then(Value::as_str) == Some("tool_use") {
-                    self.ensure_created(out);
-                    let call_id = block
-                        .and_then(|b| b.get("id"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let name = block
-                        .and_then(|b| b.get("name"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let oi = self.next_output_index;
-                    self.next_output_index += 1;
-                    let item_id = format!("fc_{oi}");
-                    out.push_str(&self.event(
-                        "response.output_item.added",
-                        json!({
-                            "type": "response.output_item.added",
-                            "output_index": oi,
-                            "item": {
-                                "id": item_id, "type": "function_call",
-                                "call_id": call_id, "name": name, "arguments": ""
-                            }
-                        }),
-                    ));
-                    self.tool_added.insert(idx, (oi, call_id, name));
+                match block.and_then(|b| b.get("type")).and_then(Value::as_str) {
+                    Some("tool_use") => {
+                        self.ensure_created(out);
+                        let call_id = block
+                            .and_then(|b| b.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let name = block
+                            .and_then(|b| b.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let oi = self.next_output_index;
+                        self.next_output_index += 1;
+                        let item_id = format!("fc_{oi}");
+                        out.push_str(&self.event(
+                            "response.output_item.added",
+                            json!({
+                                "type": "response.output_item.added",
+                                "output_index": oi,
+                                "item": {
+                                    "id": item_id, "type": "function_call",
+                                    "call_id": call_id, "name": name, "arguments": ""
+                                }
+                            }),
+                        ));
+                        self.tool_blocks.insert(
+                            idx,
+                            ToolBlock {
+                                output_index: oi,
+                                item_id,
+                                call_id,
+                                name,
+                                arguments: String::new(),
+                            },
+                        );
+                    }
+                    Some("text") => self.open_text_block(idx, out),
+                    _ => {}
                 }
             }
             "content_block_delta" => {
@@ -440,42 +558,39 @@ impl RespStreamState {
                 match delta.get("type").and_then(Value::as_str).unwrap_or("") {
                     "text_delta" => {
                         let t = delta.get("text").and_then(Value::as_str).unwrap_or("");
-                        self.ensure_created(out);
-                        self.text.push_str(t);
+                        self.open_text_block(idx, out);
+                        let Some(blk) = self.text_blocks.get_mut(&idx) else { return };
+                        blk.text.push_str(t);
+                        let (item_id, oi) = (blk.item_id.clone(), blk.output_index);
                         out.push_str(&self.event(
                             "response.output_text.delta",
                             json!({
                                 "type": "response.output_text.delta",
-                                "item_id": "msg_0", "output_index": 0, "content_index": 0,
+                                "item_id": item_id, "output_index": oi, "content_index": 0,
                                 "delta": t
                             }),
                         ));
                     }
                     "input_json_delta" => {
                         let pj = delta.get("partial_json").and_then(Value::as_str).unwrap_or("");
-                        if let Some((oi, _, _)) = self.tool_added.get(&idx) {
-                            let item_id = format!("fc_{oi}");
-                            out.push_str(&self.event(
-                                "response.function_call_arguments.delta",
-                                json!({
-                                    "type": "response.function_call_arguments.delta",
-                                    "item_id": item_id, "output_index": oi, "delta": pj
-                                }),
-                            ));
-                        }
+                        let Some(blk) = self.tool_blocks.get_mut(&idx) else { return };
+                        blk.arguments.push_str(pj);
+                        let (item_id, oi) = (blk.item_id.clone(), blk.output_index);
+                        out.push_str(&self.event(
+                            "response.function_call_arguments.delta",
+                            json!({
+                                "type": "response.function_call_arguments.delta",
+                                "item_id": item_id, "output_index": oi, "delta": pj
+                            }),
+                        ));
                     }
                     _ => {}
                 }
             }
             "content_block_stop" => {
-                // tool_use 收尾：把完整 tool_call 记进 output（arguments 累积在上游 input）
                 let idx = data.get("index").and_then(Value::as_i64).unwrap_or(0);
-                if let Some((oi, call_id, name)) = self.tool_added.get(&idx).cloned() {
-                    self.tool_calls.push(json!({
-                        "id": format!("fc_{oi}"), "type": "function_call",
-                        "call_id": call_id, "name": name
-                    }));
-                }
+                self.close_text_block(idx, out);
+                self.close_tool_block(idx, out);
             }
             "message_delta" => {
                 if let Some(u) = data.get("usage") {
@@ -488,6 +603,13 @@ impl RespStreamState {
 
     fn finalize(&mut self, out: &mut String) {
         self.ensure_created(out);
+        // 上游断流/缺 content_block_stop 时兜底收尾，避免已产出的内容丢失。
+        let mut open: Vec<i64> = self.text_blocks.keys().chain(self.tool_blocks.keys()).copied().collect();
+        open.sort_unstable();
+        for idx in open {
+            self.close_text_block(idx, out);
+            self.close_tool_block(idx, out);
+        }
         let usage_a = self.usage.clone().unwrap_or(Value::Null);
         let inp = usage_a.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
         let cache_read = usage_a
@@ -501,11 +623,8 @@ impl RespStreamState {
         let out_tok = usage_a.get("output_tokens").and_then(Value::as_i64).unwrap_or(0);
         let input_total = inp + cache_read + cache_write;
 
-        let mut output = vec![json!({
-            "id": "msg_0", "type": "message", "role": "assistant", "status": "completed",
-            "content": [{ "type": "output_text", "text": self.text }]
-        })];
-        output.extend(self.tool_calls.clone());
+        // 与已下发的 output_item.done 保持一致（客户端不读这里，仅为协议完整性）。
+        let output = self.output_items.clone();
 
         out.push_str(&self.event(
             "response.completed",
@@ -719,9 +838,10 @@ mod tests {
     fn new_resp_state() -> RespStreamState {
         RespStreamState {
             id: "resp_x".into(), model: "gpt-5.6-terra".into(), created: 0,
-            buffer: Vec::new(), created_sent: false, text: String::new(),
-            tool_added: HashMap::new(), tool_calls: Vec::new(),
-            next_output_index: 1, usage: None, done: false,
+            buffer: Vec::new(), created_sent: false,
+            text_blocks: HashMap::new(), tool_blocks: HashMap::new(),
+            output_items: Vec::new(),
+            next_output_index: 0, usage: None, done: false,
         }
     }
 
@@ -751,5 +871,78 @@ mod tests {
         // input_tokens 含缓存：9+100=109
         assert!(all.contains("\"input_tokens\":109"));
         assert!(all.contains("\"cached_tokens\":100"));
+    }
+
+    /// codex CLI 只从 output_item.done 收集本轮产出：少发即「回复为空」。
+    #[test]
+    fn responses_stream_emits_output_item_done_for_message() {
+        let mut st = new_resp_state();
+        let mut all = String::new();
+        all.push_str(&feed_resp(&mut st, "event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"));
+        all.push_str(&feed_resp(&mut st, "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n"));
+        all.push_str(&feed_resp(&mut st, "event: content_block_stop\ndata: {\"index\":0}\n\n"));
+        let mut fin = String::new();
+        st.finalize(&mut fin);
+        all.push_str(&fin);
+
+        assert!(all.contains("event: response.output_item.added"));
+        assert!(all.contains("event: response.output_item.done"));
+        assert!(all.contains("\"type\":\"message\""));
+        assert!(all.contains("\"text\":\"Hi\""));
+        // 只该有一个 message item（done 后不再于 finalize 重复收尾）
+        assert_eq!(all.matches("event: response.output_item.done").count(), 1);
+    }
+
+    /// 缺 content_block_stop（上游断流）时 finalize 兜底补 done，已产出文本不丢。
+    #[test]
+    fn responses_stream_finalize_closes_open_text_block() {
+        let mut st = new_resp_state();
+        let mut all = String::new();
+        all.push_str(&feed_resp(&mut st, "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"));
+        let mut fin = String::new();
+        st.finalize(&mut fin);
+        all.push_str(&fin);
+        assert!(all.contains("event: response.output_item.done"));
+        assert!(all.contains("\"text\":\"partial\""));
+    }
+
+    /// 工具调用：arguments 需在 output_item.done 里给全串（delta 事件客户端会忽略）。
+    #[test]
+    fn responses_stream_tool_call_done_carries_full_arguments() {
+        let mut st = new_resp_state();
+        let mut all = String::new();
+        all.push_str(&feed_resp(&mut st, "event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"shell\"}}\n\n"));
+        all.push_str(&feed_resp(&mut st, "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cmd\\\":\"}}\n\n"));
+        all.push_str(&feed_resp(&mut st, "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"ls\\\"}\"}}\n\n"));
+        all.push_str(&feed_resp(&mut st, "event: content_block_stop\ndata: {\"index\":0}\n\n"));
+        let mut fin = String::new();
+        st.finalize(&mut fin);
+        all.push_str(&fin);
+
+        assert!(all.contains("event: response.output_item.done"));
+        assert!(all.contains("\"type\":\"function_call\""));
+        assert!(all.contains("\"call_id\":\"call_1\""));
+        assert!(all.contains("\"name\":\"shell\""));
+        // arguments 为累积后的完整 JSON 串
+        assert!(all.contains(r#""arguments":"{\"cmd\":\"ls\"}""#));
+    }
+
+    /// 空文本 + 工具调用：不产出空 assistant message item。
+    #[test]
+    fn responses_stream_skips_empty_message_item() {
+        let mut st = new_resp_state();
+        let mut all = String::new();
+        all.push_str(&feed_resp(&mut st, "event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"));
+        all.push_str(&feed_resp(&mut st, "event: content_block_stop\ndata: {\"index\":0}\n\n"));
+        all.push_str(&feed_resp(&mut st, "event: content_block_start\ndata: {\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_2\",\"name\":\"f\"}}\n\n"));
+        all.push_str(&feed_resp(&mut st, "event: content_block_stop\ndata: {\"index\":1}\n\n"));
+        let mut fin = String::new();
+        st.finalize(&mut fin);
+        all.push_str(&fin);
+
+        assert_eq!(all.matches("event: response.output_item.done").count(), 1);
+        assert!(all.contains("\"type\":\"function_call\""));
+        // 空 arguments 兜底为 {}
+        assert!(all.contains(r#""arguments":"{}""#));
     }
 }

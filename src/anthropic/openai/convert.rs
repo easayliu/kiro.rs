@@ -157,14 +157,67 @@ pub fn responses_request_to_anthropic(req: &Value) -> Result<Value, String> {
         }
         Some(Value::Array(items)) => {
             for it in items {
-                let role = it.get("role").and_then(Value::as_str).unwrap_or("user");
-                let role = if role == "system" || role == "developer" {
-                    "user"
-                } else {
-                    role
-                };
-                let blocks = user_content_to_blocks(it.get("content"));
-                push_or_merge(&mut out_messages, role, blocks);
+                // Responses 的 input items 是带 type 的联合体；缺省按 message 处理。
+                match it.get("type").and_then(Value::as_str).unwrap_or("message") {
+                    // 上一轮的工具调用回放 → assistant 的 tool_use
+                    "function_call" | "custom_tool_call" => {
+                        let call_id = it
+                            .get("call_id")
+                            .or_else(|| it.get("id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let name = it.get("name").and_then(Value::as_str).unwrap_or_default();
+                        // function_call 用 arguments，custom_tool_call 用 input，均为 JSON 字符串。
+                        let args = it
+                            .get("arguments")
+                            .or_else(|| it.get("input"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}");
+                        let input: Value =
+                            serde_json::from_str(args).unwrap_or_else(|_| json!({}));
+                        push_or_merge(
+                            &mut out_messages,
+                            "assistant",
+                            vec![json!({
+                                "type": "tool_use",
+                                "id": call_id,
+                                "name": name,
+                                "input": input,
+                            })],
+                        );
+                    }
+                    // 工具执行结果 → user 的 tool_result
+                    "function_call_output" | "custom_tool_call_output" => {
+                        let call_id = it
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        // output 可为纯字符串，也可为 content items 数组。
+                        let content =
+                            content_to_plain_text(it.get("output")).unwrap_or_default();
+                        push_or_merge(
+                            &mut out_messages,
+                            "user",
+                            vec![json!({
+                                "type": "tool_result",
+                                "tool_use_id": call_id,
+                                "content": content,
+                            })],
+                        );
+                    }
+                    // reasoning 是上游加密回放件，Anthropic 形状无对应载体，丢弃。
+                    "reasoning" => {}
+                    _ => {
+                        let role = it.get("role").and_then(Value::as_str).unwrap_or("user");
+                        let role = if role == "system" || role == "developer" {
+                            "user"
+                        } else {
+                            role
+                        };
+                        let blocks = user_content_to_blocks(it.get("content"));
+                        push_or_merge(&mut out_messages, role, blocks);
+                    }
+                }
             }
         }
         _ => return Err("缺少 input 字段".to_string()),
@@ -278,7 +331,8 @@ fn user_content_to_blocks(content: Option<&Value>) -> Vec<Value> {
             for p in parts {
                 let ptype = p.get("type").and_then(Value::as_str).unwrap_or("");
                 match ptype {
-                    "text" | "input_text" => {
+                    // output_text：Responses 回放的 assistant 历史消息用这个 part 类型。
+                    "text" | "input_text" | "output_text" => {
                         let t = p.get("text").and_then(Value::as_str).unwrap_or("");
                         blocks.push(json!({ "type": "text", "text": t }));
                     }
@@ -533,6 +587,73 @@ mod tests {
         assert_eq!(a["output_config"]["effort"], "low");
         assert_eq!(a["messages"][0]["role"], "user");
         let _mr: MessagesRequest = serde_json::from_value(a).unwrap();
+    }
+
+    /// codex CLI 的多轮形态：message / function_call / function_call_output / reasoning
+    /// 混在同一个 input 数组里回放，须还原成 tool_use + tool_result 的对话。
+    #[test]
+    fn responses_input_items_restore_tool_loop() {
+        let req = json!({
+            "model": "gpt-5.6-terra",
+            "instructions": "You are a coding agent.",
+            "input": [
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "list files"}]},
+                {"type": "reasoning", "summary": [], "encrypted_content": "opaque"},
+                {"type": "function_call", "name": "shell", "call_id": "call_1",
+                 "arguments": "{\"command\":[\"ls\"]}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "a.txt\nb.txt"},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "two files"}]},
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "thanks"}]}
+            ],
+            "tools": [
+                {"type": "function", "name": "shell", "description": "run",
+                 "parameters": {"type": "object", "properties": {}}}
+            ]
+        });
+        let a = responses_request_to_anthropic(&req).unwrap();
+        let msgs = a["messages"].as_array().unwrap();
+
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"][0]["text"], "list files");
+        // reasoning 被丢弃，不该塞出一条空消息
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"][0]["type"], "tool_use");
+        assert_eq!(msgs[1]["content"][0]["id"], "call_1");
+        assert_eq!(msgs[1]["content"][0]["name"], "shell");
+        assert_eq!(msgs[1]["content"][0]["input"]["command"][0], "ls");
+        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
+        assert_eq!(msgs[2]["content"][0]["tool_use_id"], "call_1");
+        assert_eq!(msgs[2]["content"][0]["content"], "a.txt\nb.txt");
+        // assistant 历史用 output_text part，须保留文本
+        assert_eq!(msgs[3]["role"], "assistant");
+        assert_eq!(msgs[3]["content"][0]["text"], "two files");
+        assert_eq!(msgs[4]["role"], "user");
+
+        // Responses 的 tools 是扁平结构（name/parameters 不套 function）
+        assert_eq!(a["tools"][0]["name"], "shell");
+        assert_eq!(a["tools"][0]["input_schema"]["type"], "object");
+        let _mr: MessagesRequest = serde_json::from_value(a).unwrap();
+    }
+
+    /// function_call_output 的 output 也可为 content items 数组。
+    #[test]
+    fn responses_function_call_output_accepts_content_items() {
+        let req = json!({
+            "model": "gpt-5.6-terra",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+                {"type": "function_call", "name": "f", "call_id": "c1", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1",
+                 "output": [{"type": "input_text", "text": "done"}]}
+            ]
+        });
+        let a = responses_request_to_anthropic(&req).unwrap();
+        let msgs = a["messages"].as_array().unwrap();
+        assert_eq!(msgs[2]["content"][0]["content"], "done");
     }
 
     #[test]

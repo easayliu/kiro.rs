@@ -779,7 +779,8 @@ pub(crate) async fn handle_messages(
 
     // 注入溯源：记录中转层实际加进上游请求的固定内容，便于排查时证明
     // 中转只加了这些（系统提示词基线 + cli 模式 env_state + origin），未参与可疑指令。
-    tracing::info!(
+    // 每请求都是同样的固定值，info 级别只是噪音，需要溯源时开 debug 即可。
+    tracing::debug!(
         request_id = %request_id,
         injected_system_tokens = effective_injected_floor(&payload.model),
         inject_env_state = provider.is_cli_mode(),
@@ -1869,8 +1870,9 @@ async fn handle_non_stream_request(
                             upstream_credit = Some(metering.usage);
                         }
                         Event::Metadata(metadata) => {
-                            // 上游权威收笔信号：每次都打印 stopReason，便于观察漏发。
-                            tracing::info!(
+                            // 上游权威收笔信号：正常响应每次都有，info 级别只是噪音；
+                            // 排查漏发时开 debug 即可（请求完成行已带 stop_reason）。
+                            tracing::debug!(
                                 model = %model,
                                 stop_reason = ?metadata.stop_reason,
                                 "收到 metadataEvent（上游收笔信号，非流式）"
@@ -2310,7 +2312,8 @@ pub async fn post_messages_cc(
 
     // 注入溯源：记录中转层实际加进上游请求的固定内容，便于排查时证明
     // 中转只加了这些（系统提示词基线 + cli 模式 env_state + origin），未参与可疑指令。
-    tracing::info!(
+    // 每请求都是同样的固定值，info 级别只是噪音，需要溯源时开 debug 即可。
+    tracing::debug!(
         request_id = %request_id,
         injected_system_tokens = effective_injected_floor(&payload.model),
         inject_env_state = provider.is_cli_mode(),
