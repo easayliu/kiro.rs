@@ -420,7 +420,7 @@ impl RespStreamState {
         }
     }
 
-    /// 开一个 message item（text 块），下发 `output_item.added`。
+    /// 开一个 message item（text 块），下发 `output_item.added` + `content_part.added`。
     ///
     /// anthropic 的 `content_block_start` 有时不带 text 块（或被上游省略），
     /// 故 `text_delta` 也会兜底调用本函数，保证 item 一定被开出来。
@@ -443,10 +443,20 @@ impl RespStreamState {
                 }
             }),
         ));
+        // content_part.added：官方顺序里 item 与 text delta 之间的一层。codex 忽略它，
+        // 但按 part 生命周期渲染的客户端要靠它建 part 容器，故照官方补齐。
+        out.push_str(&self.event(
+            "response.content_part.added",
+            json!({
+                "type": "response.content_part.added",
+                "item_id": item_id, "output_index": oi, "content_index": 0,
+                "part": { "type": "output_text", "text": "", "annotations": [] }
+            }),
+        ));
         self.text_blocks.insert(idx, TextBlock { output_index: oi, item_id, text: String::new() });
     }
 
-    /// text 块收尾：`output_text.done` + `output_item.done`（message）。
+    /// text 块收尾：`output_text.done` + `content_part.done` + `output_item.done`（message）。
     ///
     /// 空文本不下发 item：只出工具调用的那一轮不该往对话里塞一条空 assistant 消息。
     fn close_text_block(&mut self, idx: i64, out: &mut String) {
@@ -460,6 +470,14 @@ impl RespStreamState {
                 "type": "response.output_text.done",
                 "item_id": blk.item_id, "output_index": blk.output_index,
                 "content_index": 0, "text": blk.text
+            }),
+        ));
+        out.push_str(&self.event(
+            "response.content_part.done",
+            json!({
+                "type": "response.content_part.done",
+                "item_id": blk.item_id, "output_index": blk.output_index, "content_index": 0,
+                "part": { "type": "output_text", "text": blk.text, "annotations": [] }
             }),
         ));
         let item = json!({
@@ -891,6 +909,37 @@ mod tests {
         assert!(all.contains("\"text\":\"Hi\""));
         // 只该有一个 message item（done 后不再于 finalize 重复收尾）
         assert_eq!(all.matches("event: response.output_item.done").count(), 1);
+    }
+
+    /// 纯文本轮的事件顺序须与官方 Responses 协议一致（8 段全齐）。
+    #[test]
+    fn responses_stream_event_order_matches_official() {
+        let mut st = new_resp_state();
+        let mut all = String::new();
+        all.push_str(&feed_resp(&mut st, "event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"));
+        all.push_str(&feed_resp(&mut st, "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n"));
+        all.push_str(&feed_resp(&mut st, "event: content_block_stop\ndata: {\"index\":0}\n\n"));
+        let mut fin = String::new();
+        st.finalize(&mut fin);
+        all.push_str(&fin);
+
+        let order: Vec<&str> = all
+            .lines()
+            .filter_map(|l| l.strip_prefix("event: "))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
     }
 
     /// 缺 content_block_stop（上游断流）时 finalize 兜底补 done，已产出文本不丢。
