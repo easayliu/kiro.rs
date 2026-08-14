@@ -63,7 +63,7 @@ pub async fn post_chat_completions(
         .unwrap_or(false);
 
     let mut anthropic = match chat_request_to_anthropic(&req) {
-        Ok(v) => v,
+        Ok(v) => v.anthropic,
         Err(e) => return bad_request(&e),
     };
     // OpenAI 端点客户端不发 cache_control，自动注入断点模拟 OpenAI 自动前缀缓存。
@@ -98,10 +98,14 @@ pub async fn post_responses(
 
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
-    let mut anthropic = match responses_request_to_anthropic(&req) {
+    let converted = match responses_request_to_anthropic(&req) {
         Ok(v) => v,
         Err(e) => return bad_request(&e),
     };
+    // freeform（type:"custom"）工具名要带到出口：决定工具调用发 custom_tool_call 还是
+    // function_call，发错客户端不执行（codex 的 `exec` 即 freeform）。
+    let custom_tools = converted.custom_tools;
+    let mut anthropic = converted.anthropic;
     inject_auto_cache_breakpoint(&mut anthropic);
 
     let payload = match to_messages_request(anthropic) {
@@ -115,8 +119,8 @@ pub async fn post_responses(
     let id = format!("resp_{}", Uuid::new_v4().simple());
     let created = now_secs();
     if stream && inner.status() == StatusCode::OK {
-        responses_stream(inner, id, resolved_model, created)
+        responses_stream(inner, id, resolved_model, created, custom_tools)
     } else {
-        responses_nonstream(inner, id, resolved_model, created).await
+        responses_nonstream(inner, id, resolved_model, created, custom_tools).await
     }
 }

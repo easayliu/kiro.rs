@@ -4,7 +4,7 @@
 //! 做格式翻译：非流式解析一次 JSON 重组；流式解析 Anthropic SSE 事件流后按
 //! OpenAI `chat.completion.chunk` 协议逐块下发。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::body::{Body, Bytes};
 use axum::http::{StatusCode, header};
@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use futures::stream::{self, StreamExt};
 use serde_json::{Value, json};
 
-use super::convert::{map_finish_reason, map_usage};
+use super::convert::{custom_tool_input_from_args, map_finish_reason, map_usage};
 
 const BODY_LIMIT: usize = 64 * 1024 * 1024;
 
@@ -51,7 +51,16 @@ pub async fn chat_nonstream(resp: Response, id: String, model: String, created: 
 }
 
 /// 非流式：Anthropic message JSON → OpenAI Responses `response` 对象。
-pub async fn responses_nonstream(resp: Response, id: String, model: String, created: i64) -> Response {
+///
+/// `custom_tools` 为本轮以 `type:"custom"` 声明的工具名集合，命中者产出
+/// `custom_tool_call`（`input` 为原始文本）而非 `function_call`。
+pub async fn responses_nonstream(
+    resp: Response,
+    id: String,
+    model: String,
+    created: i64,
+    custom_tools: HashSet<String>,
+) -> Response {
     let (status, body) = match read_body(resp).await {
         Ok(v) => v,
         Err(r) => return r,
@@ -75,19 +84,34 @@ pub async fn responses_nonstream(resp: Response, id: String, model: String, crea
     let input_total = inp + cache_read + cache_write;
 
     let mut output_items = Vec::new();
-    output_items.push(json!({
-        "type": "message",
-        "role": "assistant",
-        "content": [{ "type": "output_text", "text": text }],
-    }));
+    // 空文本不产出 message item：只出工具调用的那一轮不该往对话里塞一条空 assistant
+    // 消息（与流式 close_text_block 的口径一致）。
+    if !text.is_empty() {
+        output_items.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": text }],
+        }));
+    }
     for tc in tool_calls {
         let func = tc.get("function").cloned().unwrap_or(Value::Null);
-        output_items.push(json!({
-            "type": "function_call",
-            "call_id": tc.get("id").cloned().unwrap_or(Value::Null),
-            "name": func.get("name").cloned().unwrap_or(Value::Null),
-            "arguments": func.get("arguments").cloned().unwrap_or(Value::Null),
-        }));
+        let name = func.get("name").and_then(Value::as_str).unwrap_or("");
+        let args = func.get("arguments").and_then(Value::as_str).unwrap_or("");
+        if custom_tools.contains(name) {
+            output_items.push(json!({
+                "type": "custom_tool_call",
+                "call_id": tc.get("id").cloned().unwrap_or(Value::Null),
+                "name": name,
+                "input": custom_tool_input_from_args(args),
+            }));
+        } else {
+            output_items.push(json!({
+                "type": "function_call",
+                "call_id": tc.get("id").cloned().unwrap_or(Value::Null),
+                "name": name,
+                "arguments": args,
+            }));
+        }
     }
 
     let out = json!({
@@ -310,13 +334,24 @@ impl ChatStreamState {
 /// `output_text.delta` 只用于实时显示、`function_call_arguments.delta` 直接忽略。
 /// 少发 `output_item.done` 的表现就是「请求成功但回复为空、工具永不执行」。
 ///
+/// `custom_tools` 为本轮以 `type:"custom"` 声明的工具名集合：命中者按 freeform 协议
+/// 下发（`custom_tool_call` item + `custom_tool_call_input.*` 事件），未命中者按函数协议
+/// 下发。发错协议时 codex 侧找不到对应载荷，工具静默不执行。
+///
 /// 调用方须保证 `resp` 为 200（非 200 请走 `responses_nonstream`）。
-pub fn responses_stream(resp: Response, id: String, model: String, created: i64) -> Response {
+pub fn responses_stream(
+    resp: Response,
+    id: String,
+    model: String,
+    created: i64,
+    custom_tools: HashSet<String>,
+) -> Response {
     let upstream = resp.into_body().into_data_stream();
     let state = RespStreamState {
         id,
         model,
         created,
+        custom_tools,
         buffer: Vec::new(),
         created_sent: false,
         text_blocks: HashMap::new(),
@@ -372,12 +407,14 @@ struct TextBlock {
     text: String,
 }
 
-/// 流中一个 anthropic tool_use 块 → Responses 的 function_call item。
+/// 流中一个 anthropic tool_use 块 → Responses 的 function_call / custom_tool_call item。
 struct ToolBlock {
     output_index: i64,
     item_id: String,
     call_id: String,
     name: String,
+    /// 该工具是否以 `type:"custom"` 声明（freeform，载荷是原始文本）。
+    is_custom: bool,
     /// 累积的 `input_json_delta`，收尾时作为 `arguments` 整串下发。
     arguments: String,
 }
@@ -386,6 +423,8 @@ struct RespStreamState {
     id: String,
     model: String,
     created: i64,
+    /// 以 `type:"custom"` 声明的工具名集合（决定出口用哪套工具协议）。
+    custom_tools: HashSet<String>,
     buffer: Vec<u8>,
     created_sent: bool,
     /// anthropic text block index → 该块的 message item 状态
@@ -494,9 +533,43 @@ impl RespStreamState {
         self.output_items.push(item);
     }
 
-    /// tool_use 块收尾：`function_call_arguments.done` + `output_item.done`（function_call）。
+    /// tool_use 块收尾：按工具协议下发收尾事件 + `output_item.done`。
+    ///
+    /// freeform 工具走 `custom_tool_call_input.delta/done`：原文藏在合成 schema 的
+    /// `input` 字段里，流中的 `input_json_delta` 是 JSON 转义片段、无法逐片还原成原文，
+    /// 故累积到收尾一次性解出整串下发（客户端本就只认 `output_item.done`）。
     fn close_tool_block(&mut self, idx: i64, out: &mut String) {
         let Some(blk) = self.tool_blocks.remove(&idx) else { return };
+        if blk.is_custom {
+            let input = custom_tool_input_from_args(&blk.arguments);
+            out.push_str(&self.event(
+                "response.custom_tool_call_input.delta",
+                json!({
+                    "type": "response.custom_tool_call_input.delta",
+                    "item_id": blk.item_id, "output_index": blk.output_index, "delta": input
+                }),
+            ));
+            out.push_str(&self.event(
+                "response.custom_tool_call_input.done",
+                json!({
+                    "type": "response.custom_tool_call_input.done",
+                    "item_id": blk.item_id, "output_index": blk.output_index, "input": input
+                }),
+            ));
+            let item = json!({
+                "id": blk.item_id, "type": "custom_tool_call", "status": "completed",
+                "call_id": blk.call_id, "name": blk.name, "input": input
+            });
+            out.push_str(&self.event(
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": blk.output_index, "item": item
+                }),
+            ));
+            self.output_items.push(item);
+            return;
+        }
         // 空 arguments 补成 `{}`：Responses 侧 arguments 是必填 JSON 字符串。
         let args = if blk.arguments.is_empty() { "{}".to_string() } else { blk.arguments };
         out.push_str(&self.event(
@@ -540,16 +613,26 @@ impl RespStreamState {
                             .to_string();
                         let oi = self.next_output_index;
                         self.next_output_index += 1;
-                        let item_id = format!("fc_{oi}");
+                        let is_custom = self.custom_tools.contains(&name);
+                        let item_id =
+                            if is_custom { format!("ctc_{oi}") } else { format!("fc_{oi}") };
+                        let added_item = if is_custom {
+                            json!({
+                                "id": item_id, "type": "custom_tool_call",
+                                "call_id": call_id, "name": name, "input": ""
+                            })
+                        } else {
+                            json!({
+                                "id": item_id, "type": "function_call",
+                                "call_id": call_id, "name": name, "arguments": ""
+                            })
+                        };
                         out.push_str(&self.event(
                             "response.output_item.added",
                             json!({
                                 "type": "response.output_item.added",
                                 "output_index": oi,
-                                "item": {
-                                    "id": item_id, "type": "function_call",
-                                    "call_id": call_id, "name": name, "arguments": ""
-                                }
+                                "item": added_item
                             }),
                         ));
                         self.tool_blocks.insert(
@@ -559,6 +642,7 @@ impl RespStreamState {
                                 item_id,
                                 call_id,
                                 name,
+                                is_custom,
                                 arguments: String::new(),
                             },
                         );
@@ -593,6 +677,11 @@ impl RespStreamState {
                         let pj = delta.get("partial_json").and_then(Value::as_str).unwrap_or("");
                         let Some(blk) = self.tool_blocks.get_mut(&idx) else { return };
                         blk.arguments.push_str(pj);
+                        // freeform 工具的原文是 JSON 字符串里的转义内容，逐片下发只会是半个
+                        // 转义序列——收尾时一次性解出整串（见 close_tool_block）。
+                        if blk.is_custom {
+                            return;
+                        }
                         let (item_id, oi) = (blk.item_id.clone(), blk.output_index);
                         out.push_str(&self.event(
                             "response.function_call_arguments.delta",
@@ -856,6 +945,7 @@ mod tests {
     fn new_resp_state() -> RespStreamState {
         RespStreamState {
             id: "resp_x".into(), model: "gpt-5.6-terra".into(), created: 0,
+            custom_tools: HashSet::new(),
             buffer: Vec::new(), created_sent: false,
             text_blocks: HashMap::new(), tool_blocks: HashMap::new(),
             output_items: Vec::new(),
@@ -974,6 +1064,94 @@ mod tests {
         assert!(all.contains("\"name\":\"shell\""));
         // arguments 为累积后的完整 JSON 串
         assert!(all.contains(r#""arguments":"{\"cmd\":\"ls\"}""#));
+    }
+
+    /// freeform 工具（codex 的 `exec`）：出口必须发 custom_tool_call + input 原文，
+    /// 而不是 function_call + arguments——发错协议客户端不执行，表现为「读不到文件」。
+    #[test]
+    fn responses_stream_custom_tool_emits_custom_tool_call() {
+        let mut st = new_resp_state();
+        st.custom_tools.insert("exec".to_string());
+        let mut all = String::new();
+        all.push_str(&feed_resp(&mut st, "event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"exec\"}}\n\n"));
+        // 模型按合成 schema 产出 {"input":"<代码>"}，分片到达
+        all.push_str(&feed_resp(&mut st, "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"input\\\":\\\"const r = await tools.exec_command(\"}}\n\n"));
+        all.push_str(&feed_resp(&mut st, "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{cmd:\\\\\\\"ls\\\\\\\"});\\\\ntext(r.output);\\\"}\"}}\n\n"));
+        all.push_str(&feed_resp(&mut st, "event: content_block_stop\ndata: {\"index\":0}\n\n"));
+        let mut fin = String::new();
+        st.finalize(&mut fin);
+        all.push_str(&fin);
+
+        assert!(all.contains("event: response.custom_tool_call_input.done"));
+        assert!(all.contains("\"type\":\"custom_tool_call\""));
+        assert!(all.contains("\"call_id\":\"call_1\""));
+        // 原文已从合成字段里解出（含真实换行，非 JSON 转义串）
+        assert!(all.contains(r#"const r = await tools.exec_command({cmd:\"ls\"});\ntext(r.output);"#));
+        // 不该混入函数协议的事件
+        assert!(!all.contains("function_call_arguments"));
+        assert!(!all.contains("\"type\":\"function_call\""));
+    }
+
+    /// 同一轮里 freeform 与普通函数工具并存时，各走各的协议。
+    #[test]
+    fn responses_stream_mixes_custom_and_function_tools() {
+        let mut st = new_resp_state();
+        st.custom_tools.insert("exec".to_string());
+        let mut all = String::new();
+        all.push_str(&feed_resp(&mut st, "event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c1\",\"name\":\"exec\"}}\n\n"));
+        all.push_str(&feed_resp(&mut st, "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"input\\\":\\\"pwd\\\"}\"}}\n\n"));
+        all.push_str(&feed_resp(&mut st, "event: content_block_stop\ndata: {\"index\":0}\n\n"));
+        all.push_str(&feed_resp(&mut st, "event: content_block_start\ndata: {\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c2\",\"name\":\"update_plan\"}}\n\n"));
+        all.push_str(&feed_resp(&mut st, "event: content_block_delta\ndata: {\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"step\\\":1}\"}}\n\n"));
+        all.push_str(&feed_resp(&mut st, "event: content_block_stop\ndata: {\"index\":1}\n\n"));
+        let mut fin = String::new();
+        st.finalize(&mut fin);
+        all.push_str(&fin);
+
+        let done: Vec<Value> = all
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .filter(|d| d["type"] == "response.output_item.done")
+            .map(|d| d["item"].clone())
+            .collect();
+        assert_eq!(done.len(), 2);
+        assert_eq!(done[0]["type"], "custom_tool_call");
+        assert_eq!(done[0]["call_id"], "c1");
+        assert_eq!(done[0]["input"], "pwd");
+        assert!(done[0].get("arguments").is_none());
+        assert_eq!(done[1]["type"], "function_call");
+        assert_eq!(done[1]["call_id"], "c2");
+        assert_eq!(done[1]["arguments"], "{\"step\":1}");
+        assert!(done[1].get("input").is_none());
+    }
+
+    /// 非流式同样按声明分流。
+    #[tokio::test]
+    async fn responses_nonstream_splits_custom_and_function_tools() {
+        let body = json!({
+            "content": [
+                {"type": "tool_use", "id": "c1", "name": "exec", "input": {"input": "ls -la"}},
+                {"type": "tool_use", "id": "c2", "name": "shell", "input": {"cmd": "ls"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 5, "output_tokens": 2}
+        });
+        let inner = json_response(StatusCode::OK, &body);
+        let custom: HashSet<String> = ["exec".to_string()].into_iter().collect();
+        let resp =
+            responses_nonstream(inner, "resp_1".into(), "gpt-5.6-sol".into(), 0, custom).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), BODY_LIMIT).await.unwrap();
+        let out: Value = serde_json::from_slice(&bytes).unwrap();
+        let items = out["output"].as_array().unwrap();
+        // 纯工具轮不塞空 message item（与流式一致）
+        assert_eq!(items.len(), 2);
+        let exec = items.iter().find(|i| i["call_id"] == "c1").unwrap();
+        assert_eq!(exec["type"], "custom_tool_call");
+        assert_eq!(exec["input"], "ls -la");
+        let shell = items.iter().find(|i| i["call_id"] == "c2").unwrap();
+        assert_eq!(shell["type"], "function_call");
+        assert_eq!(shell["arguments"], "{\"cmd\":\"ls\"}");
     }
 
     /// 空文本 + 工具调用：不产出空 assistant message item。
