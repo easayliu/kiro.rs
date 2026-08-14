@@ -1608,10 +1608,17 @@ fn mix_fingerprint(content: &[u8; 32], extras: &[u8; 32]) -> [u8; 32] {
 /// 对齐 Anthropic 官方 prompt caching 最小可缓存 tokens（Claude API 口径）。
 /// 参考: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
 /// （Bedrock 上 Fable 5 / Mythos 5 为 1024，本代理走 Anthropic 口径不处理。）
+///
+/// GPT 系列走 OpenAI 口径（自动前缀缓存，最短 1024 token）。虽与本函数兜底值相同，
+/// 但必须显式列出：兜底是「未知模型」的保底猜测，改动它不应静默改掉 GPT 的门槛。
 fn minimum_cacheable_tokens_for_model(model: &str) -> i32 {
     // 归一化分隔符，统一用 '-' 匹配（兼容 opus-4.8 / opus_4_8 等写法）。
     let m = model.to_lowercase().replace(['.', '_'], "-");
 
+    // 1024：OpenAI 自动前缀缓存的最小前缀（官方文档口径，与 TTL/计价无关）。
+    if m.contains("gpt-") {
+        return 1024;
+    }
     // 512：Fable 5 / Mythos 5
     if m.contains("fable-5") || m.contains("mythos-5") {
         return 512;
@@ -2129,6 +2136,10 @@ mod tests {
             // 分隔符兼容
             ("claude-opus-4.8", 1024),
             ("claude-opus-4.7", 2048),
+            // GPT 走 OpenAI 口径：显式 1024，不依赖函数末尾的未知模型兜底。
+            ("gpt-5.6-sol", 1024),
+            ("gpt-5.6-terra", 1024),
+            ("gpt-5.6-luna", 1024),
         ];
         for (model, expect) in cases {
             assert_eq!(

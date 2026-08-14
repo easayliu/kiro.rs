@@ -205,8 +205,9 @@ pub fn responses_request_to_anthropic(req: &Value) -> Result<Value, String> {
 ///
 /// TTL 用 `1h`：OpenAI GPT-5.6 缓存保底存活 ≥30 分钟（官方文档，`ttl` 唯一值 30m，
 /// 是最小时长非上限）。Anthropic 无 30m 档，取 1h 覆盖该保底窗口，避免 5m 默认档
-/// 过早判过期、在 5~30 分钟间隔时误报未命中。GPT 的 1h 缓存写计价按 1.25×
-/// （见 `official_price_usd` 的 GPT 分支），不套 Anthropic 的 2×。
+/// 过早判过期、在 5~30 分钟间隔时误报未命中。注意这只影响命中判定，不影响计价：
+/// OpenAI 缓存写不加价，`official_price_usd` 的 GPT 分支两档写均按 1×（等同普通
+/// input），不套 Anthropic 的 5m 1.25× / 1h 2×。
 pub fn inject_auto_cache_breakpoint(anthropic: &mut Value) {
     let Some(msgs) = anthropic.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
